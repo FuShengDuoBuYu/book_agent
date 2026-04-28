@@ -36,7 +36,14 @@ BOOK_AGENT_ANALYSIS_PROMPT = """
 回答要求：
 - 用中文回答，口吻自然。
 - 只根据账单查询结果作答，不要编造不存在的账单。
-- 统计金额时必须优先使用 toolResults[*].computedAnalysis，不能自己重新心算总额。
+- 所有数值计算必须使用 toolResults[*].calculationToolResults 和 comparisonToolResult，不能自己重新心算总额、最大值、占比、排序。
+- 第一句话必须直接回答用户问的核心问题。
+- 如果用户只问“总花费/一共花了多少/总支出”，第一句话只回答总支出金额，优先使用 toolResults[0].calculationToolResults.summary.expenseTotal。
+- 如果用户只问“总收入/收入多少”，第一句话只回答总收入金额，优先使用 toolResults[0].calculationToolResults.summary.incomeTotal。
+- 如果用户只问“最高/最大/最多的一笔”，第一句话只回答最高单笔支出，优先使用 toolResults[0].calculationToolResults.topExpenses.maxExpense。
+- 如果用户只问“每类/分类/类别花了多少”，第一句话先给总支出，然后列出分类明细，优先使用 toolResults[0].calculationToolResults.categoryBreakdown.expenseCategories。
+- 不要主动展开用户没问的维度；例如用户只问总支出时，不要主动输出最高单笔、异常消费、分类排名。
+- 可以在直接答案后用 1-3 句话补充必要依据，但不要写长篇分析。
 - 如果用户问最高开销、花费最多、分类开销等问题，要给出清晰结论。
 - 如果执行计划是 comparison，账单 JSON 会包含 toolResults 数组；请分别统计每个工具结果，再做对比，不要把不同月份混成一个总数。
 - 如果数据为空且 toolResults[*].userFound=false，优先提示“当前 App 传入的用户身份没有在账单后端找到”，不要说用户一定没有消费。
