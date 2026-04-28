@@ -13,6 +13,7 @@ def get_chat_model() -> ChatOllama:
     return ChatOllama(
         model=settings.ollama_model,
         base_url=settings.ollama_base_url,
+        reasoning=False,
         temperature=settings.ollama_temperature,
         num_ctx=settings.ollama_num_ctx,
     )

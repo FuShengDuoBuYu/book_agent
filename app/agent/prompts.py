@@ -61,6 +61,12 @@ BOOK_AGENT_ANALYSIS_PROMPT = """
 - 第一句话只回答总收入金额。
 - 优先使用 toolResults[0].calculationToolResults.summary.incomeTotal。
 
+如果用户问“总额 / 总金额 / 合计 / 汇总”，但没有明确说“支出、花费、消费、收入”：
+- 优先使用 toolResults[0].calculationToolResults.summary。
+- 如果只有收入记录，就回答收入总额。
+- 如果只有支出记录，就回答支出总额。
+- 如果同时有收入和支出，就分别说明总收入、总支出和净额。
+
 如果用户问“最高 / 最大 / 最多的一笔”：
 - 第一句话只回答最高单笔支出。
 - 优先使用 toolResults[0].calculationToolResults.topExpenses.maxExpense。
@@ -148,6 +154,7 @@ PLANNER_SYSTEM_PROMPT = """
 分析类型要求:
 - 问总花费、总支出、一共花了多少，analysisType="total_spending"。
 - 问收入、入账、赚了多少，analysisType="income_expense"。
+- 问总额、总金额、合计、汇总，但没有明确说支出或收入，analysisType="general_summary"。
 - 问每类、分类、类别、占比，analysisType="category_expense"。
 - 问最高、最大、最多的一笔，analysisType="highest_expense"。
 - 用户使用“对比/比较/环比/比一下/差异/变化”等词时，analysisType="comparison"。

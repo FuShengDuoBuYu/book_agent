@@ -431,182 +431,23 @@ class BookAgent:
         if not plan.needsTools:
             return None
 
-        if plan.analysisType == "comparison":
-            return self._build_comparison_reply(data)
-
         tool_results = data.get("toolResults") or []
-        personal_family_ratio = self._build_personal_family_ratio_reply(
-            plan=plan,
-            tool_results=tool_results,
-        )
-        if personal_family_ratio:
-            return personal_family_ratio
-
-        if len(tool_results) != 1:
+        if not tool_results:
             return None
-
-        tool_result = tool_results[0]
-        if tool_result.get("error") == "missing_family_id":
+        if any(item.get("error") == "missing_family_id" for item in tool_results):
             return "家庭版查询需要 familyId，但当前用户资料里没有找到家庭 ID。请确认该账号已经创建或加入家庭。"
-        if not tool_result.get("userFound", False):
+        if all(not item.get("userFound", False) for item in tool_results):
             return "当前 App 传入的用户身份没有在账单后端找到。"
-        if int(tool_result.get("orderCount") or 0) == 0:
-            return f"{tool_result.get('summary', '当前查询范围')}没有查到账单记录。"
-
-        calculations = tool_result.get("calculationToolResults") or {}
-        summary = calculations.get("summary") or {}
-        label = str(tool_result.get("summary") or "当前查询范围")
-
-        if plan.analysisType == "total_spending":
-            return (
-                f"{label}总支出为{self._money_text(summary.get('expenseTotal'))}元。"
-                f"统计了{summary.get('expenseOrderCount', 0)}笔支出记录。"
-            )
-
-        if plan.analysisType == "income_expense":
-            return (
-                f"{label}总收入为{self._money_text(summary.get('incomeTotal'))}元。"
-                f"统计了{summary.get('incomeOrderCount', 0)}笔收入记录。"
-            )
-
-        if plan.analysisType == "category_expense":
-            categories = (
-                calculations.get("categoryBreakdown", {}).get("expenseCategories", [])
-            )
-            category_lines = [
-                f"{index}. {item.get('name', '未分类')}："
-                f"{self._money_text(item.get('amount'))}元"
-                f"（{item.get('orderCount', 0)}笔，占{item.get('ratioPercent', 0)}%）"
-                for index, item in enumerate(categories, start=1)
+        if all(int(item.get("orderCount") or 0) == 0 for item in tool_results):
+            summaries = [
+                str(item.get("summary") or "当前查询范围")
+                for item in tool_results
+                if item.get("userFound", False)
             ]
-            return (
-                f"{label}总支出为{self._money_text(summary.get('expenseTotal'))}元。\n"
-                + "\n".join(category_lines)
-            ).strip()
-
-        if plan.analysisType == "highest_expense":
-            max_expense = calculations.get("topExpenses", {}).get("maxExpense")
-            if not max_expense:
-                return f"{label}没有支出记录。"
-            return (
-                f"{label}最高单笔支出为{self._money_text(max_expense.get('amount'))}元，"
-                f"类别是{max_expense.get('costType') or '未分类'}，"
-                f"日期是{max_expense.get('date') or '未知日期'}。"
-            )
+            scope = "、".join(summaries) or "当前查询范围"
+            return f"{scope}没有查到账单记录。"
 
         return None
-
-    def _build_personal_family_ratio_reply(
-        self,
-        plan: AgentPlan,
-        tool_results: list[dict[str, Any]],
-    ) -> str | None:
-        if len(tool_results) < 2:
-            return None
-
-        instruction_text = f"{plan.finalInstruction} {plan.summary} {plan.reason}"
-        if not any(keyword in instruction_text for keyword in ["比例", "占比", "占", "几成"]):
-            return None
-
-        personal_result = next(
-            (
-                item
-                for item in tool_results
-                if item.get("toolName") == "search_personal_orders"
-            ),
-            None,
-        )
-        family_result = next(
-            (
-                item
-                for item in tool_results
-                if item.get("toolName") == "search_family_orders"
-            ),
-            None,
-        )
-        if not personal_result or not family_result:
-            return None
-
-        personal_summary = (
-            personal_result.get("calculationToolResults", {}).get("summary") or {}
-        )
-        family_summary = (
-            family_result.get("calculationToolResults", {}).get("summary") or {}
-        )
-        personal_total = self._to_float(personal_summary.get("expenseTotal"))
-        family_total = self._to_float(family_summary.get("expenseTotal"))
-        category = self._ratio_category_name(personal_result, family_result)
-
-        if family_total <= 0:
-            return f"当前家庭账本的{category}支出为0元，无法计算个人占家庭的比例。"
-
-        ratio = personal_total / family_total * 100
-        return (
-            f"当前用户的{category}支出占当前家庭账本{category}支出的"
-            f"{self._money_text(ratio)}%。"
-            f"个人{category}支出为{self._money_text(personal_total)}元，"
-            f"家庭{category}支出为{self._money_text(family_total)}元。"
-        )
-
-    def _ratio_category_name(
-        self,
-        personal_result: dict[str, Any],
-        family_result: dict[str, Any],
-    ) -> str:
-        personal_type = (
-            personal_result.get("args", {}).get("cost_type")
-            or personal_result.get("normalizedCostType")
-            or ""
-        )
-        family_type = (
-            family_result.get("args", {}).get("cost_type")
-            or family_result.get("normalizedCostType")
-            or ""
-        )
-        category = str(personal_type or family_type or "").strip()
-        return "" if category in {"", "不限"} else category
-
-    def _build_comparison_reply(self, data: dict[str, Any]) -> str | None:
-        comparison = data.get("comparisonToolResult") or {}
-        periods = comparison.get("periods") or []
-        if len(periods) < 2:
-            return None
-
-        lines = ["对比结果："]
-        for period in periods:
-            lines.append(
-                f"- {period.get('label', '未命名周期')}："
-                f"总支出{self._money_text(period.get('expenseTotal'))}元，"
-                f"总收入{self._money_text(period.get('incomeTotal'))}元，"
-                f"净收入{self._money_text(period.get('netIncomeMinusExpense'))}元。"
-            )
-
-        largest = comparison.get("largestExpensePeriod")
-        if largest:
-            lines.append(
-                f"支出最高的是{largest.get('label')}，"
-                f"总支出{self._money_text(largest.get('expenseTotal'))}元。"
-            )
-
-        if len(periods) == 2:
-            first, second = periods
-            difference = self._to_float(first.get("expenseTotal")) - self._to_float(
-                second.get("expenseTotal")
-            )
-            if difference > 0:
-                lines.append(
-                    f"{first.get('label')}比{second.get('label')}多支出"
-                    f"{self._money_text(difference)}元。"
-                )
-            elif difference < 0:
-                lines.append(
-                    f"{second.get('label')}比{first.get('label')}多支出"
-                    f"{self._money_text(abs(difference))}元。"
-                )
-            else:
-                lines.append("两个周期的总支出相同。")
-
-        return "\n".join(lines)
 
     def _safe_query_metadata(self, query: dict[str, Any]) -> dict[str, Any]:
         allowed_keys = {
@@ -635,15 +476,6 @@ class BookAgent:
         if isinstance(value, list):
             return any(self._contains_raw_orders(item) for item in value)
         return False
-
-    def _money_text(self, value: Any) -> str:
-        return f"{self._to_float(value):.2f}".rstrip("0").rstrip(".")
-
-    def _to_float(self, value: Any) -> float:
-        try:
-            return float(value or 0)
-        except (TypeError, ValueError):
-            return 0.0
 
     def _phone_tail(self, phone_num: str) -> str:
         value = str(phone_num or "")
