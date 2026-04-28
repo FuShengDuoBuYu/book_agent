@@ -59,7 +59,8 @@ PLANNER_SYSTEM_PROMPT = """
 - 如果用户说“这个月/本月”，使用当前年月。
 - 如果用户说“上个月/上月”，使用当前日期的上一个自然月。
 - 如果用户说“昨天/前天/今天”，生成 day 级别查询。
-- 如果用户只说“3月”“4月”这类月份，没有说年份，year=null，month=对应月份。Executor 会在用户账本里按月份过滤。
+- 如果用户只说“3月”“4月”这类月份，没有说年份，使用当前年份。
+- 只有用户明确说“不限年份/所有年份/全部年份/历年”时，才输出 year=null。
 - 不要输出 null 以外的字符串数字。
 """.strip()
 
@@ -148,8 +149,7 @@ class QueryPlanner:
         ]
         plan.toolCalls = self._dedupe_tool_calls(normalized_calls)
 
-        if not plan.summary or plan.summary == "本次账单分析计划":
-            plan.summary = self._build_summary(plan)
+        plan.summary = self._build_summary(plan)
         if not plan.finalInstruction:
             plan.finalInstruction = "根据所有工具结果回答用户问题。"
 
@@ -159,7 +159,7 @@ class QueryPlanner:
         self, tool_call: ToolCall, index: int, now: datetime, message: str
     ) -> ToolCall:
         args = tool_call.args
-        args.cost_type = args.cost_type or "不限"
+        args.cost_type = self._normalize_cost_type(args.cost_type)
         args.remark = args.remark or ""
 
         if args.year is None and args.month is None and args.day is None:
@@ -169,9 +169,9 @@ class QueryPlanner:
             args.year = args.year or now.year
             args.month = args.month or now.month
         elif args.month is not None:
-            args.year = args.year
+            args.year = args.year or now.year
 
-        if self._should_use_month_without_year(message, args.month):
+        if self._should_use_month_without_year(message):
             args.year = None
 
         tool_call.args = args
@@ -241,22 +241,33 @@ class QueryPlanner:
         )
         return re.sub(r"</?think>", "", without_blocks, flags=re.IGNORECASE)
 
-    def _should_use_month_without_year(
-        self, message: str, month: int | None
-    ) -> bool:
-        if month is None:
-            return False
+    def _normalize_cost_type(self, value: str | None) -> str:
+        cost_type = str(value or "").strip()
+        if not cost_type:
+            return "不限"
 
+        broad_words = {
+            "不限",
+            "全部",
+            "所有",
+            "支出",
+            "花费",
+            "消费",
+            "开销",
+            "费用",
+            "明细",
+            "支出明细",
+            "消费明细",
+            "花费明细",
+            "开销明细",
+            "各分类",
+            "分类",
+        }
+        return "不限" if cost_type in broad_words else cost_type
+
+    def _should_use_month_without_year(self, message: str) -> bool:
         text = message.strip()
-        if re.search(r"\d{4}\s*年", text):
-            return False
-        if any(keyword in text for keyword in ["今年", "本年", "去年", "前年"]):
-            return False
-        if any(keyword in text for keyword in ["这个月", "本月", "当月", "上个月", "上月"]):
-            return False
-
-        month_patterns = [
-            rf"(?<!\d){month}\s*月(?:份)?",
-            rf"(?<!\d){month:02d}\s*月(?:份)?",
-        ]
-        return any(re.search(pattern, text) for pattern in month_patterns)
+        return any(
+            keyword in text
+            for keyword in ["不限年份", "所有年份", "全部年份", "历年", "每一年"]
+        )

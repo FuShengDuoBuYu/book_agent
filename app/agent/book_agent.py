@@ -96,7 +96,8 @@ class BookAgent:
                         "type": "status",
                         "content": (
                             f"准备调用工具：{tool_call.id}，"
-                            f"{self._format_tool_call(tool_call)}"
+                            f"{self._format_tool_call(tool_call)}，"
+                            f"分类={tool_call.args.cost_type or '不限'}"
                         ),
                     }
                 orders_json = await self._execute_tool_calls(phone_num, plan)

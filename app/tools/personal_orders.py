@@ -34,6 +34,7 @@ async def search_personal_orders(
     """
 
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    normalized_cost_type = _normalize_cost_type(cost_type)
     should_filter_locally = year is None and (month is not None or day is not None)
     request = SearchOrdersRequest(
         phoneNum=phone_num,
@@ -42,7 +43,7 @@ async def search_personal_orders(
         month=month or now.month,
         day=day or now.day,
         searchOrderRemark=remark,
-        searchCostType=cost_type or "不限",
+        searchCostType=normalized_cost_type,
         ifIgnoreYear=year is None,
         ifIgnoreMonth=month is None,
         ifIgnoreDay=day is None,
@@ -96,6 +97,7 @@ async def search_personal_orders(
                 "month": month,
                 "day": day,
             },
+            "normalizedCostType": normalized_cost_type,
             "userInfo": parsed.data.userInfo,
             "ordersInfo": orders,
             "orderCount": len(orders),
@@ -106,6 +108,31 @@ async def search_personal_orders(
 
 def _to_json(value: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _normalize_cost_type(value: str | None) -> str:
+    cost_type = str(value or "").strip()
+    if not cost_type:
+        return "不限"
+
+    broad_words = {
+        "不限",
+        "全部",
+        "所有",
+        "支出",
+        "花费",
+        "消费",
+        "开销",
+        "费用",
+        "明细",
+        "支出明细",
+        "消费明细",
+        "花费明细",
+        "开销明细",
+        "各分类",
+        "分类",
+    }
+    return "不限" if cost_type in broad_words else cost_type
 
 
 def _filter_orders_locally(
