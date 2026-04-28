@@ -59,7 +59,7 @@ PLANNER_SYSTEM_PROMPT = """
 - 如果用户说“这个月/本月”，使用当前年月。
 - 如果用户说“上个月/上月”，使用当前日期的上一个自然月。
 - 如果用户说“昨天/前天/今天”，生成 day 级别查询。
-- 如果用户只说“3月”“4月”这类月份，没有说年份，使用当前年份。
+- 如果用户只说“3月”“4月”这类月份，没有说年份，year=null，month=对应月份。Executor 会在用户账本里按月份过滤。
 - 不要输出 null 以外的字符串数字。
 """.strip()
 
@@ -109,7 +109,7 @@ class QueryPlanner:
         ):
             plan = self._fallback_plan(now)
 
-        return self._normalize_plan(plan, now)
+        return self._normalize_plan(plan, now, message)
 
     def _extract_json(self, content: str) -> dict:
         content = self._strip_think_tags(content).strip()
@@ -125,7 +125,7 @@ class QueryPlanner:
 
         return json.loads(content[start : end + 1])
 
-    def _normalize_plan(self, plan: AgentPlan, now: datetime) -> AgentPlan:
+    def _normalize_plan(self, plan: AgentPlan, now: datetime, message: str) -> AgentPlan:
         if plan.intent != "analyze_orders":
             plan.needsTools = False
             plan.toolCalls = []
@@ -143,7 +143,7 @@ class QueryPlanner:
             plan.toolCalls = [self._default_month_tool_call(now)]
 
         normalized_calls = [
-            self._normalize_tool_call(tool_call, index, now)
+            self._normalize_tool_call(tool_call, index, now, message)
             for index, tool_call in enumerate(plan.toolCalls, start=1)
         ]
         plan.toolCalls = self._dedupe_tool_calls(normalized_calls)
@@ -156,7 +156,7 @@ class QueryPlanner:
         return plan
 
     def _normalize_tool_call(
-        self, tool_call: ToolCall, index: int, now: datetime
+        self, tool_call: ToolCall, index: int, now: datetime, message: str
     ) -> ToolCall:
         args = tool_call.args
         args.cost_type = args.cost_type or "不限"
@@ -169,7 +169,10 @@ class QueryPlanner:
             args.year = args.year or now.year
             args.month = args.month or now.month
         elif args.month is not None:
-            args.year = args.year or now.year
+            args.year = args.year
+
+        if self._should_use_month_without_year(message, args.month):
+            args.year = None
 
         tool_call.args = args
         if not tool_call.id:
@@ -218,6 +221,10 @@ class QueryPlanner:
     def _format_tool_call(self, tool_call: ToolCall) -> str:
         args = tool_call.args
         if args.year is None:
+            if args.month is not None and args.day is not None:
+                return f"{args.month}月{args.day}日个人账单（不限年份）"
+            if args.month is not None:
+                return f"{args.month}月个人账单（不限年份）"
             return "全部个人账单"
         if args.month is None:
             return f"{args.year}年个人账单"
@@ -233,3 +240,23 @@ class QueryPlanner:
             flags=re.DOTALL | re.IGNORECASE,
         )
         return re.sub(r"</?think>", "", without_blocks, flags=re.IGNORECASE)
+
+    def _should_use_month_without_year(
+        self, message: str, month: int | None
+    ) -> bool:
+        if month is None:
+            return False
+
+        text = message.strip()
+        if re.search(r"\d{4}\s*年", text):
+            return False
+        if any(keyword in text for keyword in ["今年", "本年", "去年", "前年"]):
+            return False
+        if any(keyword in text for keyword in ["这个月", "本月", "当月", "上个月", "上月"]):
+            return False
+
+        month_patterns = [
+            rf"(?<!\d){month}\s*月(?:份)?",
+            rf"(?<!\d){month:02d}\s*月(?:份)?",
+        ]
+        return any(re.search(pattern, text) for pattern in month_patterns)

@@ -1,5 +1,6 @@
 import json
 from collections.abc import AsyncIterator
+from typing import Any
 
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -90,13 +91,22 @@ class BookAgent:
             }
 
             if plan.needsTools:
+                for tool_call in plan.toolCalls:
+                    yield {
+                        "type": "status",
+                        "content": (
+                            f"准备调用工具：{tool_call.id}，"
+                            f"{self._format_tool_call(tool_call)}"
+                        ),
+                    }
                 orders_json = await self._execute_tool_calls(phone_num, plan)
                 order_count = self._extract_order_count(orders_json)
+                user_match_summary = self._extract_user_match_summary(orders_json)
                 yield {
                     "type": "status",
                     "content": (
                         f"已执行 {len(plan.toolCalls)} 个工具调用，"
-                        f"共获取 {order_count} 条账单"
+                        f"共获取 {order_count} 条账单，{user_match_summary}"
                     ),
                 }
             else:
@@ -165,6 +175,21 @@ class BookAgent:
             return int(data.get("totalOrderCount") or 0)
         return int(data.get("orderCount") or 0)
 
+    def _extract_user_match_summary(self, orders_json: str) -> str:
+        try:
+            data = json.loads(orders_json)
+        except json.JSONDecodeError:
+            return "用户身份状态未知"
+
+        tool_results = data.get("toolResults") or []
+        if not tool_results:
+            return "用户身份状态未知"
+        if all(item.get("userFound") for item in tool_results):
+            return "用户身份已匹配"
+        if any(item.get("userFound") for item in tool_results):
+            return "部分工具调用匹配到用户身份"
+        return "用户身份未匹配"
+
     async def _execute_tool_calls(self, phone_num: str, plan: AgentPlan) -> str:
         tool_results = []
         total_order_count = 0
@@ -174,6 +199,8 @@ class BookAgent:
             parsed_result = self._safe_json_loads(raw_result)
             order_count = int(parsed_result.get("orderCount") or 0)
             total_order_count += order_count
+            computed_analysis = self._compute_orders_analysis(parsed_result)
+            user_info_count = len(parsed_result.get("userInfo") or [])
             tool_results.append(
                 {
                     "toolCallId": tool_call.id,
@@ -182,6 +209,8 @@ class BookAgent:
                     "args": tool_call.args.model_dump(mode="json"),
                     "summary": self._format_tool_call(tool_call),
                     "orderCount": order_count,
+                    "userFound": user_info_count > 0,
+                    "computedAnalysis": computed_analysis,
                     "result": parsed_result,
                 }
             )
@@ -228,9 +257,109 @@ class BookAgent:
             return {"ok": False, "error": "invalid_tool_json", "raw": value}
         return data if isinstance(data, dict) else {"ok": False, "raw": data}
 
+    def _compute_orders_analysis(self, tool_result: dict[str, Any]) -> dict[str, Any]:
+        orders = tool_result.get("ordersInfo") or []
+        expense_orders = []
+        income_orders = []
+        category_totals: dict[str, float] = {}
+
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+
+            money = self._to_float(order.get("money"))
+            amount = abs(money)
+            if self._is_income_order(order, money):
+                income_orders.append(order)
+                continue
+
+            expense_orders.append(order)
+            category = str(order.get("costType") or "未分类")
+            category_totals[category] = round(category_totals.get(category, 0.0) + amount, 2)
+
+        expense_total = round(sum(abs(self._to_float(item.get("money"))) for item in expense_orders), 2)
+        income_total = round(sum(abs(self._to_float(item.get("money"))) for item in income_orders), 2)
+        top_expense = self._top_expense(expense_orders)
+        category_breakdown = [
+            {
+                "category": category,
+                "amount": amount,
+                "orderCount": sum(
+                    1 for order in expense_orders if str(order.get("costType") or "未分类") == category
+                ),
+            }
+            for category, amount in sorted(
+                category_totals.items(), key=lambda item: item[1], reverse=True
+            )
+        ]
+
+        return {
+            "orderCount": len(orders),
+            "expenseOrderCount": len(expense_orders),
+            "incomeOrderCount": len(income_orders),
+            "expenseTotal": expense_total,
+            "incomeTotal": income_total,
+            "netIncomeMinusExpense": round(income_total - expense_total, 2),
+            "categoryBreakdown": category_breakdown,
+            "topExpense": top_expense,
+        }
+
+    def _is_income_order(self, order: dict[str, Any], money: float) -> bool:
+        cost_type = str(order.get("costType") or "")
+        remark = str(order.get("orderRemark") or "")
+        income_keywords = ("收入", "工资", "奖金", "补贴", "报销", "退款", "转入", "到账")
+        expense_keywords = (
+            "饮食",
+            "餐饮",
+            "娱乐",
+            "交通",
+            "购物",
+            "房租",
+            "水电",
+            "日用",
+            "医疗",
+            "学习",
+            "聚会",
+            "其他",
+        )
+
+        if any(keyword in cost_type for keyword in income_keywords):
+            return True
+        if any(keyword in cost_type for keyword in expense_keywords):
+            return False
+        if any(keyword in remark for keyword in income_keywords):
+            return True
+        return money > 0 and not cost_type
+
+    def _top_expense(self, expense_orders: list[dict[str, Any]]) -> dict[str, Any] | None:
+        if not expense_orders:
+            return None
+
+        top_order = max(expense_orders, key=lambda item: abs(self._to_float(item.get("money"))))
+        return {
+            "amount": round(abs(self._to_float(top_order.get("money"))), 2),
+            "year": top_order.get("year"),
+            "month": top_order.get("month"),
+            "day": top_order.get("day"),
+            "clock": top_order.get("clock", ""),
+            "costType": top_order.get("costType", ""),
+            "orderRemark": top_order.get("orderRemark", ""),
+            "bankName": top_order.get("bankName", ""),
+        }
+
+    def _to_float(self, value: Any) -> float:
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
     def _format_tool_call(self, tool_call: ToolCall) -> str:
         args = tool_call.args
         if args.year is None:
+            if args.month is not None and args.day is not None:
+                return f"{args.month}月{args.day}日个人账单（不限年份）"
+            if args.month is not None:
+                return f"{args.month}月个人账单（不限年份）"
             return "全部个人账单"
         if args.month is None:
             return f"{args.year}年个人账单"

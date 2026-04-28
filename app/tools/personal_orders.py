@@ -34,6 +34,7 @@ async def search_personal_orders(
     """
 
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    should_filter_locally = year is None and (month is not None or day is not None)
     request = SearchOrdersRequest(
         phoneNum=phone_num,
         userId=phone_num,
@@ -82,11 +83,19 @@ async def search_personal_orders(
         )
 
     orders = [order.model_dump() for order in parsed.data.ordersInfo]
+    if should_filter_locally:
+        orders = _filter_orders_locally(orders, month=month, day=day)
+
     return _to_json(
         {
             "ok": parsed.success,
             "message": parsed.message,
             "query": request.model_dump(by_alias=True),
+            "localFilter": {
+                "enabled": should_filter_locally,
+                "month": month,
+                "day": day,
+            },
             "userInfo": parsed.data.userInfo,
             "ordersInfo": orders,
             "orderCount": len(orders),
@@ -97,6 +106,23 @@ async def search_personal_orders(
 
 def _to_json(value: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _filter_orders_locally(
+    orders: list[dict[str, Any]],
+    month: int | None = None,
+    day: int | None = None,
+) -> list[dict[str, Any]]:
+    filtered_orders = orders
+    if month is not None:
+        filtered_orders = [
+            order for order in filtered_orders if int(order.get("month") or 0) == month
+        ]
+    if day is not None:
+        filtered_orders = [
+            order for order in filtered_orders if int(order.get("day") or 0) == day
+        ]
+    return filtered_orders
 
 
 search_personal_orders_tool = StructuredTool.from_function(
