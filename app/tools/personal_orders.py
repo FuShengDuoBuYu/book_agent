@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from langchain_core.tools import StructuredTool
+from langsmith import traceable
 from pydantic import BaseModel, Field
 
 from app.clients.bookkeeping_api import BookkeepingApiClient
@@ -20,6 +21,11 @@ class SearchPersonalOrdersInput(BaseModel):
     remark: str = Field(default="", description="备注关键词，不传则不过滤")
 
 
+@traceable(
+    name="search_personal_orders",
+    run_type="tool",
+    process_inputs=lambda inputs: _mask_trace_inputs(inputs),
+)
 async def search_personal_orders(
     phone_num: str,
     year: int | None = None,
@@ -108,6 +114,20 @@ async def search_personal_orders(
 
 def _to_json(value: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _mask_phone(value: str) -> str:
+    phone = str(value or "")
+    if len(phone) <= 4:
+        return phone
+    return f"***{phone[-4:]}"
+
+
+def _mask_trace_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(inputs)
+    if "phone_num" in cleaned:
+        cleaned["phone_num"] = _mask_phone(cleaned["phone_num"])
+    return cleaned
 
 
 def _normalize_cost_type(value: str | None) -> str:

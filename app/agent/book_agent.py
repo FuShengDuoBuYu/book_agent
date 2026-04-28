@@ -3,6 +3,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from langchain_core.prompts import ChatPromptTemplate
+from langsmith import traceable
 
 from app.agent.planner import QueryPlanner
 from app.agent.prompts import BOOK_AGENT_ANALYSIS_PROMPT, BOOK_AGENT_SYSTEM_PROMPT
@@ -66,16 +67,11 @@ class BookAgent:
                 first_message=message,
             )
             yield {"type": "session", "sessionId": resolved_session_id}
-            history_messages = await self.memory.get_recent_messages(
-                phone_num=phone_num,
-                session_id=resolved_session_id,
-                limit=6,
-            )
-            yield {
-                "type": "status",
-                "content": f"已加载 {len(history_messages)} 条会话历史",
-            }
-            history_text = self._format_history(history_messages)
+            # Temporarily disable conversation history while debugging single-turn
+            # agent traces in LangSmith.
+            history_messages = []
+            yield {"type": "status", "content": "已暂时关闭会话历史"}
+            history_text = "无历史消息。"
             await self.memory.add_message(
                 phone_num=phone_num,
                 session_id=resolved_session_id,
@@ -84,7 +80,7 @@ class BookAgent:
             )
 
             yield {"type": "status", "content": "正在规划账单查询"}
-            plan = await self.planner.create_plan(message=message, history=history_text)
+            plan = await self._create_plan(message=message, history=history_text)
             yield {
                 "type": "status",
                 "content": f"查询计划：{plan.summary}",
@@ -100,7 +96,11 @@ class BookAgent:
                             f"分类={tool_call.args.cost_type or '不限'}"
                         ),
                     }
-                orders_json = await self._execute_tool_calls(phone_num, plan)
+                orders_json = await self._execute_tool_calls(
+                    phone_num=phone_num,
+                    phone_tail=self._phone_tail(phone_num),
+                    plan=plan,
+                )
                 order_count = self._extract_order_count(orders_json)
                 user_match_summary = self._extract_user_match_summary(orders_json)
                 yield {
@@ -191,7 +191,21 @@ class BookAgent:
             return "部分工具调用匹配到用户身份"
         return "用户身份未匹配"
 
-    async def _execute_tool_calls(self, phone_num: str, plan: AgentPlan) -> str:
+    @traceable(name="book_agent_create_plan", run_type="chain")
+    async def _create_plan(self, message: str, history: str) -> AgentPlan:
+        return await self.planner.create_plan(message=message, history=history)
+
+    @traceable(
+        name="book_agent_execute_tool_calls",
+        run_type="chain",
+        process_inputs=lambda inputs: BookAgent._mask_trace_inputs(inputs),
+    )
+    async def _execute_tool_calls(
+        self,
+        phone_num: str,
+        phone_tail: str,
+        plan: AgentPlan,
+    ) -> str:
         tool_results = []
         total_order_count = 0
 
@@ -250,6 +264,24 @@ class BookAgent:
             cost_type=args.cost_type,
             remark=args.remark,
         )
+
+    def _phone_tail(self, phone_num: str) -> str:
+        value = str(phone_num or "")
+        return value[-4:] if value else ""
+
+    @staticmethod
+    def _mask_phone(value: str) -> str:
+        phone = str(value or "")
+        if len(phone) <= 4:
+            return phone
+        return f"***{phone[-4:]}"
+
+    @staticmethod
+    def _mask_trace_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+        cleaned = {key: value for key, value in inputs.items() if key != "self"}
+        if "phone_num" in cleaned:
+            cleaned["phone_num"] = BookAgent._mask_phone(cleaned["phone_num"])
+        return cleaned
 
     def _safe_json_loads(self, value: str) -> dict:
         try:

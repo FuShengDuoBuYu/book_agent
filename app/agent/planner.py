@@ -5,6 +5,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from langchain_core.prompts import ChatPromptTemplate
+from langsmith import traceable
 from pydantic import ValidationError
 
 from app.core.config import get_settings
@@ -86,6 +87,7 @@ class QueryPlanner:
         )
         self.chain = self.prompt | get_planner_model()
 
+    @traceable(name="query_planner", run_type="chain")
     async def create_plan(self, message: str, history: str) -> AgentPlan:
         now = datetime.now(ZoneInfo("Asia/Shanghai"))
         try:
