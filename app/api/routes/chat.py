@@ -15,13 +15,17 @@ async def chat(request: ChatRequest) -> ChatResponse:
     agent = BookAgent()
 
     try:
-        reply = await agent.chat(phone_num=request.phoneNum, message=request.message)
+        reply, session_id = await agent.chat(
+            phone_num=request.phoneNum,
+            message=request.message,
+            session_id=request.sessionId,
+        )
     except ConnectionError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    return ChatResponse(reply=reply)
+    return ChatResponse(reply=reply, sessionId=session_id)
 
 
 @router.post("/chat/stream")
@@ -32,6 +36,7 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
         async for event in agent.stream_chat(
             phone_num=request.phoneNum,
             message=request.message,
+            session_id=request.sessionId,
         ):
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 

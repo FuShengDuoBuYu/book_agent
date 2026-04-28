@@ -37,6 +37,17 @@ ollama run qwen3:14b
 export OLLAMA_MODEL=qwen3:8b
 ```
 
+## 配置 MongoDB 记忆
+
+Agent 使用 MongoDB Atlas 保存会话和历史消息。连接串不要写进代码，启动前设置环境变量：
+
+```bash
+export AGENT_MONGODB_URI='mongodb+srv://用户名:密码@你的集群.mongodb.net/?appName=AutoBookKeeping'
+export AGENT_MONGODB_DB='book_agent'
+```
+
+如果更换过 Atlas 密码，记得同步更新 `AGENT_MONGODB_URI`。
+
 ## 启动服务
 
 安装后端依赖：
@@ -124,3 +135,5 @@ window.postMessage({
   phoneNum: "13800138000",
 });
 ```
+
+前端会按手机号在 `localStorage` 保存当前 `sessionId`，后端会用 `phoneNum + sessionId` 从 MongoDB 读取最近几轮会话历史。

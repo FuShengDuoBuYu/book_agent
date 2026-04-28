@@ -105,6 +105,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 const chatRef = ref(null);
 const inputRef = ref(null);
 const phoneNum = ref("");
+const sessionId = ref("");
 const draft = ref("");
 const messages = ref([]);
 const isBusy = ref(false);
@@ -172,6 +173,7 @@ function applyPhoneNum(value) {
   const nextValue = String(value || "").trim();
   if (!nextValue) return;
   phoneNum.value = nextValue;
+  sessionId.value = localStorage.getItem(sessionStorageKey(nextValue)) || "";
   showToast("用户身份已连接");
   nextTick(() => inputRef.value?.focus());
 }
@@ -338,6 +340,7 @@ async function sendMessage() {
       },
       body: JSON.stringify({
         phoneNum: phoneNum.value,
+        sessionId: sessionId.value || null,
         message,
       }),
     });
@@ -417,6 +420,11 @@ function handleStreamEvent(rawEvent, messageId) {
 
   if (payload.type === "status") {
     appendStep(messageId, payload.content);
+    return;
+  }
+
+  if (payload.type === "session") {
+    setSessionId(payload.sessionId);
     return;
   }
 
@@ -504,5 +512,16 @@ function sleep(ms) {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms);
   });
+}
+
+function setSessionId(value) {
+  const nextValue = String(value || "").trim();
+  if (!nextValue || !phoneNum.value) return;
+  sessionId.value = nextValue;
+  localStorage.setItem(sessionStorageKey(phoneNum.value), nextValue);
+}
+
+function sessionStorageKey(value) {
+  return `book_agent_session_${value}`;
 }
 </script>
