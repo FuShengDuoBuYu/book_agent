@@ -32,7 +32,33 @@
         :key="message.id"
         :class="['message', message.role, { error: message.error }]"
       >
-        <div class="bubble">{{ message.content }}</div>
+        <div class="message-stack">
+          <div v-if="message.steps?.length" class="thinking-drawer">
+            <button
+              class="thinking-toggle"
+              type="button"
+              @click="toggleSteps(message.id)"
+            >
+              <span>{{ message.done ? "处理完成" : "正在处理" }}</span>
+              <span class="thinking-meta">{{ message.steps.length }} 步</span>
+              <svg
+                :class="['chevron', { open: message.stepsOpen }]"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+              >
+                <path d="m6 9 6 6 6-6" />
+              </svg>
+            </button>
+            <div v-show="message.stepsOpen" class="thinking-panel">
+              <div v-for="step in message.steps" :key="step" class="step">
+                {{ step }}
+              </div>
+            </div>
+          </div>
+          <div :class="['bubble', { streaming: message.streaming }]">
+            {{ message.content }}
+          </div>
+        </div>
       </article>
     </section>
 
@@ -74,6 +100,7 @@ const isBusy = ref(false);
 const toast = ref("");
 let toastTimer = null;
 let messageId = 0;
+const streamQueues = new Map();
 
 const suggestions = [
   "我这个月花费最多的是什么？",
@@ -181,6 +208,10 @@ function appendMessage(role, content, error = false) {
     role,
     content,
     error,
+    steps: [],
+    stepsOpen: false,
+    done: false,
+    streaming: false,
   });
   scrollToBottom();
   return messageId;
@@ -191,6 +222,30 @@ function updateMessage(id, content, error = false) {
   if (!target) return;
   target.content = content;
   target.error = error;
+  target.streaming = false;
+  scrollToBottom();
+}
+
+function appendStep(id, content) {
+  const target = messages.value.find((message) => message.id === id);
+  if (!target) return;
+  target.steps.push(content);
+  target.stepsOpen = true;
+  scrollToBottom();
+}
+
+function toggleSteps(id) {
+  const target = messages.value.find((message) => message.id === id);
+  if (!target) return;
+  target.stepsOpen = !target.stepsOpen;
+}
+
+function markDone(id) {
+  const target = messages.value.find((message) => message.id === id);
+  if (!target) return;
+  target.done = true;
+  target.streaming = false;
+  target.stepsOpen = false;
   scrollToBottom();
 }
 
@@ -222,10 +277,10 @@ async function sendMessage() {
   draft.value = "";
   resizeInput();
   isBusy.value = true;
-  const loadingId = appendMessage("agent", "正在思考...");
+  const loadingId = appendMessage("agent", "");
 
   try {
-    const response = await fetch("/api/chat", {
+    const response = await fetch("/api/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -234,17 +289,138 @@ async function sendMessage() {
       }),
     });
 
-    const data = await response.json();
     if (!response.ok) {
+      const data = await response.json();
       throw new Error(data.detail || "请求失败");
     }
 
-    updateMessage(loadingId, data.reply);
+    await readStreamResponse(response, loadingId);
   } catch (error) {
     updateMessage(loadingId, error.message, true);
   } finally {
     isBusy.value = false;
     nextTick(() => inputRef.value?.focus());
   }
+}
+
+async function readStreamResponse(response, messageId) {
+  if (!response.body) {
+    throw new Error("当前环境不支持流式响应");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() || "";
+
+    for (const part of parts) {
+      handleStreamEvent(part, messageId);
+    }
+  }
+
+  if (buffer.trim()) {
+    handleStreamEvent(buffer, messageId);
+  }
+}
+
+function handleStreamEvent(rawEvent, messageId) {
+  const dataLine = rawEvent
+    .split("\n")
+    .find((line) => line.startsWith("data:"));
+  if (!dataLine) return;
+
+  const payload = JSON.parse(dataLine.slice(5).trim());
+
+  if (payload.type === "status") {
+    appendStep(messageId, payload.content);
+    return;
+  }
+
+  if (payload.type === "delta") {
+    enqueueDelta(messageId, payload.content);
+    return;
+  }
+
+  if (payload.type === "error") {
+    updateMessage(messageId, payload.content, true);
+    return;
+  }
+
+  if (payload.type === "done") {
+    finishStream(messageId);
+  }
+}
+
+function enqueueDelta(messageId, content) {
+  if (!content) return;
+
+  if (!streamQueues.has(messageId)) {
+    streamQueues.set(messageId, {
+      chunks: [],
+      running: false,
+      done: false,
+    });
+  }
+
+  const queue = streamQueues.get(messageId);
+  queue.chunks.push(content);
+
+  const target = messages.value.find((message) => message.id === messageId);
+  if (target) target.streaming = true;
+
+  if (!queue.running) {
+    processDeltaQueue(messageId);
+  }
+}
+
+async function processDeltaQueue(messageId) {
+  const queue = streamQueues.get(messageId);
+  if (!queue) return;
+
+  queue.running = true;
+
+  while (queue.chunks.length) {
+    const chunk = queue.chunks.shift();
+    const pieces = chunk.match(/.{1,3}/gs) || [chunk];
+
+    for (const piece of pieces) {
+      const target = messages.value.find((message) => message.id === messageId);
+      if (!target) break;
+      target.content += piece;
+      scrollToBottom();
+      await sleep(14);
+    }
+  }
+
+  queue.running = false;
+  const shouldMarkDone = queue.done;
+  streamQueues.delete(messageId);
+
+  if (shouldMarkDone) {
+    markDone(messageId);
+  }
+}
+
+function finishStream(messageId) {
+  const queue = streamQueues.get(messageId);
+  if (queue?.running || queue?.chunks.length) {
+    queue.done = true;
+    return;
+  }
+
+  markDone(messageId);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
 }
 </script>

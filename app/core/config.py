@@ -8,6 +8,7 @@ from pydantic import BaseModel
 class Settings(BaseModel):
     app_name: str = "book_agent"
     app_version: str = "0.1.0"
+    bookkeeping_api_base_url: str = "https://autobookkeeping-fastapi.onrender.com"
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:14b"
     ollama_temperature: float = 0.2
@@ -19,6 +20,9 @@ class Settings(BaseModel):
 def get_settings() -> Settings:
     defaults = Settings()
     return Settings(
+        bookkeeping_api_base_url=os.getenv(
+            "BOOKKEEPING_API_BASE_URL", defaults.bookkeeping_api_base_url
+        ),
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", defaults.ollama_base_url),
         ollama_model=os.getenv("OLLAMA_MODEL", defaults.ollama_model),
         ollama_temperature=float(

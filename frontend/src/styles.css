@@ -156,8 +156,11 @@ h1 {
   justify-content: flex-start;
 }
 
-.bubble {
+.message-stack {
   max-width: min(82%, 620px);
+}
+
+.bubble {
   font-size: 15px;
   line-height: 1.65;
   letter-spacing: 0;
@@ -171,6 +174,11 @@ h1 {
   background: var(--soft);
 }
 
+.user .message-stack {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .agent .bubble {
   padding: 4px 0;
 }
@@ -180,6 +188,82 @@ h1 {
   border-radius: 12px;
   background: var(--danger-bg);
   color: var(--danger);
+}
+
+.thinking-drawer {
+  margin-bottom: 10px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fff;
+  overflow: hidden;
+}
+
+.thinking-toggle {
+  display: grid;
+  grid-template-columns: auto auto 18px;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 38px;
+  padding: 0 10px;
+  color: #3f3f46;
+  font-size: 13px;
+  font-weight: 650;
+  text-align: left;
+}
+
+.thinking-meta {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.chevron {
+  width: 18px;
+  height: 18px;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+  transition: transform 160ms ease;
+}
+
+.chevron.open {
+  transform: rotate(180deg);
+}
+
+.thinking-panel {
+  display: grid;
+  gap: 6px;
+  padding: 0 10px 10px;
+}
+
+.step {
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: var(--soft);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.streaming::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 1em;
+  margin-left: 2px;
+  border-radius: 999px;
+  background: #171717;
+  vertical-align: -2px;
+  animation: blink 1s steps(2, start) infinite;
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
 }
 
 .composer {
