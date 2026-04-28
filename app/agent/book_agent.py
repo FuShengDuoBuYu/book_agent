@@ -55,6 +55,7 @@ class BookAgent:
             yield {"type": "status", "content": f"已获取 {order_count} 条账单"}
             yield {"type": "status", "content": "正在生成分析结果"}
 
+            think_parser = ThinkTagStreamParser()
             async for chunk in self.chain.astream(
                 {
                     "message": message,
@@ -64,7 +65,11 @@ class BookAgent:
             ):
                 content = getattr(chunk, "content", "")
                 if content:
-                    yield {"type": "delta", "content": content}
+                    for event in think_parser.feed(content):
+                        yield event
+
+            for event in think_parser.flush():
+                yield event
 
             yield {"type": "done", "content": ""}
         except Exception as exc:
@@ -114,3 +119,61 @@ class BookAgent:
             return 0
 
         return int(data.get("orderCount") or 0)
+
+
+class ThinkTagStreamParser:
+    start_tag = "<think>"
+    end_tag = "</think>"
+
+    def __init__(self) -> None:
+        self.buffer = ""
+        self.in_think = False
+
+    def feed(self, content: str) -> list[dict[str, str]]:
+        self.buffer += content
+        events: list[dict[str, str]] = []
+
+        while self.buffer:
+            tag = self.end_tag if self.in_think else self.start_tag
+            tag_index = self.buffer.find(tag)
+
+            if tag_index == -1:
+                keep_length = self._partial_tag_length(self.buffer, tag)
+                flush_length = len(self.buffer) - keep_length
+                if flush_length <= 0:
+                    break
+
+                text = self.buffer[:flush_length]
+                self.buffer = self.buffer[flush_length:]
+                events.append(self._event(text))
+                break
+
+            text = self.buffer[:tag_index]
+            if text:
+                events.append(self._event(text))
+
+            self.buffer = self.buffer[tag_index + len(tag) :]
+            self.in_think = not self.in_think
+
+        return [event for event in events if event["content"]]
+
+    def flush(self) -> list[dict[str, str]]:
+        if not self.buffer:
+            return []
+
+        event = self._event(self.buffer)
+        self.buffer = ""
+        return [event] if event["content"] else []
+
+    def _event(self, content: str) -> dict[str, str]:
+        return {
+            "type": "thinking" if self.in_think else "delta",
+            "content": content,
+        }
+
+    def _partial_tag_length(self, text: str, tag: str) -> int:
+        max_length = min(len(text), len(tag) - 1)
+        for length in range(max_length, 0, -1):
+            if text[-length:] == tag[:length]:
+                return length
+        return 0

@@ -50,12 +50,21 @@
               </svg>
             </button>
             <div v-show="message.stepsOpen" class="thinking-panel">
-              <div v-for="step in message.steps" :key="step" class="step">
-                {{ step }}
+              <div
+                v-for="step in message.steps"
+                :key="step.id"
+                :class="['step', step.kind]"
+              >
+                {{ step.content }}
               </div>
             </div>
           </div>
-          <div :class="['bubble', { streaming: message.streaming }]">
+          <div
+            v-if="message.role === 'agent'"
+            :class="['bubble', 'markdown-body', { streaming: message.streaming }]"
+            v-html="renderMarkdown(message.content)"
+          ></div>
+          <div v-else :class="['bubble', { streaming: message.streaming }]">
             {{ message.content }}
           </div>
         </div>
@@ -89,6 +98,8 @@
 </template>
 
 <script setup>
+import DOMPurify from "dompurify";
+import MarkdownIt from "markdown-it";
 import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 
 const chatRef = ref(null);
@@ -100,7 +111,14 @@ const isBusy = ref(false);
 const toast = ref("");
 let toastTimer = null;
 let messageId = 0;
+let stepId = 0;
 const streamQueues = new Map();
+const markdown = new MarkdownIt({
+  breaks: true,
+  html: false,
+  linkify: true,
+  typographer: true,
+});
 
 const suggestions = [
   "我这个月花费最多的是什么？",
@@ -194,6 +212,12 @@ function notifyNativeReady() {
   window.webkit?.messageHandlers?.bookAgentReady?.postMessage?.(payload);
 }
 
+function renderMarkdown(content) {
+  return DOMPurify.sanitize(markdown.render(content || ""), {
+    USE_PROFILES: { html: true },
+  });
+}
+
 function useSuggestion(text) {
   draft.value = text;
   nextTick(() => {
@@ -229,7 +253,33 @@ function updateMessage(id, content, error = false) {
 function appendStep(id, content) {
   const target = messages.value.find((message) => message.id === id);
   if (!target) return;
-  target.steps.push(content);
+  target.steps.push({
+    id: ++stepId,
+    kind: "status",
+    content,
+  });
+  target.stepsOpen = true;
+  scrollToBottom();
+}
+
+function appendThinking(id, content) {
+  const text = content.trim();
+  if (!text) return;
+
+  const target = messages.value.find((message) => message.id === id);
+  if (!target) return;
+
+  const lastStep = target.steps[target.steps.length - 1];
+  if (lastStep?.kind === "thinking") {
+    lastStep.content += text;
+  } else {
+    target.steps.push({
+      id: ++stepId,
+      kind: "thinking",
+      content: `模型思考：${text}`,
+    });
+  }
+
   target.stepsOpen = true;
   scrollToBottom();
 }
@@ -282,7 +332,10 @@ async function sendMessage() {
   try {
     const response = await fetch("/api/chat/stream", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "ngrok-skip-browser-warning": "true",
+      },
       body: JSON.stringify({
         phoneNum: phoneNum.value,
         message,
@@ -290,16 +343,40 @@ async function sendMessage() {
     });
 
     if (!response.ok) {
-      const data = await response.json();
-      throw new Error(data.detail || "请求失败");
+      throw new Error(await readErrorMessage(response));
     }
 
+    assertStreamResponse(response);
     await readStreamResponse(response, loadingId);
   } catch (error) {
     updateMessage(loadingId, error.message, true);
   } finally {
     isBusy.value = false;
     nextTick(() => inputRef.value?.focus());
+  }
+}
+
+async function readErrorMessage(response) {
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    const data = await response.json();
+    return data.detail || "请求失败";
+  }
+
+  const text = await response.text();
+  if (text.trim().startsWith("<!DOCTYPE")) {
+    return "请求没有到达 Agent API，而是返回了 HTML 页面。请确认后端已启动并重启到最新代码。";
+  }
+
+  return text || "请求失败";
+}
+
+function assertStreamResponse(response) {
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.includes("text/event-stream")) {
+    throw new Error(
+      "后端没有返回流式响应。请确认 /api/chat/stream 已生效，并重启 uvicorn。",
+    );
   }
 }
 
@@ -345,6 +422,11 @@ function handleStreamEvent(rawEvent, messageId) {
 
   if (payload.type === "delta") {
     enqueueDelta(messageId, payload.content);
+    return;
+  }
+
+  if (payload.type === "thinking") {
+    appendThinking(messageId, payload.content);
     return;
   }
 
