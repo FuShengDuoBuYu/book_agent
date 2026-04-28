@@ -19,8 +19,8 @@ class TopOrdersInput(OrdersJsonInput):
 class ComparePeriodsInput(BaseModel):
     periods_json: str = Field(
         description=(
-            "多个周期的 JSON 字符串。格式为数组，每项包含 label 和 ordersInfo，"
-            "也可以包含 calculationToolResults。"
+            "多个周期的压缩分析 JSON 字符串。格式为数组，每项包含 label 和 "
+            "calculationToolResults，不应包含原始 ordersInfo。"
         )
     )
 
@@ -216,22 +216,30 @@ def compare_periods(periods_json: str) -> str:
                 "incomeTotal": summary.get("incomeTotal", 0),
                 "netIncomeMinusExpense": summary.get("netIncomeMinusExpense", 0),
                 "topExpense": analysis.get("topExpenses", {}).get("maxExpense"),
-                "topExpenseCategory": categories[0] if categories else None,
-                "expenseCategories": categories,
+                "topExpenseCategory": _compact_category(categories[0]) if categories else None,
+                "topExpenseCategories": [_compact_category(item) for item in categories[:5]],
             }
         )
 
+    largest_expense_period = _max_row(rows, "expenseTotal")
+    largest_income_period = _max_row(rows, "incomeTotal")
     return _to_json(
         {
             "periods": rows,
-            "expenseTotalRanking": sorted(
-                rows, key=lambda item: item.get("expenseTotal", 0), reverse=True
-            ),
-            "incomeTotalRanking": sorted(
-                rows, key=lambda item: item.get("incomeTotal", 0), reverse=True
-            ),
-            "largestExpensePeriod": _max_row(rows, "expenseTotal"),
-            "largestIncomePeriod": _max_row(rows, "incomeTotal"),
+            "expenseTotalRanking": [
+                _ranking_row(item, "expenseTotal")
+                for item in sorted(
+                    rows, key=lambda item: item.get("expenseTotal", 0), reverse=True
+                )
+            ],
+            "incomeTotalRanking": [
+                _ranking_row(item, "incomeTotal")
+                for item in sorted(
+                    rows, key=lambda item: item.get("incomeTotal", 0), reverse=True
+                )
+            ],
+            "largestExpensePeriod": _ranking_row(largest_expense_period, "expenseTotal"),
+            "largestIncomePeriod": _ranking_row(largest_income_period, "incomeTotal"),
             "periodCount": len(rows),
         }
     )
@@ -401,6 +409,24 @@ def _max_row(rows: list[dict[str, Any]], key: str) -> dict[str, Any] | None:
     if not rows:
         return None
     return max(rows, key=lambda item: item.get(key, 0) or 0)
+
+
+def _compact_category(category: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": category.get("name", ""),
+        "amount": category.get("amount", 0),
+        "orderCount": category.get("orderCount", 0),
+        "ratioPercent": category.get("ratioPercent", 0),
+    }
+
+
+def _ranking_row(row: dict[str, Any] | None, metric: str) -> dict[str, Any] | None:
+    if not row:
+        return None
+    return {
+        "label": row.get("label", ""),
+        metric: row.get(metric, 0),
+    }
 
 
 def _to_json(value: dict[str, Any] | list[Any]) -> str:

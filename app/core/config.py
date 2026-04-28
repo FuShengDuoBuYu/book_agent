@@ -19,6 +19,7 @@ class Settings(BaseModel):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:14b"
     ollama_temperature: float = 0.2
+    ollama_num_ctx: int = 8192
     planner_timeout_seconds: float = 20.0
     planner_num_predict: int = 512
     request_timeout_seconds: float = 120.0
@@ -39,6 +40,7 @@ def get_settings() -> Settings:
         ollama_temperature=float(
             os.getenv("OLLAMA_TEMPERATURE", str(defaults.ollama_temperature))
         ),
+        ollama_num_ctx=int(os.getenv("OLLAMA_NUM_CTX", str(defaults.ollama_num_ctx))),
         planner_timeout_seconds=float(
             os.getenv(
                 "PLANNER_TIMEOUT_SECONDS", str(defaults.planner_timeout_seconds)

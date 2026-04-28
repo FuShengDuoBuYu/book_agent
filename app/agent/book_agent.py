@@ -77,13 +77,16 @@ class BookAgent:
                 first_message=message,
             )
             yield {"type": "session", "sessionId": resolved_session_id}
-            # 这里本来应该把历史消息拼回给 planner 和回答模型。
-            # 当前代码为了调试先强制关闭了多轮上下文，所以你会看到历史被置空。
-            # Temporarily disable conversation history while debugging single-turn
-            # agent traces in LangSmith.
-            history_messages = []
-            yield {"type": "status", "content": "已暂时关闭会话历史"}
-            history_text = "无历史消息。"
+            history_messages = await self.memory.get_recent_messages(
+                phone_num=phone_num,
+                session_id=resolved_session_id,
+                limit=6,
+            )
+            yield {
+                "type": "status",
+                "content": f"已加载 {len(history_messages)} 条会话历史",
+            }
+            history_text = self._format_history(history_messages)
             await self.memory.add_message(
                 phone_num=phone_num,
                 session_id=resolved_session_id,
@@ -128,12 +131,28 @@ class BookAgent:
                     {
                         "ok": True,
                         "message": "本轮无需查询账单。",
-                        "ordersInfo": [],
                         "orderCount": 0,
                     },
                     ensure_ascii=False,
                 )
+            self._assert_no_raw_orders_for_answer(orders_json)
             yield {"type": "status", "content": "正在生成分析结果"}
+
+            deterministic_reply = self._build_deterministic_reply(
+                plan=plan,
+                orders_json=orders_json,
+            )
+            if deterministic_reply:
+                assistant_chunks.append(deterministic_reply)
+                yield {"type": "delta", "content": deterministic_reply}
+                await self._save_assistant_reply(
+                    phone_num=phone_num,
+                    session_id=resolved_session_id,
+                    reply=deterministic_reply,
+                    plan=plan,
+                )
+                yield {"type": "done", "content": ""}
+                return
 
             # ThinkTagStreamParser 把模型流式输出拆成“思考”和“最终回答”两类事件。
             think_parser = ThinkTagStreamParser()
@@ -159,14 +178,12 @@ class BookAgent:
                 yield event
 
             assistant_reply = "".join(assistant_chunks).strip()
-            if assistant_reply and resolved_session_id:
-                await self.memory.add_message(
-                    phone_num=phone_num,
-                    session_id=resolved_session_id,
-                    role="assistant",
-                    content=assistant_reply,
-                    metadata={"plan": plan.model_dump(mode="json")},
-                )
+            await self._save_assistant_reply(
+                phone_num=phone_num,
+                session_id=resolved_session_id,
+                reply=assistant_reply,
+                plan=plan,
+            )
 
             yield {"type": "done", "content": ""}
         except Exception as exc:
@@ -206,6 +223,23 @@ class BookAgent:
             return "部分工具调用匹配到用户身份"
         return "用户身份未匹配"
 
+    async def _save_assistant_reply(
+        self,
+        phone_num: str,
+        session_id: str | None,
+        reply: str,
+        plan: AgentPlan,
+    ) -> None:
+        if not reply or not session_id:
+            return
+        await self.memory.add_message(
+            phone_num=phone_num,
+            session_id=session_id,
+            role="assistant",
+            content=reply,
+            metadata={"plan": plan.model_dump(mode="json")},
+        )
+
     @traceable(name="book_agent_create_plan", run_type="chain")
     async def _create_plan(self, message: str, history: str) -> AgentPlan:
         return await self.planner.create_plan(message=message, history=history)
@@ -242,7 +276,7 @@ class BookAgent:
                     "summary": self._format_tool_call(tool_call),
                     "orderCount": order_count,
                     "userFound": user_info_count > 0,
-                    "query": parsed_result.get("query", {}),
+                    "query": self._safe_query_metadata(parsed_result.get("query", {})),
                     "localFilter": parsed_result.get("localFilter", {}),
                     "normalizedCostType": parsed_result.get("normalizedCostType", "不限"),
                     "calculationToolResults": calculation_tool_results,
@@ -331,6 +365,152 @@ class BookAgent:
         )
         return self._safe_json_loads(raw_comparison)
 
+    def _build_deterministic_reply(
+        self,
+        plan: AgentPlan,
+        orders_json: str,
+    ) -> str | None:
+        data = self._safe_json_loads(orders_json)
+        if not data.get("ok", False):
+            return None
+        if not plan.needsTools:
+            return None
+
+        if plan.analysisType == "comparison":
+            return self._build_comparison_reply(data)
+
+        tool_results = data.get("toolResults") or []
+        if len(tool_results) != 1:
+            return None
+
+        tool_result = tool_results[0]
+        if not tool_result.get("userFound", False):
+            return "当前 App 传入的用户身份没有在账单后端找到。"
+        if int(tool_result.get("orderCount") or 0) == 0:
+            return f"{tool_result.get('summary', '当前查询范围')}没有查到账单记录。"
+
+        calculations = tool_result.get("calculationToolResults") or {}
+        summary = calculations.get("summary") or {}
+        label = str(tool_result.get("summary") or "当前查询范围")
+
+        if plan.analysisType == "total_spending":
+            return (
+                f"{label}总支出为{self._money_text(summary.get('expenseTotal'))}元。"
+                f"统计了{summary.get('expenseOrderCount', 0)}笔支出记录。"
+            )
+
+        if plan.analysisType == "income_expense":
+            return (
+                f"{label}总收入为{self._money_text(summary.get('incomeTotal'))}元。"
+                f"统计了{summary.get('incomeOrderCount', 0)}笔收入记录。"
+            )
+
+        if plan.analysisType == "category_expense":
+            categories = (
+                calculations.get("categoryBreakdown", {}).get("expenseCategories", [])
+            )
+            category_lines = [
+                f"{index}. {item.get('name', '未分类')}："
+                f"{self._money_text(item.get('amount'))}元"
+                f"（{item.get('orderCount', 0)}笔，占{item.get('ratioPercent', 0)}%）"
+                for index, item in enumerate(categories, start=1)
+            ]
+            return (
+                f"{label}总支出为{self._money_text(summary.get('expenseTotal'))}元。\n"
+                + "\n".join(category_lines)
+            ).strip()
+
+        if plan.analysisType == "highest_expense":
+            max_expense = calculations.get("topExpenses", {}).get("maxExpense")
+            if not max_expense:
+                return f"{label}没有支出记录。"
+            return (
+                f"{label}最高单笔支出为{self._money_text(max_expense.get('amount'))}元，"
+                f"类别是{max_expense.get('costType') or '未分类'}，"
+                f"日期是{max_expense.get('date') or '未知日期'}。"
+            )
+
+        return None
+
+    def _build_comparison_reply(self, data: dict[str, Any]) -> str | None:
+        comparison = data.get("comparisonToolResult") or {}
+        periods = comparison.get("periods") or []
+        if len(periods) < 2:
+            return None
+
+        lines = ["对比结果："]
+        for period in periods:
+            lines.append(
+                f"- {period.get('label', '未命名周期')}："
+                f"总支出{self._money_text(period.get('expenseTotal'))}元，"
+                f"总收入{self._money_text(period.get('incomeTotal'))}元，"
+                f"净收入{self._money_text(period.get('netIncomeMinusExpense'))}元。"
+            )
+
+        largest = comparison.get("largestExpensePeriod")
+        if largest:
+            lines.append(
+                f"支出最高的是{largest.get('label')}，"
+                f"总支出{self._money_text(largest.get('expenseTotal'))}元。"
+            )
+
+        if len(periods) == 2:
+            first, second = periods
+            difference = self._to_float(first.get("expenseTotal")) - self._to_float(
+                second.get("expenseTotal")
+            )
+            if difference > 0:
+                lines.append(
+                    f"{first.get('label')}比{second.get('label')}多支出"
+                    f"{self._money_text(difference)}元。"
+                )
+            elif difference < 0:
+                lines.append(
+                    f"{second.get('label')}比{first.get('label')}多支出"
+                    f"{self._money_text(abs(difference))}元。"
+                )
+            else:
+                lines.append("两个周期的总支出相同。")
+
+        return "\n".join(lines)
+
+    def _safe_query_metadata(self, query: dict[str, Any]) -> dict[str, Any]:
+        allowed_keys = {
+            "mode",
+            "year",
+            "month",
+            "day",
+            "searchOrderRemark",
+            "searchCostType",
+            "ifIgnoreYear",
+            "ifIgnoreMonth",
+            "ifIgnoreDay",
+        }
+        return {key: value for key, value in query.items() if key in allowed_keys}
+
+    def _assert_no_raw_orders_for_answer(self, orders_json: str) -> None:
+        data = self._safe_json_loads(orders_json)
+        if self._contains_raw_orders(data):
+            raise RuntimeError("内部错误：最终回答 payload 中包含原始账单明细。")
+
+    def _contains_raw_orders(self, value: Any) -> bool:
+        if isinstance(value, dict):
+            if "ordersInfo" in value or "result" in value:
+                return True
+            return any(self._contains_raw_orders(item) for item in value.values())
+        if isinstance(value, list):
+            return any(self._contains_raw_orders(item) for item in value)
+        return False
+
+    def _money_text(self, value: Any) -> str:
+        return f"{self._to_float(value):.2f}".rstrip("0").rstrip(".")
+
+    def _to_float(self, value: Any) -> float:
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
     def _phone_tail(self, phone_num: str) -> str:
         value = str(phone_num or "")
         return value[-4:] if value else ""
@@ -380,7 +560,7 @@ class BookAgent:
             role = "用户" if item.get("role") == "user" else "助手"
             content = str(item.get("content", "")).strip()
             if content:
-                lines.append(f"{role}: {content}")
+                lines.append(f"{role}: {self._sanitize_history_content(content)}")
             plan = item.get("metadata", {}).get("plan")
             if plan:
                 lines.append(
@@ -389,6 +569,24 @@ class BookAgent:
                 )
 
         return "\n".join(lines) or "无历史消息。"
+
+    def _sanitize_history_content(self, content: str) -> str:
+        markers = [
+            '"toolResults"',
+            "toolResults",
+            '"ordersInfo"',
+            "ordersInfo",
+            '"calculationToolResults"',
+            "calculationToolResults",
+            '"comparisonToolResult"',
+            "comparisonToolResult",
+        ]
+        cleaned = content
+        for marker in markers:
+            marker_index = cleaned.find(marker)
+            if marker_index != -1:
+                cleaned = cleaned[:marker_index].strip()
+        return cleaned[:600]
 
 
 class ThinkTagStreamParser:
