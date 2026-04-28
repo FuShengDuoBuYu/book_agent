@@ -19,7 +19,7 @@ AnalysisType = Literal[
     "unknown",
 ]
 # 这个是Agent在规划层可以调用的tools的名单
-ToolName = Literal["search_personal_orders"]
+ToolName = Literal["search_personal_orders", "search_family_orders"]
 
 
 class SearchPersonalOrdersArgs(BaseModel):

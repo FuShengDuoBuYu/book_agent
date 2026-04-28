@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -6,6 +8,12 @@ class ChatRequest(BaseModel):
     phoneNum: str = Field(..., min_length=1, description="User phone number")
     message: str = Field(..., min_length=1, description="User message")
     sessionId: str | None = Field(default=None, description="Conversation session id")
+    mode: Literal["个人版", "家庭版"] = Field(
+        default="个人版", description="Bookkeeping mode"
+    )
+    familyId: str | None = Field(
+        default=None, description="Family id, required for family mode when available"
+    )
 
 
 class ChatResponse(BaseModel):

@@ -21,3 +21,10 @@ class BookkeepingApiClient:
             response.raise_for_status()
 
         return response.json()
+
+    async def get_user(self, phone_num: str) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.get(f"{self.base_url}/user/getUser/{phone_num}")
+            response.raise_for_status()
+
+        return response.json()

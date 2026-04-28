@@ -20,6 +20,8 @@ async def chat(request: ChatRequest) -> ChatResponse:
             phone_num=request.phoneNum,
             message=request.message,
             session_id=request.sessionId,
+            mode=request.mode,
+            family_id=request.familyId,
         )
     except ConnectionError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -39,6 +41,8 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
             phone_num=request.phoneNum,
             message=request.message,
             session_id=request.sessionId,
+            mode=request.mode,
+            family_id=request.familyId,
         ):
             # SSE 协议要求每个事件都以 data: 开头，并以空行结束。
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"

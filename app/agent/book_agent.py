@@ -17,6 +17,7 @@ from app.tools.order_calculations import (
     find_top_expenses,
     find_top_incomes,
 )
+from app.tools.family_orders import search_family_orders
 from app.tools.personal_orders import search_personal_orders
 
 
@@ -42,6 +43,8 @@ class BookAgent:
         phone_num: str,
         message: str,
         session_id: str | None = None,
+        mode: str = "个人版",
+        family_id: str | None = None,
     ) -> tuple[str, str | None]:
         chunks: list[str] = []
         resolved_session_id: str | None = None
@@ -49,6 +52,8 @@ class BookAgent:
             phone_num=phone_num,
             message=message,
             session_id=session_id,
+            mode=mode,
+            family_id=family_id,
         ):
             if event["type"] == "session":
                 resolved_session_id = event["sessionId"]
@@ -64,13 +69,18 @@ class BookAgent:
         phone_num: str,
         message: str,
         session_id: str | None = None,
+        mode: str = "个人版",
+        family_id: str | None = None,
     ) -> AsyncIterator[dict[str, str]]:
         # stream_chat 是整个 Agent 的主流程。
         # 前端看到的 status / thinking / delta / done 事件，都是从这里连续产出的。
         resolved_session_id: str | None = None
         assistant_chunks: list[str] = []
         try:
+            book_mode = self._normalize_mode(mode)
+            family_id = str(family_id or "").strip()
             yield {"type": "status", "content": "正在解析你的问题"}
+            yield {"type": "status", "content": f"当前账本模式：{book_mode}"}
             resolved_session_id = await self.memory.ensure_session(
                 phone_num=phone_num,
                 session_id=session_id,
@@ -95,10 +105,12 @@ class BookAgent:
             )
 
             yield {"type": "status", "content": "正在规划账单查询"}
-            plan = await self._create_plan(message=message, history=history_text)
+            plan = await self._create_plan(
+                message=message, history=history_text, book_mode=book_mode
+            )
             yield {
                 "type": "status",
-                "content": f"查询计划：{plan.summary}",
+                "content": f"查询计划：{self._scope_text(plan.summary, book_mode)}",
             }
 
             if plan.needsTools:
@@ -107,13 +119,15 @@ class BookAgent:
                         "type": "status",
                         "content": (
                             f"准备调用工具：{tool_call.id}，"
-                            f"{self._format_tool_call(tool_call)}，"
+                            f"{self._format_tool_call(tool_call, book_mode)}，"
                             f"分类={tool_call.args.cost_type or '不限'}"
                         ),
                     }
                 orders_json = await self._execute_tool_calls(
                     phone_num=phone_num,
                     phone_tail=self._phone_tail(phone_num),
+                    mode=book_mode,
+                    family_id=family_id,
                     plan=plan,
                 )
                 order_count = self._extract_order_count(orders_json)
@@ -241,8 +255,14 @@ class BookAgent:
         )
 
     @traceable(name="book_agent_create_plan", run_type="chain")
-    async def _create_plan(self, message: str, history: str) -> AgentPlan:
-        return await self.planner.create_plan(message=message, history=history)
+    async def _create_plan(
+        self, message: str, history: str, book_mode: str
+    ) -> AgentPlan:
+        return await self.planner.create_plan(
+            message=message,
+            history=history,
+            book_mode=book_mode,
+        )
 
     @traceable(
         name="book_agent_execute_tool_calls",
@@ -253,14 +273,23 @@ class BookAgent:
         self,
         phone_num: str,
         phone_tail: str,
+        mode: str,
+        family_id: str | None,
         plan: AgentPlan,
     ) -> str:
         # 一个 plan 里可能包含多个 tool call，例如“对比上月和本月”会产生两次查询。
         tool_results = []
         total_order_count = 0
+        book_mode = self._normalize_mode(mode)
+        family_id = str(family_id or "").strip()
 
         for tool_call in plan.toolCalls:
-            raw_result = await self._execute_tool_call(phone_num, tool_call)
+            raw_result = await self._execute_tool_call(
+                phone_num=phone_num,
+                tool_call=tool_call,
+                mode=book_mode,
+                family_id=family_id,
+            )
             parsed_result = self._safe_json_loads(raw_result)
             order_count = int(parsed_result.get("orderCount") or 0)
             total_order_count += order_count
@@ -273,7 +302,13 @@ class BookAgent:
                     "toolName": tool_call.toolName,
                     "reason": tool_call.reason,
                     "args": tool_call.args.model_dump(mode="json"),
-                    "summary": self._format_tool_call(tool_call),
+                    "summary": self._format_tool_call(tool_call, book_mode),
+                    "mode": parsed_result.get("mode", book_mode),
+                    "ok": parsed_result.get("ok", False),
+                    "error": parsed_result.get("error"),
+                    "message": parsed_result.get("message"),
+                    "familyIdSet": bool(parsed_result.get("familyIdSet")),
+                    "familyIdResolved": bool(parsed_result.get("familyIdResolved")),
                     "orderCount": order_count,
                     "userFound": user_info_count > 0,
                     "query": self._safe_query_metadata(parsed_result.get("query", {})),
@@ -291,8 +326,11 @@ class BookAgent:
             {
                 "ok": True,
                 "message": "账单查询完成。",
-                "planSummary": plan.summary,
+                "planSummary": self._scope_text(plan.summary, book_mode),
                 "analysisType": plan.analysisType,
+                "mode": book_mode,
+                "familyIdSet": bool(family_id)
+                or any(item.get("familyIdSet") for item in tool_results),
                 "finalInstruction": plan.finalInstruction,
                 "totalOrderCount": total_order_count,
                 "toolResults": tool_results,
@@ -302,9 +340,15 @@ class BookAgent:
             default=str,
         )
 
-    async def _execute_tool_call(self, phone_num: str, tool_call: ToolCall) -> str:
-        # Planner 只负责决定“查什么”，真正执行时才把当前用户手机号注入进去。
-        if tool_call.toolName != "search_personal_orders":
+    async def _execute_tool_call(
+        self,
+        phone_num: str,
+        tool_call: ToolCall,
+        mode: str,
+        family_id: str | None,
+    ) -> str:
+        # Planner 只负责决定“查什么”，真正执行时才把当前身份和账本模式注入进去。
+        if tool_call.toolName not in {"search_personal_orders", "search_family_orders"}:
             return json.dumps(
                 {
                     "ok": False,
@@ -315,6 +359,17 @@ class BookAgent:
             )
 
         args = tool_call.args
+        if tool_call.toolName == "search_family_orders":
+            return await search_family_orders(
+                phone_num=phone_num,
+                family_id=family_id or "",
+                year=args.year,
+                month=args.month,
+                day=args.day,
+                cost_type=args.cost_type,
+                remark=args.remark,
+            )
+
         return await search_personal_orders(
             phone_num=phone_num,
             year=args.year,
@@ -380,10 +435,19 @@ class BookAgent:
             return self._build_comparison_reply(data)
 
         tool_results = data.get("toolResults") or []
+        personal_family_ratio = self._build_personal_family_ratio_reply(
+            plan=plan,
+            tool_results=tool_results,
+        )
+        if personal_family_ratio:
+            return personal_family_ratio
+
         if len(tool_results) != 1:
             return None
 
         tool_result = tool_results[0]
+        if tool_result.get("error") == "missing_family_id":
+            return "家庭版查询需要 familyId，但当前用户资料里没有找到家庭 ID。请确认该账号已经创建或加入家庭。"
         if not tool_result.get("userFound", False):
             return "当前 App 传入的用户身份没有在账单后端找到。"
         if int(tool_result.get("orderCount") or 0) == 0:
@@ -431,6 +495,76 @@ class BookAgent:
             )
 
         return None
+
+    def _build_personal_family_ratio_reply(
+        self,
+        plan: AgentPlan,
+        tool_results: list[dict[str, Any]],
+    ) -> str | None:
+        if len(tool_results) < 2:
+            return None
+
+        instruction_text = f"{plan.finalInstruction} {plan.summary} {plan.reason}"
+        if not any(keyword in instruction_text for keyword in ["比例", "占比", "占", "几成"]):
+            return None
+
+        personal_result = next(
+            (
+                item
+                for item in tool_results
+                if item.get("toolName") == "search_personal_orders"
+            ),
+            None,
+        )
+        family_result = next(
+            (
+                item
+                for item in tool_results
+                if item.get("toolName") == "search_family_orders"
+            ),
+            None,
+        )
+        if not personal_result or not family_result:
+            return None
+
+        personal_summary = (
+            personal_result.get("calculationToolResults", {}).get("summary") or {}
+        )
+        family_summary = (
+            family_result.get("calculationToolResults", {}).get("summary") or {}
+        )
+        personal_total = self._to_float(personal_summary.get("expenseTotal"))
+        family_total = self._to_float(family_summary.get("expenseTotal"))
+        category = self._ratio_category_name(personal_result, family_result)
+
+        if family_total <= 0:
+            return f"当前家庭账本的{category}支出为0元，无法计算个人占家庭的比例。"
+
+        ratio = personal_total / family_total * 100
+        return (
+            f"当前用户的{category}支出占当前家庭账本{category}支出的"
+            f"{self._money_text(ratio)}%。"
+            f"个人{category}支出为{self._money_text(personal_total)}元，"
+            f"家庭{category}支出为{self._money_text(family_total)}元。"
+        )
+
+    def _ratio_category_name(
+        self,
+        personal_result: dict[str, Any],
+        family_result: dict[str, Any],
+    ) -> str:
+        personal_type = (
+            personal_result.get("args", {}).get("cost_type")
+            or personal_result.get("normalizedCostType")
+            or ""
+        )
+        family_type = (
+            family_result.get("args", {}).get("cost_type")
+            or family_result.get("normalizedCostType")
+            or ""
+        )
+        category = str(personal_type or family_type or "").strip()
+        return "" if category in {"", "不限"} else category
 
     def _build_comparison_reply(self, data: dict[str, Any]) -> str | None:
         comparison = data.get("comparisonToolResult") or {}
@@ -515,6 +649,17 @@ class BookAgent:
         value = str(phone_num or "")
         return value[-4:] if value else ""
 
+    def _normalize_mode(self, value: str | None) -> str:
+        mode = str(value or "").strip()
+        if mode in {"家庭版", "家庭", "family", "family_mode"}:
+            return "家庭版"
+        return "个人版"
+
+    def _scope_text(self, text: str, mode: str) -> str:
+        if self._normalize_mode(mode) != "家庭版":
+            return text
+        return str(text or "").replace("个人账单", "家庭账单")
+
     @staticmethod
     def _mask_phone(value: str) -> str:
         phone = str(value or "")
@@ -527,6 +672,8 @@ class BookAgent:
         cleaned = {key: value for key, value in inputs.items() if key != "self"}
         if "phone_num" in cleaned:
             cleaned["phone_num"] = BookAgent._mask_phone(cleaned["phone_num"])
+        if "family_id" in cleaned and cleaned["family_id"]:
+            cleaned["family_id"] = "***"
         return cleaned
 
     def _safe_json_loads(self, value: str) -> dict:
@@ -537,19 +684,20 @@ class BookAgent:
             return {"ok": False, "error": "invalid_tool_json", "raw": value}
         return data if isinstance(data, dict) else {"ok": False, "raw": data}
 
-    def _format_tool_call(self, tool_call: ToolCall) -> str:
+    def _format_tool_call(self, tool_call: ToolCall, mode: str = "个人版") -> str:
         args = tool_call.args
+        scope = self._normalize_mode(mode).replace("版", "")
         if args.year is None:
             if args.month is not None and args.day is not None:
-                return f"{args.month}月{args.day}日个人账单（不限年份）"
+                return f"{args.month}月{args.day}日{scope}账单（不限年份）"
             if args.month is not None:
-                return f"{args.month}月个人账单（不限年份）"
-            return "全部个人账单"
+                return f"{args.month}月{scope}账单（不限年份）"
+            return f"全部{scope}账单"
         if args.month is None:
-            return f"{args.year}年个人账单"
+            return f"{args.year}年{scope}账单"
         if args.day is None:
-            return f"{args.year}年{args.month}月个人账单"
-        return f"{args.year}年{args.month}月{args.day}日个人账单"
+            return f"{args.year}年{args.month}月{scope}账单"
+        return f"{args.year}年{args.month}月{args.day}日{scope}账单"
 
     def _format_history(self, messages: list[dict]) -> str:
         if not messages:

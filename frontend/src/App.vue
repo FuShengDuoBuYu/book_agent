@@ -7,6 +7,35 @@
       </div>
     </header>
 
+    <section class="mode-panel" aria-label="账本模式">
+      <div class="mode-switch">
+        <button
+          type="button"
+          :class="{ active: bookMode === '个人版' }"
+          @click="setBookMode('个人版')"
+        >
+          个人版
+        </button>
+        <button
+          type="button"
+          :class="{ active: bookMode === '家庭版' }"
+          @click="setBookMode('家庭版')"
+        >
+          家庭版
+        </button>
+      </div>
+      <input
+        v-if="isFamilyMode"
+        v-model="familyId"
+        class="family-input"
+        type="text"
+        inputmode="text"
+        autocomplete="off"
+        placeholder="familyId，可留空自动获取"
+        @change="syncSessionId"
+      />
+    </section>
+
     <section v-if="!phoneNum" class="context-banner">
       等待 App 注入用户身份后即可开始对话。
     </section>
@@ -107,6 +136,8 @@ const chatRef = ref(null);
 const inputRef = ref(null);
 const phoneNum = ref("");
 const sessionId = ref("");
+const bookMode = ref("个人版");
+const familyId = ref("");
 const draft = ref("");
 const messages = ref([]);
 const isBusy = ref(false);
@@ -129,12 +160,13 @@ const suggestions = [
 ];
 
 const subtitle = computed(() =>
-  phoneNum.value ? "已连接 App 用户身份" : "自动记账 Agent",
+  phoneNum.value ? `已连接 App 用户身份 · ${bookMode.value}` : "自动记账 Agent",
 );
+const isFamilyMode = computed(() => bookMode.value === "家庭版");
 
 onMounted(() => {
   // 页面初始化时，优先从 URL、原生注入对象里恢复用户身份。
-  applyPhoneNum(resolveInitialPhoneNum());
+  applyBookAgentContext(resolveInitialContext());
   window.setBookAgentContext = setBookAgentContext;
   window.setBookAgentPhoneNum = (value) => applyPhoneNum(value);
   window.addEventListener("message", handleNativeMessage);
@@ -156,30 +188,58 @@ function showToast(text) {
   }, 2200);
 }
 
-function resolveInitialPhoneNum() {
+function resolveInitialContext() {
   const params = new URLSearchParams(window.location.search);
   const context = window.__BOOK_AGENT_CONTEXT__ || {};
 
-  return params.get("phoneNum") || context.phoneNum;
+  return {
+    phoneNum: params.get("phoneNum") || context.phoneNum,
+    mode: params.get("mode") || params.get("bookMode") || context.mode || context.bookMode,
+    familyId:
+      params.get("familyId") ||
+      params.get("familyID") ||
+      params.get("family") ||
+      context.familyId ||
+      context.familyID,
+  };
+}
+
+function applyBookAgentContext(context) {
+  if (!context) return;
+  if (typeof context === "string") {
+    applyPhoneNum(context);
+    return;
+  }
+
+  setBookMode(context.mode || context.bookMode || bookMode.value, false);
+  applyFamilyId(context.familyId || context.familyID || context.family);
+  applyPhoneNum(context.phoneNum || context.phone || context.userId);
 }
 
 function applyPhoneNum(value) {
   const nextValue = String(value || "").trim();
   if (!nextValue) return;
   phoneNum.value = nextValue;
-  // sessionId 按手机号分桶存储，这样同一个 WebView 重开后还能续聊。
-  sessionId.value = localStorage.getItem(sessionStorageKey(nextValue)) || "";
+  syncSessionId();
   showToast("用户身份已连接");
   nextTick(() => inputRef.value?.focus());
 }
 
-function setBookAgentContext(context) {
-  if (typeof context === "string") {
-    applyPhoneNum(context);
-    return;
-  }
+function setBookMode(value, notify = true) {
+  const nextMode = normalizeBookMode(value);
+  if (bookMode.value === nextMode) return;
+  bookMode.value = nextMode;
+  syncSessionId();
+  if (notify) showToast(`已切换到${nextMode}`);
+}
 
-  applyPhoneNum(context?.phoneNum || context?.phone || context?.userId);
+function applyFamilyId(value) {
+  familyId.value = String(value || "").trim();
+  syncSessionId();
+}
+
+function setBookAgentContext(context) {
+  applyBookAgentContext(context);
 }
 
 function handleNativeMessage(event) {
@@ -339,6 +399,8 @@ async function sendMessage() {
       body: JSON.stringify({
         phoneNum: phoneNum.value,
         sessionId: sessionId.value || null,
+        mode: bookMode.value,
+        familyId: isFamilyMode.value ? familyId.value || null : null,
         message,
       }),
     });
@@ -521,10 +583,25 @@ function setSessionId(value) {
   const nextValue = String(value || "").trim();
   if (!nextValue || !phoneNum.value) return;
   sessionId.value = nextValue;
-  localStorage.setItem(sessionStorageKey(phoneNum.value), nextValue);
+  localStorage.setItem(sessionStorageKey(), nextValue);
 }
 
-function sessionStorageKey(value) {
-  return `book_agent_session_${value}`;
+function syncSessionId() {
+  if (!phoneNum.value) {
+    sessionId.value = "";
+    return;
+  }
+  sessionId.value = localStorage.getItem(sessionStorageKey()) || "";
+}
+
+function normalizeBookMode(value) {
+  return ["家庭版", "家庭", "family", "family_mode"].includes(String(value || "").trim())
+    ? "家庭版"
+    : "个人版";
+}
+
+function sessionStorageKey() {
+  const scope = isFamilyMode.value ? familyId.value || "auto_family" : "personal";
+  return `book_agent_session_${phoneNum.value}_${bookMode.value}_${scope}`;
 }
 </script>
