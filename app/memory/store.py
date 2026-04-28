@@ -11,6 +11,7 @@ class MongoMemoryStore:
         session_id: str | None,
         first_message: str,
     ) -> str:
+        # session 的职责是把一轮轮消息归到同一个会话里，便于多轮上下文和前端续聊。
         db = get_memory_db()
         now = datetime.now(UTC)
 
@@ -46,6 +47,7 @@ class MongoMemoryStore:
         content: str,
         metadata: dict | None = None,
     ) -> None:
+        # 消息和 session 分表存储：前者保存聊天内容，后者保存会话元信息。
         db = get_memory_db()
         now = datetime.now(UTC)
 
@@ -71,6 +73,7 @@ class MongoMemoryStore:
         session_id: str,
         limit: int = 6,
     ) -> list[dict]:
+        # 读取时先倒序取最近 N 条，再 reverse 回正序，方便直接喂给模型。
         db = get_memory_db()
         cursor = (
             db.agent_messages.find(
@@ -85,5 +88,6 @@ class MongoMemoryStore:
         return messages
 
     def _build_title(self, message: str) -> str:
+        # 会话标题直接从首条用户消息截取，简单但足够用于列表展示。
         title = message.strip().replace("\n", " ")
         return title[:30] or "新对话"

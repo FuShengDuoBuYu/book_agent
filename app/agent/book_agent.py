@@ -22,6 +22,7 @@ from app.tools.personal_orders import search_personal_orders
 
 class BookAgent:
     def __init__(self) -> None:
+        # BookAgent 是总编排器：接用户输入、调 planner、调工具、再把结果交给模型生成答案。
         self.prompt = ChatPromptTemplate.from_messages(
             [
                 ("system", BOOK_AGENT_SYSTEM_PROMPT),
@@ -64,6 +65,8 @@ class BookAgent:
         message: str,
         session_id: str | None = None,
     ) -> AsyncIterator[dict[str, str]]:
+        # stream_chat 是整个 Agent 的主流程。
+        # 前端看到的 status / thinking / delta / done 事件，都是从这里连续产出的。
         resolved_session_id: str | None = None
         assistant_chunks: list[str] = []
         try:
@@ -74,6 +77,8 @@ class BookAgent:
                 first_message=message,
             )
             yield {"type": "session", "sessionId": resolved_session_id}
+            # 这里本来应该把历史消息拼回给 planner 和回答模型。
+            # 当前代码为了调试先强制关闭了多轮上下文，所以你会看到历史被置空。
             # Temporarily disable conversation history while debugging single-turn
             # agent traces in LangSmith.
             history_messages = []
@@ -118,6 +123,7 @@ class BookAgent:
                     ),
                 }
             else:
+                # 不需要查账单时，也统一给后续模型一个结构稳定的空结果。
                 orders_json = json.dumps(
                     {
                         "ok": True,
@@ -129,6 +135,7 @@ class BookAgent:
                 )
             yield {"type": "status", "content": "正在生成分析结果"}
 
+            # ThinkTagStreamParser 把模型流式输出拆成“思考”和“最终回答”两类事件。
             think_parser = ThinkTagStreamParser()
             async for chunk in self.chain.astream(
                 {
@@ -163,6 +170,7 @@ class BookAgent:
 
             yield {"type": "done", "content": ""}
         except Exception as exc:
+            # 这里把异常转换成前端可消费的 error 事件，而不是直接让流中断。
             error_text = str(exc)
             if "Connection refused" in error_text or "Failed to connect" in error_text:
                 yield {
@@ -213,6 +221,7 @@ class BookAgent:
         phone_tail: str,
         plan: AgentPlan,
     ) -> str:
+        # 一个 plan 里可能包含多个 tool call，例如“对比上月和本月”会产生两次查询。
         tool_results = []
         total_order_count = 0
 
@@ -221,6 +230,7 @@ class BookAgent:
             parsed_result = self._safe_json_loads(raw_result)
             order_count = int(parsed_result.get("orderCount") or 0)
             total_order_count += order_count
+            # 查询工具返回原始账单，统计工具再把原始账单加工成适合回答的摘要信息。
             calculation_tool_results = self._calculate_orders(parsed_result, plan)
             user_info_count = len(parsed_result.get("userInfo") or [])
             tool_results.append(
@@ -259,6 +269,7 @@ class BookAgent:
         )
 
     async def _execute_tool_call(self, phone_num: str, tool_call: ToolCall) -> str:
+        # Planner 只负责决定“查什么”，真正执行时才把当前用户手机号注入进去。
         if tool_call.toolName != "search_personal_orders":
             return json.dumps(
                 {
@@ -339,6 +350,7 @@ class BookAgent:
         return cleaned
 
     def _safe_json_loads(self, value: str) -> dict:
+        # 工具层当前通过 JSON 字符串传递结果，这里统一兜底，避免单个工具异常把整个链路炸掉。
         try:
             data = json.loads(value)
         except json.JSONDecodeError:

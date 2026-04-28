@@ -13,6 +13,7 @@ from app.schemas.orders import SearchOrdersRequest, SearchOrdersResponse
 
 
 class SearchPersonalOrdersInput(BaseModel):
+    # 这个 schema 既给 LangChain 工具用，也顺便定义了工具的入参约束。
     phone_num: str = Field(description="用户手机号，只允许查询当前用户自己的手机号")
     year: int | None = Field(default=None, description="查询年份，例如 2026")
     month: int | None = Field(default=None, description="查询月份，1-12")
@@ -26,6 +27,7 @@ class SearchPersonalOrdersInput(BaseModel):
     run_type="tool",
     process_inputs=lambda inputs: _mask_trace_inputs(inputs),
 )
+# mask_trace_input是为了在trace里隐藏敏感信息，但工具函数本身仍然能拿到完整的输入参数。
 async def search_personal_orders(
     phone_num: str,
     year: int | None = None,
@@ -40,7 +42,10 @@ async def search_personal_orders(
     """
 
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    # Planner 产出的分类词可能比较宽泛，这里先归一化，再发给下游接口。
     normalized_cost_type = _normalize_cost_type(cost_type)
+    # 当 year=None 但给了 month/day 时，远端接口无法直接表达“跨年查某月某日”，
+    # 所以先扩大查询范围，再在本地做二次过滤。
     should_filter_locally = year is None and (month is not None or day is not None)
     request = SearchOrdersRequest(
         phoneNum=phone_num,
@@ -80,6 +85,7 @@ async def search_personal_orders(
     try:
         parsed = SearchOrdersResponse.model_validate(data)
     except ValueError:
+        # 一旦后端 API 改了字段，至少返回明确错误，而不是让 Agent 静默失败。
         return _to_json(
             {
                 "ok": False,
@@ -160,6 +166,7 @@ def _filter_orders_locally(
     month: int | None = None,
     day: int | None = None,
 ) -> list[dict[str, Any]]:
+    # 本地过滤只在“查询范围被故意放大”时启用，用来补足远端 API 表达能力不足的问题。
     filtered_orders = orders
     if month is not None:
         filtered_orders = [

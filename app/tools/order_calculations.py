@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 
 class OrdersJsonInput(BaseModel):
+    # 统计工具当前直接吃 JSON 字符串，这是为了方便串到 Agent 链路里。
     orders_json: str = Field(description="账单 JSON 字符串，支持 ordersInfo 数组或原始账单数组")
 
 
@@ -26,6 +27,7 @@ class ComparePeriodsInput(BaseModel):
 
 @traceable(name="calculate_order_summary", run_type="tool")
 def calculate_order_summary(orders_json: str) -> str:
+    # summary 是所有分析里最基础的一层：先把总笔数、总收入、总支出这些基础指标算出来。
     orders = _extract_orders(orders_json)
     expense_orders = [order for order in orders if _is_expense_order(order)]
     income_orders = [order for order in orders if _is_income_order(order)]
@@ -197,32 +199,6 @@ def calculate_remark_breakdown(orders_json: str) -> str:
         }
     )
 
-
-@traceable(name="calculate_order_statistics_suite", run_type="tool")
-def calculate_order_statistics_suite(orders_json: str) -> str:
-    summary = json.loads(calculate_order_summary(orders_json))
-    category_breakdown = json.loads(calculate_category_breakdown(orders_json))
-    top_expenses = json.loads(find_top_expenses(orders_json, top_n=10))
-    top_incomes = json.loads(find_top_incomes(orders_json, top_n=10))
-    daily_breakdown = json.loads(calculate_daily_breakdown(orders_json))
-    monthly_breakdown = json.loads(calculate_monthly_breakdown(orders_json))
-    payment_breakdown = json.loads(calculate_payment_method_breakdown(orders_json))
-    remark_breakdown = json.loads(calculate_remark_breakdown(orders_json))
-
-    return _to_json(
-        {
-            "summary": summary,
-            "categoryBreakdown": category_breakdown,
-            "topExpenses": top_expenses,
-            "topIncomes": top_incomes,
-            "dailyBreakdown": daily_breakdown,
-            "monthlyBreakdown": monthly_breakdown,
-            "paymentMethodBreakdown": payment_breakdown,
-            "remarkBreakdown": remark_breakdown,
-        }
-    )
-
-
 @traceable(name="compare_periods", run_type="tool")
 def compare_periods(periods_json: str) -> str:
     periods = _extract_periods(periods_json)
@@ -262,6 +238,8 @@ def compare_periods(periods_json: str) -> str:
 
 
 def _extract_orders(value: str | list[dict[str, Any]] | dict[str, Any]) -> list[dict[str, Any]]:
+    # 这个 helper 的作用是把各种来源的账单数据收口成统一 list[dict] 结构。
+    # 因为不同链路传进来的可能是 JSON 字符串、原始数组，或者包着 result/ordersInfo 的对象。
     if isinstance(value, str):
         try:
             value = json.loads(value)
@@ -295,6 +273,7 @@ def _extract_periods(value: str | list[dict[str, Any]] | dict[str, Any]) -> list
 
 
 def _is_income_order(order: dict[str, Any]) -> bool:
+    # 账单原始数据并不总是显式标明收入/支出，所以这里结合金额方向和关键词做启发式判断。
     money = _money(order)
     cost_type = str(order.get("costType") or "")
     remark = str(order.get("orderRemark") or "")
@@ -355,7 +334,7 @@ def _group_amounts(
     rows.sort(key=lambda item: item["amount"], reverse=True)
     return rows
 
-
+# 做基本数据清洗和格式化，保证输出的订单数据结构统一且字段齐全，方便后续分析工具使用。
 def _compact_order(order: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": order.get("id"),
@@ -474,12 +453,6 @@ calculate_remark_breakdown_tool = StructuredTool.from_function(
     func=calculate_remark_breakdown,
     name="calculate_remark_breakdown",
     description="按备注统计支出金额、笔数、占比。",
-    args_schema=OrdersJsonInput,
-)
-calculate_order_statistics_suite_tool = StructuredTool.from_function(
-    func=calculate_order_statistics_suite,
-    name="calculate_order_statistics_suite",
-    description="一次性计算账单总览、分类、Top 支出、Top 收入、按天、按月、支付方式和备注统计。",
     args_schema=OrdersJsonInput,
 )
 compare_periods_tool = StructuredTool.from_function(

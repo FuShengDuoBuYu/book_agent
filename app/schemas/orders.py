@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 class SearchOrdersRequest(BaseModel):
     mode: str = Field(default="个人版")
+    # alias的意思Json的字段名
     family_id: str = Field(default="", alias="familyId")
     phone_num: str = Field(alias="phoneNum")
     user_id: str | None = Field(default=None, alias="userId")
@@ -30,8 +31,9 @@ class OrderInfo(BaseModel):
     costType: str = ""
     userId: str = ""
 
-
+# 这是response的data格式
 class SearchOrdersData(BaseModel):
+    # default_factory的意思是如果没有传入这个字段，就用这个默认值,这里会创建一个新的空列表,避免多个实例共享同一个列表
     userInfo: list[dict[str, Any]] = Field(default_factory=list)
     ordersInfo: list[OrderInfo] = Field(default_factory=list)
 

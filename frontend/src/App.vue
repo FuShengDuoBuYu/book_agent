@@ -102,6 +102,7 @@ import DOMPurify from "dompurify";
 import MarkdownIt from "markdown-it";
 import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 
+// 这里维护的是整个聊天页的核心状态：用户身份、当前会话、消息列表和流式渲染队列。
 const chatRef = ref(null);
 const inputRef = ref(null);
 const phoneNum = ref("");
@@ -128,10 +129,11 @@ const suggestions = [
 ];
 
 const subtitle = computed(() =>
-  phoneNum.value ? "已连接 App 用户身份" : "本地自动记账 Agent",
+  phoneNum.value ? "已连接 App 用户身份" : "自动记账 Agent",
 );
 
 onMounted(() => {
+  // 页面初始化时，优先从 URL、原生注入对象里恢复用户身份。
   applyPhoneNum(resolveInitialPhoneNum());
   window.setBookAgentContext = setBookAgentContext;
   window.setBookAgentPhoneNum = (value) => applyPhoneNum(value);
@@ -158,21 +160,14 @@ function resolveInitialPhoneNum() {
   const params = new URLSearchParams(window.location.search);
   const context = window.__BOOK_AGENT_CONTEXT__ || {};
 
-  return (
-    params.get("phoneNum") ||
-    params.get("phone") ||
-    params.get("userId") ||
-    context.phoneNum ||
-    context.phone ||
-    context.userId ||
-    ""
-  );
+  return params.get("phoneNum") || context.phoneNum;
 }
 
 function applyPhoneNum(value) {
   const nextValue = String(value || "").trim();
   if (!nextValue) return;
   phoneNum.value = nextValue;
+  // sessionId 按手机号分桶存储，这样同一个 WebView 重开后还能续聊。
   sessionId.value = localStorage.getItem(sessionStorageKey(nextValue)) || "";
   showToast("用户身份已连接");
   nextTick(() => inputRef.value?.focus());
@@ -209,12 +204,14 @@ function normalizeMessageData(data) {
 }
 
 function notifyNativeReady() {
+  // 兼容 React Native WebView 和 iOS WKWebView 两种宿主注入方式。
   const payload = { type: "BOOK_AGENT_READY" };
   window.ReactNativeWebView?.postMessage?.(JSON.stringify(payload));
   window.webkit?.messageHandlers?.bookAgentReady?.postMessage?.(payload);
 }
 
 function renderMarkdown(content) {
+  // 模型回复支持 Markdown，但必须先消毒，避免把 HTML 直接注入页面。
   return DOMPurify.sanitize(markdown.render(content || ""), {
     USE_PROFILES: { html: true },
   });
@@ -318,6 +315,7 @@ function resizeInput() {
 }
 
 async function sendMessage() {
+  // 这里是前端主流程入口：发请求、校验 SSE、消费流、更新消息状态。
   const message = draft.value.trim();
   if (!phoneNum.value) {
     showToast("等待 App 注入用户身份");
@@ -377,6 +375,7 @@ async function readErrorMessage(response) {
 function assertStreamResponse(response) {
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.includes("text/event-stream")) {
+    // 一旦这里报错，通常说明请求没命中流式接口，而是被静态页面或旧后端接住了。
     throw new Error(
       "后端没有返回流式响应。请确认 /api/chat/stream 已生效，并重启 uvicorn。",
     );
@@ -388,6 +387,7 @@ async function readStreamResponse(response, messageId) {
     throw new Error("当前环境不支持流式响应");
   }
 
+  // SSE 在 fetch 里表现为可读流，这里手动按事件分隔符 \n\n 切包。
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
@@ -411,6 +411,7 @@ async function readStreamResponse(response, messageId) {
 }
 
 function handleStreamEvent(rawEvent, messageId) {
+  // 后端每种事件类型都映射到不同 UI 行为：状态栏、会话 ID、增量文本、错误、结束。
   const dataLine = rawEvent
     .split("\n")
     .find((line) => line.startsWith("data:"));
@@ -452,6 +453,7 @@ function enqueueDelta(messageId, content) {
   if (!content) return;
 
   if (!streamQueues.has(messageId)) {
+    // queue 用来做“打字机效果”，避免流式 chunk 一次性整块塞进页面。
     streamQueues.set(messageId, {
       chunks: [],
       running: false,
@@ -478,6 +480,7 @@ async function processDeltaQueue(messageId) {
 
   while (queue.chunks.length) {
     const chunk = queue.chunks.shift();
+    // 这里故意切成更小片段，视觉上会更像模型正在逐字输出。
     const pieces = chunk.match(/.{1,3}/gs) || [chunk];
 
     for (const piece of pieces) {

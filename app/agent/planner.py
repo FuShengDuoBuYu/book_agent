@@ -79,6 +79,7 @@ PLANNER_HUMAN_PROMPT = """
 
 class QueryPlanner:
     def __init__(self) -> None:
+        # Planner 不直接回答用户，它只把自然语言问题翻译成结构化执行计划。
         self.prompt = ChatPromptTemplate.from_messages(
             [
                 ("system", PLANNER_SYSTEM_PROMPT),
@@ -89,6 +90,7 @@ class QueryPlanner:
 
     @traceable(name="query_planner", run_type="chain")
     async def create_plan(self, message: str, history: str) -> AgentPlan:
+        # 这里的核心任务是：拿到 LLM 输出后，尽量把它收敛成一个可执行的 AgentPlan。
         now = datetime.now(ZoneInfo("Asia/Shanghai"))
         try:
             response = await asyncio.wait_for(
@@ -115,6 +117,7 @@ class QueryPlanner:
         return self._normalize_plan(plan, now, message)
 
     def _extract_json(self, content: str) -> dict:
+        # 模型有时会包一层 markdown code fence，或带 <think> 标签，这里先做清洗再取 JSON。
         content = self._strip_think_tags(content).strip()
         if content.startswith("```"):
             content = content.strip("`")
@@ -129,6 +132,7 @@ class QueryPlanner:
         return json.loads(content[start : end + 1])
 
     def _normalize_plan(self, plan: AgentPlan, now: datetime, message: str) -> AgentPlan:
+        # normalize 的目的，是把“不稳定的 LLM 输出”整理成“稳定的程序输入”。
         if plan.intent != "analyze_orders":
             plan.needsTools = False
             plan.toolCalls = []
@@ -184,6 +188,7 @@ class QueryPlanner:
         return tool_call
 
     def _dedupe_tool_calls(self, tool_calls: list[ToolCall]) -> list[ToolCall]:
+        # 对比类问题很容易让模型生成重复查询，这里根据参数去重。
         unique_calls: list[ToolCall] = []
         seen: set[tuple[int | None, int | None, int | None, str, str]] = set()
         for tool_call in tool_calls:

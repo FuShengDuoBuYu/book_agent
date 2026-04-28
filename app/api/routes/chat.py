@@ -12,6 +12,7 @@ router = APIRouter(tags=["chat"])
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
+    # 这个接口是“一次性拿最终答案”的普通 HTTP 模式。
     agent = BookAgent()
 
     try:
@@ -30,6 +31,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
 @router.post("/chat/stream")
 async def chat_stream(request: ChatRequest) -> StreamingResponse:
+    # 这个接口走 SSE 流式输出，前端能边收状态边收模型增量文本。
     agent = BookAgent()
 
     async def event_stream():
@@ -38,12 +40,14 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
             message=request.message,
             session_id=request.sessionId,
         ):
+            # SSE 协议要求每个事件都以 data: 开头，并以空行结束。
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
         headers={
+            # 禁用中间层缓冲，否则前端会很晚才看到流式内容。
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },

@@ -2,7 +2,6 @@ from app.tools.order_calculations import (
     calculate_category_breakdown_tool,
     calculate_daily_breakdown_tool,
     calculate_monthly_breakdown_tool,
-    calculate_order_statistics_suite_tool,
     calculate_order_summary_tool,
     calculate_payment_method_breakdown_tool,
     calculate_remark_breakdown_tool,
@@ -23,6 +22,5 @@ __all__ = [
     "calculate_monthly_breakdown_tool",
     "calculate_payment_method_breakdown_tool",
     "calculate_remark_breakdown_tool",
-    "calculate_order_statistics_suite_tool",
     "compare_periods_tool",
 ]
