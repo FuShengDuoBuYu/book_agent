@@ -51,14 +51,6 @@ def planner_tool_names() -> tuple[str, ...]:
     return tuple(PLANNER_TOOL_BY_NAME.keys())
 
 
-def default_tool_name_for_mode(book_mode: str) -> str:
-    return (
-        "search_family_orders"
-        if str(book_mode or "").strip() in {"家庭版", "家庭", "family", "family_mode"}
-        else "search_personal_orders"
-    )
-
-
 def render_planner_tools_for_prompt() -> str:
     lines = []
     for tool in PLANNER_TOOLS:

@@ -16,7 +16,6 @@ from app.tools.registry import (
     INTERNAL_CALCULATION_TOOLS,
     PLANNER_TOOL_BY_NAME,
     PLANNER_TOOLS,
-    default_tool_name_for_mode,
     planner_tool_names,
     render_planner_tools_for_prompt,
 )
@@ -38,7 +37,6 @@ __all__ = [
     "INTERNAL_CALCULATION_TOOLS",
     "PLANNER_TOOL_BY_NAME",
     "INTERNAL_CALCULATION_TOOL_BY_NAME",
-    "default_tool_name_for_mode",
     "planner_tool_names",
     "render_planner_tools_for_prompt",
 ]

@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, get_args
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -18,8 +18,30 @@ AnalysisType = Literal[
     "chat",
     "unknown",
 ]
-# 这个是Agent在规划层可以调用的tools的名单
-ToolName = Literal["search_personal_orders", "search_family_orders"]
+
+
+def literal_options(type_alias: object) -> tuple[str, ...]:
+    return tuple(str(item) for item in get_args(type_alias))
+
+
+def render_literal_options(type_alias: object) -> str:
+    return " | ".join(f'"{item}"' for item in literal_options(type_alias))
+
+
+def intent_options() -> tuple[str, ...]:
+    return literal_options(IntentType)
+
+
+def analysis_type_options() -> tuple[str, ...]:
+    return literal_options(AnalysisType)
+
+
+def render_intents_for_prompt() -> str:
+    return render_literal_options(IntentType)
+
+
+def render_analysis_types_for_prompt() -> str:
+    return render_literal_options(AnalysisType)
 
 
 class SearchPersonalOrdersArgs(BaseModel):
@@ -46,8 +68,9 @@ class SearchPersonalOrdersArgs(BaseModel):
 # 调用工具的一条计划记录
 class ToolCall(BaseModel):
     id: str = ""
-    # toolName必须是ToolName里面的一个, 目前我们先写死一个工具, 后续如果有新的工具, 可以继续往ToolName里面添加
-    toolName: ToolName = "search_personal_orders"
+    # toolName 的合法性由 app.tools.registry.PLANNER_TOOL_BY_NAME 动态校验，
+    # schema 层不写死具体工具名，避免工具注册表和 schema 出现两份名单。
+    toolName: str = ""
     args: SearchPersonalOrdersArgs = Field(default_factory=SearchPersonalOrdersArgs)
     # 模型认为调用这个工具的目的是什么
     reason: str = ""
