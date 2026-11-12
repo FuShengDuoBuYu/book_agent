@@ -184,6 +184,8 @@ def unsupported_assertion(text, facts):
             return '规则没有重复线索，不能断言存在重复'
         if re.search(r'记录不完整|存在漏记|健康风险', clause):
             return '记录样本不足不能证明漏记、完整性或健康状况'
+        if re.search(r'消费习惯.{0,8}(?:改变|变化|不变|改善|恶化)', clause):
+            return '分类金额变化不能直接证明消费习惯的实际变化或未变'
         if '不存在这两项的资金缺口' in evidence_text and re.search(r'资金缺口|填补.{0,4}缺口|弥补.{0,4}差额', clause):
             return '购买和储备已能同时覆盖，不能把正的储备余量称为资金缺口'
         if re.search(r'不会(?:导致|影响|造成).{0,6}生活|肯定买得起|肯定买不起', clause):
