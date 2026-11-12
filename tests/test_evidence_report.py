@@ -94,6 +94,13 @@ class EvidenceReportTests(unittest.TestCase):
         self.assertNotIn('收入减少一半', prepared.sections[0].analysis)
         self.assertIn('确认家教', prepared.sections[0].analysis)
 
+    def test_source_labels_and_available_cash_do_not_guarantee_future_safety(self):
+        draft = self.draft(analysis='固定工资通常具有较好的稳定性。若当前余额允许，这笔支出不会导致生活困难。请核对近期必付账单和应急储备。')
+        prepared, _ = prepare_draft(draft, self.facts)
+        self.assertNotIn('较好的稳定性', prepared.sections[0].analysis)
+        self.assertNotIn('不会导致生活困难', prepared.sections[0].analysis)
+        self.assertIn('核对近期必付账单', prepared.sections[0].analysis)
+
 
 class EvidenceReviewTests(unittest.IsolatedAsyncioTestCase):
     async def test_numeric_restatement_removed_but_qualitative_advice_reviewed(self):

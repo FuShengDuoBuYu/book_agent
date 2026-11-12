@@ -180,6 +180,10 @@ def unsupported_assertion(text, facts):
             return '规则没有重复线索，不能断言存在重复'
         if re.search(r'记录不完整|存在漏记|健康风险', clause):
             return '记录样本不足不能证明漏记、完整性或健康状况'
+        if re.search(r'不会(?:导致|影响|造成).{0,6}生活|肯定买得起|肯定买不起', clause):
+            return '现有余额不能保证未来生活不受影响，还需确认必付账单和储备'
+        if re.search(r'工资|职业|来源', clause) and re.search(r'较好的稳定性|稳定性较好|(?:通常|天然|本身).{0,8}(?:稳定|可靠)', clause):
+            return '不能从来源名称推断未来收入稳定性'
         if re.search(r'家教|兼职|收入|来源', clause) and re.search(r'不稳定|波动性', clause):
             return '不能仅按来源名称断言未来收入稳定性'
         if re.search(r'偏高|过高|压力过大|(?:结构|占比).{0,4}合理|最大的.{0,6}(?:变数|风险)', clause):
