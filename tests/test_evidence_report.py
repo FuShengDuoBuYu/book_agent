@@ -79,6 +79,15 @@ class EvidenceReportTests(unittest.TestCase):
         self.assertNotIn('无进一步压缩', prepared.sections[0].analysis)
         self.assertIn('考虑增收或延长期限', prepared.sections[0].analysis)
 
+    def test_protected_expenses_leave_a_concrete_next_step_when_no_cut_is_identified(self):
+        from datetime import date
+        from app.tools.financial_analysis import run_analysis
+        from tests.test_decision_analysis import ledger
+        evidence = run_analysis('optimization', ledger(), as_of=date(2026, 11, 13),
+                                protected_categories=['房租', '餐饮'])
+        facts = build_facts([{'tool': 'optimization', 'evidence': evidence}])
+        self.assertTrue(any(fact['required'] and '增收' in fact['text'] and '保护项' in fact['text'] for fact in facts))
+
     def test_chinese_proportions_cannot_change_the_scope_of_a_scenario(self):
         draft = self.draft(analysis='在收入减少一半的情况下，压力会增加。建议确认家教后续安排。')
         prepared, _ = prepare_draft(draft, self.facts)

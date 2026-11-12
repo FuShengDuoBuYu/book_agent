@@ -120,15 +120,15 @@ class AnalysisRequest(BaseModel):
     queryIds: list[str] = Field(default_factory=list, max_length=24)
     metric: Literal["income", "expense", "net"] = "income"
     targetMonth: str | None = Field(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
-    changes: list[ScenarioChange] = Field(default_factory=list, max_length=20)
+    changes: list[ScenarioChange] = Field(default_factory=list, max_length=20, description='用户给定的收支变化；全部收入中断对应 income、percent=-100、source为空')
     budgetAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False)
     startingBalance: FiniteFloat | None = None
-    targetAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False)
+    targetAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False, description='储蓄目标的期末总余额，不是购买后需保留的应急金')
     months: int | None = Field(default=None, ge=1, le=600)
     monthsDelta: int | None = Field(default=None, ge=-599, le=599)
     monthlyImprovement: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False)
     purchaseAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False)
-    reserveAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False)
+    reserveAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False, description='购买后需保留的应急金或现金底线；还要留5000元应急钱对应5000')
     protectedCategories: list[str] = Field(default_factory=list, max_length=30)
 
     @field_validator("tool")

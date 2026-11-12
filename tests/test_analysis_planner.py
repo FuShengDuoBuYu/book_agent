@@ -6,11 +6,52 @@ from app.schemas.plan import AgentPlan
 
 
 class AnalysisPlannerTests(unittest.TestCase):
+    def test_explicit_purchase_reserve_is_not_a_savings_target(self):
+        plan = AgentPlan.model_validate({'analyses': [{'tool': 'purchase', 'startingBalance': 12000,
+            'purchaseAmount': 6000, 'targetAmount': 5000}]})
+        QueryPlanner.__new__(QueryPlanner)._normalize_explicit_conditions(plan, '买电脑后还要留5000元应急钱')
+        self.assertEqual(plan.analyses[0].reserveAmount, 5000)
+        self.assertIsNone(plan.analyses[0].targetAmount)
+
+    def test_explicit_complete_income_stop_is_not_a_missing_shock(self):
+        plan = AgentPlan.model_validate({'analyses': [{'tool': 'runway', 'startingBalance': 10000}]})
+        QueryPlanner.__new__(QueryPlanner)._normalize_explicit_conditions(plan, '假设所有收入都停了，支出维持原样')
+        self.assertEqual(plan.analyses[0].changes[0].percent, -100)
+        self.assertEqual(plan.analyses[0].changes[0].source, '')
+
+    def test_negated_and_compared_conditions_are_not_globally_imposed(self):
+        planner = QueryPlanner.__new__(QueryPlanner)
+        plan = AgentPlan.model_validate({'analyses': [{'tool': 'runway'}, {'tool': 'purchase'}]})
+        planner._normalize_explicit_conditions(plan, '不是所有收入都停了。不用留5000元应急钱。')
+        self.assertEqual(plan.analyses[0].changes, [])
+        self.assertIsNone(plan.analyses[1].reserveAmount)
+        comparison = AgentPlan.model_validate({'analyses': [{'tool': 'projection'}, {'tool': 'projection'}]})
+        planner._normalize_explicit_conditions(comparison, '比较收入正常与所有收入都停了两种情景')
+        self.assertTrue(all(not task.changes for task in comparison.analyses))
+
+    def test_explicit_conditions_do_not_cross_multiple_query_scopes(self):
+        plan = AgentPlan.model_validate({'toolCalls': [
+            {'id': 'personal', 'toolName': 'search_personal_orders'},
+            {'id': 'family', 'toolName': 'search_family_orders'}],
+            'analyses': [{'tool': 'purchase', 'queryIds': ['personal']}, {'tool': 'runway', 'queryIds': ['family']}]})
+        QueryPlanner.__new__(QueryPlanner)._normalize_explicit_conditions(plan, '留5000元应急钱，假设所有收入都停了')
+        self.assertIsNone(plan.analyses[0].reserveAmount)
+        self.assertEqual(plan.analyses[1].changes, [])
+
     def test_future_purchase_month_is_not_a_historical_analysis_window(self):
         plan = AgentPlan.model_validate({'analysisWindow': {'startDate': '2026-12-01', 'endDate': '2026-12-31'},
             'analyses': [{'tool': 'purchase', 'purchaseAmount': 6000}, {'tool': 'cashflow'}]})
+        normalized = QueryPlanner.__new__(QueryPlanner)._normalize_plan(plan, datetime(2026, 11, 13), '下个月买电脑是否合适？')
+        self.assertIsNone(normalized.analysisWindow)
+        self.assertTrue(all(call.args.year == 2026 and call.args.month <= 11 for call in normalized.toolCalls))
+        self.assertEqual(normalized.analyses[0].targetMonth, '2026-12')
+        self.assertTrue(normalized._planning_issues)
+
+    def test_future_only_history_cannot_silently_be_replaced_with_past_records(self):
+        plan = AgentPlan.model_validate({'analysisWindow': {'startDate': '2026-12-01', 'endDate': '2026-12-31'},
+            'analyses': [{'tool': 'cashflow'}]})
         with self.assertRaisesRegex(ValueError, 'analysisWindow'):
-            QueryPlanner.__new__(QueryPlanner)._normalize_plan(plan, datetime(2026, 11, 13), '下个月买电脑是否合适？')
+            QueryPlanner.__new__(QueryPlanner)._normalize_plan(plan, datetime(2026, 11, 13), '查下个月已经记了哪些账')
 
     def test_unused_null_collections_and_source_are_normalized(self):
         plan = AgentPlan.model_validate({'analyses': [{'tool': 'optimization', 'protectedCategories': None},

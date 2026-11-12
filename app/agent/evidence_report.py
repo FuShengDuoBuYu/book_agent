@@ -108,6 +108,8 @@ def build_facts(results):
                 add(f"历史收入来源“{row['source']}”累计 {money(row['amount'])} 元，占已记录收入 {row['sharePercent']}%。来源集中意味着该来源变化需要重点测算，并不证明它将减少。", True)
         elif tool == 'optimization':
             add('在保护 ' + '、'.join(dict.fromkeys(e['protectedCategories'] + e['excludedCategories'])) + f" 等支出的前提下，本次已记录数据中可逐项核查的月度支出上界为 {money(e['reviewableMonthlySpend'])} 元；不代表都可取消，也不能证明现实中没有其他可优化支出。", True)
+            if not e['candidates']:
+                add('下一步先核查未分类、用途不清的支出，确认是否有保护项之外可调整的项目；如仍需提高结余，再比较可实现的增收与调整目标期限。未经确认的增收不计入基准，不强行削减保护项。', True)
             if e.get('goalMonthlyRequirement') is not None:
                 add(f"目标所需月结余 {money(e['goalMonthlyRequirement'])} 元，当前情景月结余 {money(e['baselineMonthlySaving'])} 元，真正需要额外改善的是 {money(e['monthlyImprovement'])} 元；不能把目标月结余当成需要额外节省的钱。", True)
             if e.get('monthlyImprovement') is not None:

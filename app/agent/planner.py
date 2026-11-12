@@ -15,6 +15,7 @@ from app.agent.prompts import PLANNER_HUMAN_PROMPT, PLANNER_SYSTEM_PROMPT
 from app.schemas.plan import (
     AgentPlan,
     AnalysisRequest,
+    ScenarioChange,
     SearchPersonalOrdersArgs,
     ToolCall,
     render_analysis_types_for_prompt,
@@ -22,6 +23,8 @@ from app.schemas.plan import (
 )
 from app.tools.registry import PLANNER_TOOL_BY_NAME, format_tool_call, render_planner_tools_for_prompt
 from app.tools.financial_analysis import ANALYSIS_TOOLS, shift_month
+
+HISTORY_BASED_TOOLS = {'forecast', 'scenario', 'savings', 'projection', 'purchase', 'runway', 'optimization'}
 
 
 class QueryPlanner:
@@ -65,6 +68,7 @@ class QueryPlanner:
                 if not data:
                     raise ValueError("Missing plan")
                 plan = AgentPlan.model_validate(data)
+                self._normalize_explicit_conditions(plan, message)
                 self._coalesce_forecasts(plan)
                 resolve_context(plan, previous_context or {}, self._normalize_mode(book_mode))
                 return self._normalize_plan(plan, now, message, book_mode)
@@ -93,6 +97,44 @@ class QueryPlanner:
 
         return json.loads(content[start : end + 1])
 
+    def _normalize_explicit_conditions(self, plan, message):
+        """Recover narrow, unambiguous user inputs before resolving context.
+
+        Multiple alternatives and negated statements remain the planner's job;
+        this must never impose one scenario's numbers on another scope.
+        """
+        scopes = {(call.toolName, call.args.cost_type, call.args.remark) for call in plan.toolCalls}
+        if len(scopes) > 1 or ('个人' in message and '家庭' in message):
+            return
+        clauses = re.split(r'[，。；,;\n]', message)
+        positive = [clause for clause in clauses if not re.search(r'不是|并非|不会|并未|并不|不用|无需|不需要|不保留|不留', clause)]
+        purchases = [task for task in plan.analyses if task.tool == 'purchase']
+        amounts = set()
+        patterns = (r'(?:保留|预留|留出|留)\s*(\d+(?:\.\d+)?)\s*(万)?\s*(?:元|块)?\s*(?:的|作为)?(?:应急|备用|储备)',
+                    r'(?:应急金|应急钱|备用金|储备金|储备底线)\s*(?:设为|至少|为|是|要)?\s*(\d+(?:\.\d+)?)\s*(万)?')
+        for clause in positive:
+            for pattern in patterns:
+                amounts.update(float(amount) * (10000 if unit else 1) for amount, unit in re.findall(pattern, clause))
+        if len(purchases) == 1 and len(amounts) == 1:
+            reserve = amounts.pop()
+            if not 0 <= reserve <= 1e12:
+                raise ValueError('reserveAmount 超出允许范围')
+            task = purchases[0]
+            if task.reserveAmount != reserve:
+                task.reserveAmount = reserve
+                # A wrongly classified reserve must not become a future goal.
+                if task.targetAmount == reserve and not any(t.tool == 'savings' for t in plan.analyses):
+                    task.targetAmount = None
+                plan._planning_issues.append({'type': 'normalized_explicit_condition', 'field': 'reserveAmount', 'value': reserve})
+        scenarios = [task for task in plan.analyses if task.tool in {'runway', 'projection', 'scenario', 'savings'}]
+        stopped = any(re.search(r'(?:(?:所有|全部)(?:的)?收入(?:都|完全|全部)?|收入(?:全部|全都|都))(?:停了|停止|中断|归零|没有了)', clause) for clause in positive)
+        if stopped and len(scenarios) == 1 and not re.search(r'比较|对比|两种|分别', message):
+            task = scenarios[0]
+            if not any(change.metric == 'income' and not change.source and change.percent == -100 for change in task.changes):
+                task.changes = [change for change in task.changes if change.metric != 'income'] + [
+                    ScenarioChange(metric='income', percent=-100, source='', label='用户明确假设全部收入中断')]
+                plan._planning_issues.append({'type': 'normalized_explicit_condition', 'field': 'changes', 'detail': '用户明确假设全部收入中断，按全部收入减少100%计算'})
+
     def _normalize_plan(
         self, plan: AgentPlan, now: datetime, message: str, book_mode: str = "个人版"
     ) -> AgentPlan:
@@ -104,7 +146,14 @@ class QueryPlanner:
             plan.intent = "analyze_orders"
             plan.needsTools = True
             if plan.analysisWindow and plan.analysisWindow.startDate > now.date():
-                raise ValueError('analysisWindow 是已发生账单的历史范围，不能填未来购买或预测月份；历史范围未指定时填 null，未来月份填 targetMonth。')
+                if not any(task.tool in HISTORY_BASED_TOOLS for task in plan.analyses):
+                    raise ValueError('analysisWindow 不能用未来月份查询已发生的历史收支；未来估计需要预测工具。')
+                # A future decision date is not a sample of recorded transactions.
+                # Let the existing history expansion supply the decision baseline.
+                plan._planning_issues.append({'type': 'normalized_future_window',
+                    'window': plan.analysisWindow.model_dump(mode='json'),
+                    'detail': '未来决策月份误放入历史窗口，改用默认历史基准；预测目标保持在 targetMonth。'})
+                plan.analysisWindow = None
             quantified_change = re.search(r"(?:增加|减少|新增|少花|多花|节省|多赚|少赚)[^\d，。；,\n]{0,6}\d+(?:\.\d+)?\s*(?:元|块|节|次)", message)
             if quantified_change and any(task.tool == "scenario" and not task.changes for task in plan.analyses):
                 raise ValueError("scenario.changes 未提取用户明确给出的变化金额和次数")
@@ -182,7 +231,7 @@ class QueryPlanner:
                                                      targetMonth=targets[0], months=len(targets)))
 
     def _prepare_analysis_queries(self, plan: AgentPlan, now: datetime, book_mode: str) -> None:
-        forecasting = [task for task in plan.analyses if task.tool in {"forecast", "scenario", "savings", "projection", "purchase", "runway", "optimization"}]
+        forecasting = [task for task in plan.analyses if task.tool in HISTORY_BASED_TOOLS]
         for task in forecasting:
             if task.targetMonth is None:
                 task.targetMonth = shift_month(now.date(), 1).strftime("%Y-%m")
