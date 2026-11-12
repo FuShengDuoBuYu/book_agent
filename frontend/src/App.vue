@@ -5,6 +5,10 @@
         <h1>AI 账单</h1>
         <p>{{ subtitle }}</p>
       </div>
+      <nav class="conversation-actions" aria-label="对话操作">
+        <button ref="historyButton" type="button" :disabled="isBusy || historyLoading || !hasSession" @click="openHistory">历史对话</button>
+        <button type="button" :disabled="isBusy || historyLoading || !hasSession" @click="newConversation">新对话</button>
+      </nav>
     </header>
 
     <section class="mode-panel" aria-label="账本模式">
@@ -31,10 +35,16 @@
     <section v-if="!hasSession" class="context-banner" role="status">
       {{ sessionStatus }}
     </section>
+    <section v-if="historyError" class="context-banner" role="alert">
+      {{ historyError }}
+      <button type="button" :disabled="historyLoading" @click="refreshConversations('', !sessionId)">重试</button>
+    </section>
 
     <section ref="chatRef" class="chat" aria-live="polite">
-      <div v-if="hasSession && messages.length === 0" class="empty">
-        <h2>今天想看哪笔账？</h2>
+      <p v-if="historyLoading" class="history-status" role="status">正在读取历史对话…</p>
+      <button v-if="messageCursor" class="older-messages" type="button" :disabled="historyLoading || isBusy" @click="loadOlderMessages">加载更早的消息</button>
+      <div v-if="hasSession && !historyLoading && messages.length === 0" class="empty">
+        <h2>想了解哪方面的收支？</h2>
         <div class="suggestions">
           <button
             v-for="item in suggestions"
@@ -91,13 +101,32 @@
       </article>
     </section>
 
+    <dialog ref="historyDialog" class="history-dialog" @click="closeHistoryOnBackdrop">
+      <div class="history-heading">
+        <h2>历史对话</h2>
+        <button type="button" @click="closeHistory">关闭</button>
+      </div>
+      <p class="history-status">{{ bookMode }}</p>
+      <p v-if="historyError" class="history-status" role="alert">{{ historyError }}
+        <button type="button" :disabled="historyLoading" @click="refreshConversations()">重试</button>
+      </p>
+      <p v-else-if="!conversations.length && !historyLoading" class="history-status">这个账本还没有历史对话。</p>
+      <button v-for="conversation in conversations" :key="conversation.id" type="button"
+        class="conversation-row" :class="{ selected: conversation.id === sessionId }"
+        :disabled="historyLoading || isBusy" @click="selectConversation(conversation.id)">
+        <span>{{ conversation.title }}</span>
+        <time>{{ formatHistoryTime(conversation.updatedAt) }}</time>
+      </button>
+      <button v-if="conversationCursor" class="older-messages" type="button" :disabled="historyLoading" @click="refreshConversations(conversationCursor)">加载更多对话</button>
+    </dialog>
+
     <form class="composer" @submit.prevent="sendMessage">
       <textarea
         ref="inputRef"
         v-model="draft"
         rows="1"
         :placeholder="hasSession ? '发消息' : '等待验证'"
-        :disabled="isBusy || !hasSession"
+          :disabled="isBusy || historyLoading || !hasSession"
         @input="resizeInput"
         @keydown.enter.exact.prevent="sendMessage"
       />
@@ -132,6 +161,14 @@ const sessionId = ref("");
 const bookMode = ref("个人版");
 const draft = ref("");
 const messages = ref([]);
+const conversations = ref([]);
+const conversationCursor = ref(null);
+const messageCursor = ref(null);
+const historyLoading = ref(false);
+const historyError = ref("");
+const historyDialog = ref(null);
+const historyButton = ref(null);
+const startNewSession = ref(false);
 const isBusy = ref(false);
 const toast = ref("");
 let toastTimer = null;
@@ -146,9 +183,9 @@ const markdown = new MarkdownIt({
 });
 
 const suggestions = [
-  "我这个月花费最多的是什么？",
-  "帮我分析一下最近几天的消费情况。",
-  "你以后可以帮我做哪些账单分析？",
+  "分析最近半年的收支变化和主要原因。",
+  "最近有没有异常开销或重复记账？",
+  "结合历史数据，预估下个月的收入、支出和结余。",
 ];
 
 const subtitle = computed(() =>
@@ -180,17 +217,134 @@ async function loadSession() {
     const context = await response.json();
     familyAvailable.value = context.familyAvailable === true;
     hasSession.value = true;
+    await refreshConversations("", true);
   } catch {
     sessionStatus.value = "暂时无法连接账本服务，请从 App 重新进入。";
   }
 }
 
-function setBookMode(value) {
-  if (bookMode.value === value || isBusy.value) return;
+async function setBookMode(value) {
+  if (bookMode.value === value || isBusy.value || historyLoading.value) return;
   bookMode.value = value;
   sessionId.value = "";
   messages.value = [];
+  conversations.value = [];
+  messageCursor.value = null;
+  conversationCursor.value = null;
+  startNewSession.value = false;
+  await refreshConversations("", true);
   showToast(`已切换到${value}`);
+}
+
+async function historyRequest(path, cursor = "") {
+  const query = new URLSearchParams({ mode: bookMode.value });
+  if (cursor) query.set("cursor", cursor);
+  const response = await fetch(`${path}?${query}`, { cache: "no-store" });
+  if (!response.ok) {
+    const detail = await readErrorMessage(response);
+    if (response.status === 401) {
+      hasSession.value = false;
+      sessionStatus.value = detail;
+      closeHistory();
+    }
+    throw new Error(detail);
+  }
+  return response.json();
+}
+
+async function refreshConversations(cursor = "", restore = false) {
+  if (historyLoading.value || isBusy.value || !hasSession.value) return;
+  historyLoading.value = true;
+  historyError.value = "";
+  try {
+    const data = await historyRequest("/api/conversations", cursor);
+    conversations.value = cursor ? [...conversations.value, ...data.items] : data.items;
+    conversationCursor.value = data.nextCursor;
+    if (restore && data.items.length) await readConversation(data.items[0].id);
+  } catch (error) {
+    historyError.value = error.message || "历史对话暂时无法读取。";
+  } finally {
+    historyLoading.value = false;
+  }
+}
+
+async function readConversation(id, cursor = "") {
+  const data = await historyRequest(`/api/conversations/${encodeURIComponent(id)}`, cursor);
+  const restored = data.messages.map((message) => ({
+    id: message.id,
+    role: message.role === "assistant" ? "agent" : "user",
+    content: message.content,
+    done: true,
+    steps: [],
+  }));
+  const priorHeight = chatRef.value?.scrollHeight || 0;
+  messages.value = cursor ? [...restored, ...messages.value] : restored;
+  sessionId.value = data.sessionId;
+  startNewSession.value = false;
+  messageCursor.value = data.nextCursor;
+  if (cursor) {
+    await nextTick();
+    if (chatRef.value) chatRef.value.scrollTop = chatRef.value.scrollHeight - priorHeight;
+  } else {
+    scrollToBottom();
+  }
+}
+
+async function selectConversation(id) {
+  if (historyLoading.value || isBusy.value) return;
+  historyLoading.value = true;
+  historyError.value = "";
+  try {
+    await readConversation(id);
+    closeHistory();
+  } catch (error) {
+    historyError.value = error.message;
+    showToast(error.message);
+  } finally {
+    historyLoading.value = false;
+  }
+}
+
+async function loadOlderMessages() {
+  if (historyLoading.value || isBusy.value || !messageCursor.value) return;
+  historyLoading.value = true;
+  try {
+    await readConversation(sessionId.value, messageCursor.value);
+  } catch (error) {
+    historyError.value = error.message;
+  } finally {
+    historyLoading.value = false;
+  }
+}
+
+function openHistory() {
+  historyDialog.value?.showModal();
+  refreshConversations();
+}
+
+function closeHistory() {
+  historyDialog.value?.close();
+  historyButton.value?.focus();
+}
+
+function closeHistoryOnBackdrop(event) {
+  if (event.target === historyDialog.value) closeHistory();
+}
+
+function newConversation() {
+  if (isBusy.value || historyLoading.value) return;
+  sessionId.value = "";
+  messages.value = [];
+  messageCursor.value = null;
+  draft.value = "";
+  startNewSession.value = true;
+  historyError.value = "";
+  resizeInput();
+  nextTick(() => inputRef.value?.focus());
+}
+
+function formatHistoryTime(value) {
+  return value ? new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(value)) : "";
 }
 
 function renderMarkdown(content) {
@@ -304,7 +458,7 @@ async function sendMessage() {
     showToast(sessionStatus.value);
     return;
   }
-  if (!message || isBusy.value) return;
+  if (!message || isBusy.value || historyLoading.value) return;
 
   appendMessage("user", message);
   draft.value = "";
@@ -320,6 +474,7 @@ async function sendMessage() {
       },
       body: JSON.stringify({
         sessionId: sessionId.value || null,
+        newSession: startNewSession.value,
         mode: bookMode.value,
         message,
       }),
@@ -344,6 +499,7 @@ async function sendMessage() {
     updateMessage(loadingId, error.message, true);
   } finally {
     isBusy.value = false;
+    await refreshConversations();
     nextTick(() => inputRef.value?.focus());
   }
 }
@@ -509,6 +665,9 @@ function sleep(ms) {
 }
 
 function setSessionId(value) {
-  if (value && hasSession.value) sessionId.value = value;
+  if (value && hasSession.value) {
+    sessionId.value = value;
+    startNewSession.value = false;
+  }
 }
 </script>

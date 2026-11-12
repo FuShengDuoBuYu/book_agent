@@ -13,11 +13,14 @@ from app.core.llm import get_planner_model
 from app.agent.prompts import PLANNER_HUMAN_PROMPT, PLANNER_SYSTEM_PROMPT
 from app.schemas.plan import (
     AgentPlan,
+    AnalysisRequest,
+    SearchPersonalOrdersArgs,
     ToolCall,
     render_analysis_types_for_prompt,
     render_intents_for_prompt,
 )
 from app.tools.registry import PLANNER_TOOL_BY_NAME, format_tool_call, render_planner_tools_for_prompt
+from app.tools.financial_analysis import ANALYSIS_TOOLS, shift_month
 
 
 class QueryPlanner:
@@ -32,6 +35,7 @@ class QueryPlanner:
             tools_text=render_planner_tools_for_prompt(),
             intent_types_text=render_intents_for_prompt(),
             analysis_types_text=render_analysis_types_for_prompt(),
+            analysis_tools_text="\n".join(f"- {name}: {description}" for name, description in ANALYSIS_TOOLS.items()),
         )
         self.chain = self.prompt | get_planner_model()
 
@@ -41,30 +45,31 @@ class QueryPlanner:
     ) -> AgentPlan:
         # 这里的核心任务是：拿到 LLM 输出后，尽量把它收敛成一个可执行的 AgentPlan。
         now = datetime.now(ZoneInfo("Asia/Shanghai"))
-        try:
-            response = await asyncio.wait_for(
-                self.chain.ainvoke(
-                    {
-                        "current_date": now.strftime("%Y-%m-%d"),
-                        "book_mode": self._normalize_mode(book_mode),
-                        "history": history,
-                        "message": message,
-                    }
-                ),
-                timeout=get_settings().planner_timeout_seconds,
-            )
-            raw_content = str(getattr(response, "content", "")).strip()
-            data = self._extract_json(raw_content)
-            plan = AgentPlan.model_validate(data)
-        except (
-            asyncio.TimeoutError,
-            json.JSONDecodeError,
-            ValidationError,
-            ValueError,
-        ):
-            plan = self._fallback_plan()
+        prompt_values = {
+            "current_date": now.strftime("%Y-%m-%d"),
+            "book_mode": self._normalize_mode(book_mode),
+            "history": history,
+            "message": message,
+        }
+        plan = self._fallback_plan()
+        for attempt in range(2):
+            try:
+                response = await asyncio.wait_for(
+                    self.chain.ainvoke(prompt_values),
+                    timeout=get_settings().planner_timeout_seconds,
+                )
+                raw_content = str(getattr(response, "content", "")).strip()
+                data = self._extract_json(raw_content)
+                if not data:
+                    raise ValueError("Missing plan")
+                plan = AgentPlan.model_validate(data)
+                return self._normalize_plan(plan, now, message, book_mode)
+            except (asyncio.TimeoutError, json.JSONDecodeError, ValidationError, ValueError) as exc:
+                if attempt == 0:
+                    detail = "; ".join(f"{error['loc']}: {error['msg']}" for error in exc.errors()) if isinstance(exc, ValidationError) else str(exc)
+                    prompt_values["message"] = message + "\n上次计划校验失败：" + detail[:800] + "\n请重新生成符合 JSON schema 的计划。用户的情景金额与次数必须填入 scenario.changes，预算和储蓄条件也要填写，不能只写在 finalInstruction。"
 
-        return self._normalize_plan(plan, now, message)
+        return self._fallback_plan()
 
     def _extract_json(self, content: str) -> dict:
         # 模型有时会包一层 markdown code fence，或带 <think> 标签，这里先做清洗再取 JSON。
@@ -82,9 +87,37 @@ class QueryPlanner:
         return json.loads(content[start : end + 1])
 
     def _normalize_plan(
-        self, plan: AgentPlan, now: datetime, message: str
+        self, plan: AgentPlan, now: datetime, message: str, book_mode: str = "个人版"
     ) -> AgentPlan:
         # normalize 的目的，是把“不稳定的 LLM 输出”整理成“稳定的程序输入”。
+        if plan.analysisType == "financial_analysis" and not plan.analyses:
+            plan.analyses = [AnalysisRequest(tool=name) for name in ("cashflow", "trends", "changes", "anomalies", "recurring")]
+        if plan.analyses:
+            plan.intent = "analyze_orders"
+            plan.needsTools = True
+            quantified_change = re.search(r"(?:增加|减少|新增|少花|多花|节省|多赚|少赚)[^\d，。；,\n]{0,6}\d+(?:\.\d+)?\s*(?:元|块|节|次)", message)
+            if quantified_change and any(task.tool == "scenario" and not task.changes for task in plan.analyses):
+                raise ValueError("scenario.changes 未提取用户明确给出的变化金额和次数")
+            for task in plan.analyses:
+                if task.tool == "budget" and task.budgetAmount is None and re.search(r"预算\D{0,6}\d", message):
+                    raise ValueError("budget.budgetAmount 未提取用户明确给出的预算")
+                if task.tool == "savings":
+                    if task.startingBalance is None and re.search(r"(?:已有(?:存款|余额)?|(?:当前|现有|现在)的?(?:存款|余额)|存款|余额)\s*[为是有：:]?\s*\d", message):
+                        raise ValueError("savings.startingBalance 未提取用户明确给出的当前余额")
+                    if task.targetAmount is None and re.search(r"(?:存到|达到|目标)\D{0,6}\d", message):
+                        raise ValueError("savings.targetAmount 未提取用户明确给出的目标金额")
+                    if task.months is None and re.search(r"\d+\s*个月", message):
+                        raise ValueError("savings.months 未提取用户明确给出的期限")
+            relative = set(re.findall(r"下下(?:个)?月|下(?:个)?月|本月|这个月|上(?:个)?月", message))
+            explicit_month = re.search(r"\d{1,4}[-年/]\d{1,2}|\d{1,2}\s*月", message)
+            if len(relative) == 1 and not explicit_month:
+                token = next(iter(relative))
+                if token.startswith("下"):
+                    target = shift_month(now.date(), 2 if token.startswith("下下") else 1).strftime("%Y-%m")
+                    for task in plan.analyses:
+                        if task.tool in {"forecast", "scenario"}:
+                            task.targetMonth = target
+            self._prepare_analysis_queries(plan, now, book_mode)
         if plan.intent != "analyze_orders":
             plan.needsTools = False
             plan.toolCalls = []
@@ -121,6 +154,52 @@ class QueryPlanner:
 
         return plan
 
+    def _prepare_analysis_queries(self, plan: AgentPlan, now: datetime, book_mode: str) -> None:
+        forecasting = [task for task in plan.analyses if task.tool in {"forecast", "scenario", "savings"}]
+        for task in forecasting:
+            if task.targetMonth is None:
+                task.targetMonth = shift_month(now.date(), 1).strftime("%Y-%m")
+        # Expand date windows in code instead of asking a model to enumerate months.
+        sources = {}
+        source_scopes = {}
+        for index, call in enumerate(plan.toolCalls, start=1):
+            if call.toolName in PLANNER_TOOL_BY_NAME:
+                key = (call.toolName, self._normalize_cost_type(call.args.cost_type), call.args.remark or "")
+                identifier = call.id or f"query_{index}"
+                if identifier in source_scopes and source_scopes[identifier] != key:
+                    raise ValueError("An analysis references an ambiguous query id")
+                source_scopes[identifier] = key
+                sources.setdefault(key, []).append(identifier)
+        if not sources:
+            tool = "search_family_orders" if self._normalize_mode(book_mode) == "家庭版" else "search_personal_orders"
+            sources[(tool, "不限", "")] = ["ledger"]
+        known_ids = {identifier for identifiers in sources.values() for identifier in identifiers}
+        if any(set(task.queryIds) - known_ids for task in plan.analyses):
+            raise ValueError("An analysis references an unknown query id")
+        cutoff = now.date().replace(day=1)
+        for task in forecasting:
+            target = datetime.strptime(task.targetMonth, "%Y-%m").date()
+            cutoff = min(cutoff, target)
+        periods = [shift_month(cutoff, offset) for offset in range(-6, 1)]
+        if plan.analysisWindow:
+            start = plan.analysisWindow.startDate.replace(day=1)
+            end = plan.analysisWindow.endDate.replace(day=1)
+            length = (end.year - start.year) * 12 + end.month - start.month + 1
+            requested_periods = [shift_month(start, offset) for offset in range(length)]
+            periods = sorted(set(periods + requested_periods)) if forecasting else requested_periods
+        for task in plan.analyses:
+            if task.tool == "budget":
+                target = datetime.strptime(task.targetMonth, "%Y-%m").date() if task.targetMonth else now.date().replace(day=1)
+                periods = sorted(set(periods + [target]))
+        plan.toolCalls = [
+            ToolCall(id=f"analysis_{index}_{period:%Y%m}", toolName=tool,
+                     sourceIds=sources[(tool, category, remark)],
+                     args=SearchPersonalOrdersArgs(year=period.year, month=period.month, cost_type=category, remark=remark),
+                     reason="取得历史证据用于分析，区分完整月份和未完月份")
+            for index, (tool, category, remark) in enumerate(sources, start=1)
+            for period in periods
+        ]
+
     def _normalize_tool_call(
         self,
         tool_call: ToolCall,
@@ -154,7 +233,7 @@ class QueryPlanner:
     def _dedupe_tool_calls(self, tool_calls: list[ToolCall]) -> list[ToolCall]:
         # 对比类问题很容易让模型生成重复查询，这里根据参数去重。
         unique_calls: list[ToolCall] = []
-        seen: set[tuple[str, int | None, int | None, int | None, str, str]] = set()
+        seen: dict[tuple, ToolCall] = {}
         for tool_call in tool_calls:
             args = tool_call.args
             key = (
@@ -166,8 +245,12 @@ class QueryPlanner:
                 args.remark,
             )
             if key in seen:
+                existing = seen[key]
+                existing.sourceIds = list(dict.fromkeys(
+                    (existing.sourceIds or [existing.id]) + (tool_call.sourceIds or [tool_call.id])
+                ))
                 continue
-            seen.add(key)
+            seen[key] = tool_call
             unique_calls.append(tool_call)
         return [
             tool_call
@@ -189,7 +272,7 @@ class QueryPlanner:
     def _build_summary(self, plan: AgentPlan) -> str:
         summaries = [format_tool_call(tool_call) for tool_call in plan.toolCalls]
         if len(summaries) > 1:
-            return "、".join(summaries) + "后对比分析"
+            return "、".join(summaries) + "后综合分析"
         return summaries[0] if summaries else "无需查询账单"
 
     def _normalize_mode(self, value: str | None) -> str:

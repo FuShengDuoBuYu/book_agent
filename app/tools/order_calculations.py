@@ -261,37 +261,12 @@ def _extract_periods(value: str | list[dict[str, Any]] | dict[str, Any]) -> list
 
 
 def _is_income_order(order: dict[str, Any]) -> bool:
-    # 账单原始数据并不总是显式标明收入/支出，所以这里结合金额方向和关键词做启发式判断。
-    money = _money(order)
-    cost_type = str(order.get("costType") or "")
-    remark = str(order.get("orderRemark") or "")
-    income_keywords = ("收入", "工资", "奖金", "补贴", "报销", "退款", "转入", "到账")
-    expense_keywords = (
-        "饮食",
-        "餐饮",
-        "娱乐",
-        "交通",
-        "购物",
-        "房租",
-        "水电",
-        "日用",
-        "医疗",
-        "学习",
-        "聚会",
-        "其他",
-    )
-
-    if any(keyword in cost_type for keyword in income_keywords):
-        return True
-    if any(keyword in cost_type for keyword in expense_keywords):
-        return False
-    if any(keyword in remark for keyword in income_keywords):
-        return True
-    return money > 0 and not cost_type
+    # Android's manual entry and notification parser both store signed money.
+    return _money(order) > 0
 
 
 def _is_expense_order(order: dict[str, Any]) -> bool:
-    return not _is_income_order(order)
+    return _money(order) < 0
 
 
 def _group_amounts(

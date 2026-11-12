@@ -1,7 +1,11 @@
 import json
 import logging
+from collections import defaultdict
 from collections.abc import AsyncIterator
+from datetime import datetime
+from time import perf_counter
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from langchain_core.prompts import ChatPromptTemplate
 from langsmith import traceable
@@ -10,7 +14,8 @@ from app.agent.planner import QueryPlanner
 from app.agent.prompts import BOOK_AGENT_ANALYSIS_PROMPT, BOOK_AGENT_SYSTEM_PROMPT
 from app.clients.bookkeeping_api import BookkeepingApiClient
 from app.core.llm import get_chat_model
-from app.memory.store import MongoMemoryStore
+from app.core.config import get_settings
+from app.memory.store import MongoMemoryStore, conversation_scope
 from app.schemas.plan import AgentPlan, ToolCall
 from app.tools.order_calculations import (
     calculate_category_breakdown,
@@ -21,6 +26,7 @@ from app.tools.order_calculations import (
 )
 from app.tools.order_search import search_orders
 from app.tools.registry import PLANNER_TOOL_BY_NAME, format_tool_call
+from app.tools.financial_analysis import _date, merge_orders, run_analysis
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +56,7 @@ class BookAgent:
         session_id: str | None = None,
         mode: str = "个人版",
         family_id: str | None = None,
+        new_session: bool = False,
     ) -> tuple[str, str | None]:
         chunks: list[str] = []
         resolved_session_id: str | None = None
@@ -59,6 +66,7 @@ class BookAgent:
             session_id=session_id,
             mode=mode,
             family_id=family_id,
+            new_session=new_session,
         ):
             if event["type"] == "session":
                 resolved_session_id = event["sessionId"]
@@ -76,18 +84,17 @@ class BookAgent:
         session_id: str | None = None,
         mode: str = "个人版",
         family_id: str | None = None,
+        new_session: bool = False,
     ) -> AsyncIterator[dict[str, str]]:
         # stream_chat 是整个 Agent 的主流程。
         # 前端看到的 status / thinking / delta / done 事件，都是从这里连续产出的。
         resolved_session_id: str | None = None
         assistant_chunks: list[str] = []
+        started_at = perf_counter()
         try:
             book_mode = self._normalize_mode(mode)
             family_id = str(family_id or "").strip()
-            book_scope = "family" if book_mode == "家庭版" else "personal"
-            if family_id:
-                # Both modes can answer comparisons with the authorized family.
-                book_scope = f"{book_scope}:{family_id}"
+            book_scope = conversation_scope(book_mode, family_id)
             yield {"type": "status", "content": "正在解析你的问题"}
             yield {"type": "status", "content": f"当前账本模式：{book_mode}"}
             resolved_session_id = await self.memory.ensure_session(
@@ -95,6 +102,7 @@ class BookAgent:
                 session_id=session_id,
                 first_message=message,
                 book_scope=book_scope,
+                new_session=new_session,
             )
             yield {"type": "session", "sessionId": resolved_session_id}
             history_messages = await self.memory.get_recent_messages(
@@ -164,6 +172,8 @@ class BookAgent:
                     session_id=resolved_session_id,
                     reply=deterministic_reply,
                     plan=plan,
+                    evidence=self._safe_json_loads(orders_json),
+                    duration_ms=round((perf_counter() - started_at) * 1000),
                 )
                 yield {"type": "done", "content": ""}
                 return
@@ -175,8 +185,10 @@ class BookAgent:
                     "message": message,
                     "history": history_text,
                     "query_summary": plan.summary,
-                    "plan_json": plan.model_dump_json(),
-                    "orders_json": orders_json,
+                    "plan_json": json.dumps({"analyses": [task.model_dump() for task in plan.analyses],
+                                             "analysisWindow": plan.analysisWindow.model_dump(mode="json") if plan.analysisWindow else None},
+                                            ensure_ascii=False) if plan.analyses else plan.model_dump_json(),
+                    "orders_json": self._answer_evidence(orders_json),
                 }
             ):
                 content = getattr(chunk, "content", "")
@@ -197,6 +209,8 @@ class BookAgent:
                 session_id=resolved_session_id,
                 reply=assistant_reply,
                 plan=plan,
+                evidence=self._safe_json_loads(orders_json),
+                duration_ms=round((perf_counter() - started_at) * 1000),
             )
 
             yield {"type": "done", "content": ""}
@@ -211,21 +225,35 @@ class BookAgent:
             return "账单查询未完成"
         return f"查询完成，共获取 {data.get('totalOrderCount', 0)} 条账单"
 
+    def _answer_evidence(self, orders_json: str) -> str:
+        data = self._safe_json_loads(orders_json)
+        if data.get("analysisResults"):
+            # Present one coherent analysis, without duplicate per-query amounts.
+            data = {"analysisResults": data["analysisResults"]}
+        return json.dumps(data, ensure_ascii=False, default=str)
+
     async def _save_assistant_reply(
         self,
         phone_num: str,
         session_id: str | None,
         reply: str,
         plan: AgentPlan,
+        evidence: dict | None = None,
+        duration_ms: int | None = None,
     ) -> None:
         if not reply or not session_id:
             return
+        settings = get_settings()
         await self.memory.add_message(
             phone_num=phone_num,
             session_id=session_id,
             role="assistant",
             content=reply,
-            metadata={"plan": plan.model_dump(mode="json")},
+            metadata={"plan": plan.model_dump(mode="json"), "evidence": evidence or {},
+                      "analysisVersion": 2, "durationMs": duration_ms,
+                      "model": {"provider": settings.llm_provider, "name": settings.llm_model,
+                                "reasoning": settings.llm_reasoning,
+                                "reasoningEffort": settings.llm_reasoning_effort}},
         )
 
     @traceable(name="book_agent_create_plan", run_type="chain")
@@ -251,12 +279,20 @@ class BookAgent:
     ) -> str:
         # 一个 plan 里可能包含多个 tool call，例如“对比上月和本月”会产生两次查询。
         tool_results = []
+        datasets = defaultdict(list)
         total_order_count = 0
         book_mode = self._normalize_mode(mode)
         family_id = str(family_id or "").strip()
 
         for tool_call in plan.toolCalls:
             parsed_result = await self._execute_tool_call(tool_call, family_id)
+            if parsed_result.get("ok") and plan.analysisWindow and not plan.analyses:
+                window = plan.analysisWindow
+                records = [order for order in parsed_result.get("ordersInfo", [])
+                           if _date(order) and window.startDate <= _date(order) <= window.endDate]
+                parsed_result = {**parsed_result, "ordersInfo": records, "orderCount": len(records)}
+            if parsed_result.get("ok"):
+                datasets[parsed_result.get("mode", book_mode)].append((tool_call, parsed_result.get("ordersInfo", [])))
             order_count = int(parsed_result.get("orderCount") or 0)
             total_order_count += order_count
             # 查询工具返回原始账单，统计工具再把原始账单加工成适合回答的摘要信息。
@@ -287,6 +323,38 @@ class BookAgent:
         if len(tool_results) > 1 and all(item["ok"] for item in tool_results):
             comparison_tool_result = self._compare_tool_results(tool_results)
 
+        analysis_results = []
+        if plan.analyses and all(item["ok"] for item in tool_results):
+            today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+            for scope, queries in datasets.items():
+                for task in plan.analyses:
+                    bound = [(call, rows) for call, rows in queries
+                             if not task.queryIds or set(task.queryIds) & set(call.sourceIds or [call.id])]
+                    if not bound:
+                        continue
+                    filters = {(call.args.cost_type, call.args.remark) for call, _ in bound}
+                    if len(filters) > 1 and not task.queryIds:
+                        analysis_results.append({"mode": scope, "tool": task.tool, "evidence": {
+                            "sufficientData": False, "reason": "该分析尚未明确关联哪个分类或备注范围，需要确认查询范围。"}})
+                        continue
+                    records = merge_orders([rows for _, rows in bound])
+                    window = plan.analysisWindow if task.tool not in {"forecast", "scenario", "savings", "budget"} else None
+                    selected = records
+                    if window:
+                        selected = [order for order in records if _date(order) and window.startDate <= _date(order) <= window.endDate]
+                    result = run_analysis(
+                        task.tool, selected, as_of=today, metric=task.metric,
+                        target_month=task.targetMonth,
+                        changes=[change.model_dump() for change in task.changes],
+                        budget_amount=task.budgetAmount, starting_balance=task.startingBalance,
+                        target_amount=task.targetAmount, months=task.months,
+                        window_start=window.startDate if window else None,
+                        window_end=window.endDate if window else None,
+                    )
+                    analysis_results.append({"mode": scope, "tool": task.tool, "queryIds": task.queryIds,
+                                             "filters": [{"category": category, "remark": remark} for category, remark in sorted(filters)],
+                                             "evidence": result})
+
         return json.dumps(
             {
                 "ok": True,
@@ -299,6 +367,7 @@ class BookAgent:
                 "totalOrderCount": total_order_count,
                 "toolResults": tool_results,
                 "comparisonToolResult": comparison_tool_result,
+                "analysisResults": analysis_results,
             },
             ensure_ascii=False,
             default=str,
@@ -365,6 +434,8 @@ class BookAgent:
         orders_json: str,
     ) -> str | None:
         data = self._safe_json_loads(orders_json)
+        if plan.intent == "unknown":
+            return "这次未能生成可执行的分析计划，请补充你想分析的范围或换一种表述后重试。"
         if not data.get("ok", False):
             return None
         if not plan.needsTools:
@@ -389,6 +460,16 @@ class BookAgent:
             ]
             scope = "、".join(summaries) or "当前查询范围"
             return f"{scope}没有查到账单记录。"
+
+        analyses = data.get("analysisResults") or []
+        if analyses and all(item.get("evidence", {}).get("sufficientData") is False for item in analyses):
+            input_names = {"budgetAmount": "预算金额", "startingBalance": "当前存款余额", "targetAmount": "目标金额"}
+            missing = list(dict.fromkeys(input_names.get(field, field) for item in analyses
+                                        for field in item["evidence"].get("missingInputs", [])))
+            if missing:
+                return "账单已查询，但完成这次测算还需要确认：" + "、".join(missing) + "。请补充这些条件。"
+            reasons = list(dict.fromkeys(item["evidence"].get("reason") or "可用的完整月份不足以支持可靠的推算。" for item in analyses))
+            return "当前证据不足以完成这次分析。" + "；".join(reasons)
 
         return None
 

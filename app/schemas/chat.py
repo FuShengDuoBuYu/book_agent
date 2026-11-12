@@ -8,6 +8,7 @@ class ChatRequest(BaseModel):
 
     message: str = Field(min_length=1)
     sessionId: str | None = None
+    newSession: bool = False
     mode: Literal["个人版", "家庭版"] = "个人版"
 
 
