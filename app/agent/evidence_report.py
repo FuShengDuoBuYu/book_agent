@@ -180,7 +180,7 @@ def unsupported_assertion(text, facts):
             return '没有识别出候选项不等于已证明没有调整余地'
         if '可能' in clause:
             continue
-        if duplicate_counts and all(int(n) == 0 for n in duplicate_counts) and re.search(r'存在(?:疑似)?重复|发现(?:了)?(?:疑似)?重复', clause):
+        if duplicate_counts and all(int(n) == 0 for n in duplicate_counts) and re.search(r'(?:存在|发现|检测到|检出|识别到|识别出|查出)(?:了)?(?:疑似)?重复', clause):
             return '规则没有重复线索，不能断言存在重复'
         if re.search(r'记录不完整|存在漏记|健康风险', clause):
             return '记录样本不足不能证明漏记、完整性或健康状况'
@@ -203,6 +203,13 @@ def prepare_draft(draft, facts):
     removed = []
     for section in draft.sections:
         sentences = re.findall(r'[^。！？\n]+[。！？\n]?', section.analysis)
+        # Keep a complete, nonnumeric conditional action when a following
+        # "otherwise" clause merely repeats an unverified numerical outcome.
+        for index, sentence in enumerate(sentences):
+            parts = re.split(r'[，,](?=否则)', sentence, maxsplit=1)
+            if len(parts) == 2 and not QUANTITY.search(parts[0]) and QUANTITY.search(parts[1]):
+                sentences[index] = parts[0] + '。'
+                removed.append(parts[1])
         removed.extend(sentence for sentence in sentences if QUANTITY.search(sentence) or unsupported_assertion(sentence, facts))
         section.analysis = ''.join(sentence for sentence in sentences if not QUANTITY.search(sentence) and not unsupported_assertion(sentence, facts)).strip()
         if QUANTITY.search(section.title) or unsupported_assertion(section.title, facts):

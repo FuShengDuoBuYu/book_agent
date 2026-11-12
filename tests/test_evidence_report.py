@@ -112,6 +112,19 @@ class EvidenceReportTests(unittest.TestCase):
         self.assertNotIn('资金缺口', prepared.sections[0].title)
         self.assertIn('核对近期必付账单', prepared.sections[0].analysis)
 
+    def test_zero_duplicate_count_cannot_be_restated_as_detected_duplicates(self):
+        facts = [{'id': 'f1', 'required': True, 'text': '检测到疑似重复组 0 组。'}]
+        draft = self.draft(analysis='系统检测到疑似重复组，且医疗类别样本不足。建议核对交易原始凭据。')
+        prepared, _ = prepare_draft(draft, facts)
+        self.assertNotIn('系统检测到疑似重复', prepared.sections[0].analysis)
+        self.assertIn('核对交易原始凭据', prepared.sections[0].analysis)
+
+    def test_action_before_an_unverified_numeric_consequence_is_preserved(self):
+        draft = self.draft(analysis='若收入中断，需尽快确认新的收入来源或调整非必要支出，否则资金将在不到四个月耗尽。')
+        prepared, _ = prepare_draft(draft, self.facts)
+        self.assertIn('若收入中断，需尽快确认新的收入来源', prepared.sections[0].analysis)
+        self.assertNotIn('四个月', prepared.sections[0].analysis)
+
 
 class EvidenceReviewTests(unittest.IsolatedAsyncioTestCase):
     async def test_numeric_restatement_removed_but_qualitative_advice_reviewed(self):

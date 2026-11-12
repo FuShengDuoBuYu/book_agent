@@ -145,6 +145,12 @@ class QueryPlanner:
         if plan.analyses:
             plan.intent = "analyze_orders"
             plan.needsTools = True
+            explicit_history = re.search(r'本月|这个月|当月|今天|本周|这周|最近|过去|\d{1,4}[-年/]\d{1,2}|(?:\d{1,2}|[一二三四五六七八九十]+)月', message)
+            if (plan.analysisWindow and plan.analysisWindow.startDate >= now.date().replace(day=1)
+                    and any(task.tool in HISTORY_BASED_TOOLS for task in plan.analyses) and not explicit_history):
+                plan._planning_issues.append({'type': 'normalized_implicit_history_window',
+                    'detail': '用户未限定历史月份；当前余额或未来目标不将历史样本限制为本月。'})
+                plan.analysisWindow = None
             if plan.analysisWindow and plan.analysisWindow.startDate > now.date():
                 if not any(task.tool in HISTORY_BASED_TOOLS for task in plan.analyses):
                     raise ValueError('analysisWindow 不能用未来月份查询已发生的历史收支；未来估计需要预测工具。')

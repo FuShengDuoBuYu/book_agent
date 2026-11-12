@@ -53,6 +53,14 @@ class AnalysisPlannerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'analysisWindow'):
             QueryPlanner.__new__(QueryPlanner)._normalize_plan(plan, datetime(2026, 11, 13), '查下个月已经记了哪些账')
 
+    def test_current_balance_wording_does_not_limit_history_to_this_partial_month(self):
+        for question, keep_window in (('现在有10000元，三个月存到20000元能做到吗？', False),
+                                      ('分析本月收支，并测算三个月存到20000元', True)):
+            plan = AgentPlan.model_validate({'analysisWindow': {'startDate': '2026-11-01', 'endDate': '2026-11-30'},
+                'analyses': [{'tool': 'savings', 'startingBalance': 10000, 'targetAmount': 20000, 'months': 3}, {'tool': 'cashflow'}]})
+            normalized = QueryPlanner.__new__(QueryPlanner)._normalize_plan(plan, datetime(2026, 11, 13), question)
+            self.assertEqual(normalized.analysisWindow is not None, keep_window)
+
     def test_unused_null_collections_and_source_are_normalized(self):
         plan = AgentPlan.model_validate({'analyses': [{'tool': 'optimization', 'protectedCategories': None},
                  {'tool': 'scenario', 'changes': [{'metric': 'income', 'amount': 200, 'source': None}]}]})
