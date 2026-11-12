@@ -101,6 +101,17 @@ class EvidenceReportTests(unittest.TestCase):
         self.assertNotIn('不会导致生活困难', prepared.sections[0].analysis)
         self.assertIn('核对近期必付账单', prepared.sections[0].analysis)
 
+    def test_positive_reserve_margin_cannot_be_reported_as_a_funding_gap(self):
+        facts = build_facts([{'tool': 'purchase', 'evidence': {'sufficientData': True,
+            'startingBalance': 12000, 'purchaseAmount': 6000, 'cashAfterPurchase': 6000,
+            'reserveAmount': 5000, 'reserveMargin': 1000}}])
+        self.assertTrue(any(f['required'] and '不存在这两项的资金缺口' in f['text'] for f in facts))
+        draft = self.draft(title='资金缺口分析', analysis='需要收入及时到账以填补该缺口。请核对近期必付账单。')
+        prepared, _ = prepare_draft(draft, facts)
+        self.assertNotIn('填补该缺口', prepared.sections[0].analysis)
+        self.assertNotIn('资金缺口', prepared.sections[0].title)
+        self.assertIn('核对近期必付账单', prepared.sections[0].analysis)
+
 
 class EvidenceReviewTests(unittest.IsolatedAsyncioTestCase):
     async def test_numeric_restatement_removed_but_qualitative_advice_reviewed(self):

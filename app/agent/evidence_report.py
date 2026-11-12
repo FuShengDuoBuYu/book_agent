@@ -123,6 +123,10 @@ def build_facts(results):
             add(f"用户给定可用余额 {money(e['startingBalance'])} 元，现金购买 {money(e['purchaseAmount'])} 元后剩 {money(e['cashAfterPurchase'])} 元。", True)
             if e.get('reserveMargin') is not None:
                 add(f"相对用户希望保留的 {money(e['reserveAmount'])} 元储备，购买后余量 {money(e['reserveMargin'])} 元。还需核对近期必付账单与收入到账时间。", True)
+                if e['reserveMargin'] >= 0:
+                    add('按给定余额，可以同时覆盖购买价和所需储备，不存在这两项的资金缺口；这不等于已覆盖其他尚未提供的必付账单或未来风险。', True)
+                else:
+                    add('按给定余额，购买后不能同时满足所需储备，需调整购买金额、时间或资金安排；未确认的未来收入不能算作现有现金。', True)
         elif tool == 'runway':
             add(f"在用户假设下，每月现金缺口 {money(e['monthlyDeficit'])} 元。" +
                 (f"给定可用余额 {money(e['startingBalance'])} 元，可覆盖约 {e['runwayMonths']} 个月。" if e['runwayMonths'] is not None else '此情景没有月度缺口，不能解释为资金永远足够。'), True)
@@ -180,6 +184,8 @@ def unsupported_assertion(text, facts):
             return '规则没有重复线索，不能断言存在重复'
         if re.search(r'记录不完整|存在漏记|健康风险', clause):
             return '记录样本不足不能证明漏记、完整性或健康状况'
+        if '不存在这两项的资金缺口' in evidence_text and re.search(r'资金缺口|填补.{0,4}缺口|弥补.{0,4}差额', clause):
+            return '购买和储备已能同时覆盖，不能把正的储备余量称为资金缺口'
         if re.search(r'不会(?:导致|影响|造成).{0,6}生活|肯定买得起|肯定买不起', clause):
             return '现有余额不能保证未来生活不受影响，还需确认必付账单和储备'
         if re.search(r'工资|职业|来源', clause) and re.search(r'较好的稳定性|稳定性较好|(?:通常|天然|本身).{0,8}(?:稳定|可靠)', clause):
