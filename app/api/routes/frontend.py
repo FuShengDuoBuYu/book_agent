@@ -23,11 +23,6 @@ async def index() -> FileResponse:
     return _frontend_index()
 
 
-@router.get("/{path:path}")
-async def spa_fallback(path: str) -> FileResponse:
-    return _frontend_index()
-
-
 def _frontend_index() -> FileResponse:
     settings = get_settings()
     index_file = settings.frontend_dist / "index.html"
@@ -41,4 +36,13 @@ def _frontend_index() -> FileResponse:
             ),
         )
 
-    return FileResponse(Path(index_file))
+    return FileResponse(
+        Path(index_file),
+        headers={
+            "Content-Security-Policy": (
+                "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+                "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+            ),
+            "Referrer-Policy": "no-referrer",
+        },
+    )

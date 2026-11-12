@@ -1,34 +1,52 @@
 from functools import lru_cache
 
+from langchain_core.language_models import BaseChatModel
+from langchain_core.runnables import Runnable
 from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
+from pydantic import SecretStr
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 
 
 @lru_cache
-def get_chat_model() -> ChatOllama:
-    # 主对话模型负责“最终回答”，允许正常生成自然语言。
-    # 用 lru_cache 复用模型实例，避免每次请求重复创建。
+def get_chat_model() -> BaseChatModel:
     settings = get_settings()
+    if settings.llm_provider == "ollama":
+        return _ollama(settings)
+    return _compatible(settings)
+
+
+@lru_cache
+def get_planner_model() -> Runnable:
+    settings = get_settings()
+    if settings.llm_provider == "ollama":
+        return _ollama(settings, planner=True)
+    return _compatible(settings, planner=True).bind(response_format={"type": "json_object"})
+
+
+def _ollama(settings: Settings, planner: bool = False) -> ChatOllama:
     return ChatOllama(
-        model=settings.ollama_model,
-        base_url=settings.ollama_base_url,
+        model=settings.llm_model,
+        base_url=settings.llm_base_url,
         reasoning=False,
-        temperature=settings.ollama_temperature,
+        temperature=0 if planner else settings.llm_temperature,
         num_ctx=settings.ollama_num_ctx,
+        format="json" if planner else None,
+        num_predict=settings.planner_num_predict if planner else None,
+        client_kwargs={"timeout": settings.request_timeout_seconds},
     )
 
 
-@lru_cache
-def get_planner_model() -> ChatOllama:
-    # Planner 模型只负责产出结构化计划，所以把温度压低并强制 JSON 输出。
-    settings = get_settings()
-    return ChatOllama(
-        model=settings.ollama_model,
-        base_url=settings.ollama_base_url,
-        reasoning=False,
-        format="json",
-        temperature=0,
-        num_ctx=settings.ollama_num_ctx,
-        num_predict=settings.planner_num_predict,
+def _compatible(settings: Settings, planner: bool = False) -> ChatOpenAI:
+    return ChatOpenAI(
+        model=settings.llm_model,
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key or SecretStr("ollama"),
+        temperature=0 if planner else settings.llm_temperature,
+        max_tokens=settings.planner_num_predict if planner else None,
+        reasoning_effort=settings.llm_reasoning_effort,
+        timeout=settings.request_timeout_seconds,
+        max_retries=0,
+        use_responses_api=False,
     )

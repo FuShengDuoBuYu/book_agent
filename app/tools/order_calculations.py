@@ -2,27 +2,7 @@ import json
 from collections import defaultdict
 from typing import Any
 
-from langchain_core.tools import StructuredTool
 from langsmith import traceable
-from pydantic import BaseModel, Field
-
-
-class OrdersJsonInput(BaseModel):
-    # 统计工具当前直接吃 JSON 字符串，这是为了方便串到 Agent 链路里。
-    orders_json: str = Field(description="账单 JSON 字符串，支持 ordersInfo 数组或原始账单数组")
-
-
-class TopOrdersInput(OrdersJsonInput):
-    top_n: int = Field(default=5, ge=1, le=50, description="返回前 N 笔")
-
-
-class ComparePeriodsInput(BaseModel):
-    periods_json: str = Field(
-        description=(
-            "多个周期的压缩分析 JSON 字符串。格式为数组，每项包含 label 和 "
-            "calculationToolResults，不应包含原始 ordersInfo。"
-        )
-    )
 
 
 @traceable(name="calculate_order_summary", run_type="tool")
@@ -431,59 +411,3 @@ def _ranking_row(row: dict[str, Any] | None, metric: str) -> dict[str, Any] | No
 
 def _to_json(value: dict[str, Any] | list[Any]) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
-
-
-calculate_order_summary_tool = StructuredTool.from_function(
-    func=calculate_order_summary,
-    name="calculate_order_summary",
-    description="计算账单总支出、总收入、净收入、笔数、平均金额和日期范围。",
-    args_schema=OrdersJsonInput,
-)
-calculate_category_breakdown_tool = StructuredTool.from_function(
-    func=calculate_category_breakdown,
-    name="calculate_category_breakdown",
-    description="按账单分类计算金额、笔数、占比。",
-    args_schema=OrdersJsonInput,
-)
-find_top_expenses_tool = StructuredTool.from_function(
-    func=find_top_expenses,
-    name="find_top_expenses",
-    description="找出金额最大的 N 笔支出。",
-    args_schema=TopOrdersInput,
-)
-find_top_incomes_tool = StructuredTool.from_function(
-    func=find_top_incomes,
-    name="find_top_incomes",
-    description="找出金额最大的 N 笔收入。",
-    args_schema=TopOrdersInput,
-)
-calculate_daily_breakdown_tool = StructuredTool.from_function(
-    func=calculate_daily_breakdown,
-    name="calculate_daily_breakdown",
-    description="按天统计支出、收入、净额和笔数。",
-    args_schema=OrdersJsonInput,
-)
-calculate_monthly_breakdown_tool = StructuredTool.from_function(
-    func=calculate_monthly_breakdown,
-    name="calculate_monthly_breakdown",
-    description="按月统计支出、收入、净额和笔数。",
-    args_schema=OrdersJsonInput,
-)
-calculate_payment_method_breakdown_tool = StructuredTool.from_function(
-    func=calculate_payment_method_breakdown,
-    name="calculate_payment_method_breakdown",
-    description="按支付方式统计支出和收入金额、笔数、占比。",
-    args_schema=OrdersJsonInput,
-)
-calculate_remark_breakdown_tool = StructuredTool.from_function(
-    func=calculate_remark_breakdown,
-    name="calculate_remark_breakdown",
-    description="按备注统计支出金额、笔数、占比。",
-    args_schema=OrdersJsonInput,
-)
-compare_periods_tool = StructuredTool.from_function(
-    func=compare_periods,
-    name="compare_periods",
-    description="对比多个周期的总支出、总收入、最高支出和分类结构。",
-    args_schema=ComparePeriodsInput,
-)

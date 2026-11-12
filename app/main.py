@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from app.api.routes import chat, frontend, health
+from app.api.routes import chat, frontend, health, session
 from app.core.config import get_settings
 
 
@@ -12,6 +12,7 @@ def create_app() -> FastAPI:
     # 健康检查通常最先注册，便于部署环境快速探活。
     app.include_router(health.router)
     # 对话相关接口统一挂到 /api 前缀下，前端通过这里进入 Agent 主流程。
+    app.include_router(session.router, prefix="/api")
     app.include_router(chat.router, prefix="/api")
     # 前端静态资源和页面路由单独注册，方便本地直接跑一个完整应用。
     frontend.register_frontend(app)

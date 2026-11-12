@@ -5,10 +5,6 @@ from pydantic import BaseModel, Field
 
 class SearchOrdersRequest(BaseModel):
     mode: str = Field(default="个人版")
-    # alias的意思Json的字段名
-    family_id: str = Field(default="", alias="familyId")
-    phone_num: str = Field(alias="phoneNum")
-    user_id: str | None = Field(default=None, alias="userId")
     year: int
     month: int
     day: int
