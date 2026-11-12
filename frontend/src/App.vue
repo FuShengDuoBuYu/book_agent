@@ -180,7 +180,6 @@ async function loadSession() {
     const context = await response.json();
     familyAvailable.value = context.familyAvailable === true;
     hasSession.value = true;
-    restoreSessionId();
   } catch {
     sessionStatus.value = "暂时无法连接账本服务，请从 App 重新进入。";
   }
@@ -189,7 +188,7 @@ async function loadSession() {
 function setBookMode(value) {
   if (bookMode.value === value || isBusy.value) return;
   bookMode.value = value;
-  restoreSessionId();
+  sessionId.value = "";
   messages.value = [];
   showToast(`已切换到${value}`);
 }
@@ -509,25 +508,7 @@ function sleep(ms) {
   });
 }
 
-function sessionStorageKey() {
-  return `book-agent.conversation.${bookMode.value}`;
-}
-
-function restoreSessionId() {
-  try {
-    sessionId.value = localStorage.getItem(sessionStorageKey()) || "";
-  } catch {
-    sessionId.value = "";
-  }
-}
-
 function setSessionId(value) {
-  if (!value || !hasSession.value) return;
-  sessionId.value = value;
-  try {
-    localStorage.setItem(sessionStorageKey(), value);
-  } catch {
-    // The active conversation also works when storage is unavailable.
-  }
+  if (value && hasSession.value) sessionId.value = value;
 }
 </script>

@@ -17,7 +17,7 @@ from app.schemas.plan import (
     render_analysis_types_for_prompt,
     render_intents_for_prompt,
 )
-from app.tools.registry import PLANNER_TOOL_BY_NAME, render_planner_tools_for_prompt
+from app.tools.registry import PLANNER_TOOL_BY_NAME, format_tool_call, render_planner_tools_for_prompt
 
 
 class QueryPlanner:
@@ -148,7 +148,7 @@ class QueryPlanner:
         if not tool_call.id:
             tool_call.id = f"search_orders_{index}"
         if not tool_call.reason:
-            tool_call.reason = self._format_tool_call(tool_call)
+            tool_call.reason = format_tool_call(tool_call)
         return tool_call
 
     def _dedupe_tool_calls(self, tool_calls: list[ToolCall]) -> list[ToolCall]:
@@ -187,25 +187,10 @@ class QueryPlanner:
         )
 
     def _build_summary(self, plan: AgentPlan) -> str:
-        summaries = [self._format_tool_call(tool_call) for tool_call in plan.toolCalls]
+        summaries = [format_tool_call(tool_call) for tool_call in plan.toolCalls]
         if len(summaries) > 1:
             return "、".join(summaries) + "后对比分析"
         return summaries[0] if summaries else "无需查询账单"
-
-    def _format_tool_call(self, tool_call: ToolCall) -> str:
-        args = tool_call.args
-        scope = "家庭" if tool_call.toolName == "search_family_orders" else "个人"
-        if args.year is None:
-            if args.month is not None and args.day is not None:
-                return f"{args.month}月{args.day}日{scope}账单（不限年份）"
-            if args.month is not None:
-                return f"{args.month}月{scope}账单（不限年份）"
-            return f"全部{scope}账单"
-        if args.month is None:
-            return f"{args.year}年{scope}账单"
-        if args.day is None:
-            return f"{args.year}年{args.month}月{scope}账单"
-        return f"{args.year}年{args.month}月{args.day}日{scope}账单"
 
     def _normalize_mode(self, value: str | None) -> str:
         mode = str(value or "").strip()

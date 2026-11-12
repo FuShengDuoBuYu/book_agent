@@ -10,7 +10,7 @@ from app.schemas.plan import AgentPlan, SearchPersonalOrdersArgs, ToolCall
 
 
 class LedgerAccessTests(unittest.IsolatedAsyncioTestCase):
-    async def test_plan_cannot_change_the_selected_ledger(self):
+    async def test_mixed_plan_reads_distinct_authorized_scopes(self):
         observed = []
 
         async def ledger(request):
@@ -28,24 +28,35 @@ class LedgerAccessTests(unittest.IsolatedAsyncioTestCase):
             })
 
         agent = BookAgent(BookkeepingApiClient("fixture-grant"))
-        plan = AgentPlan(toolCalls=[ToolCall(
-            toolName="search_family_orders",
-            args=SearchPersonalOrdersArgs(year=2026, month=10),
-        )])
+        plan = AgentPlan(toolCalls=[
+            ToolCall(toolName=tool, args=SearchPersonalOrdersArgs(year=2026, month=10))
+            for tool in ("search_personal_orders", "search_family_orders")
+        ])
         factory = httpx.AsyncClient
         with patch(
             "app.clients.bookkeeping_api.httpx.AsyncClient",
             side_effect=lambda **kwargs: factory(transport=httpx.MockTransport(ledger), **kwargs),
         ):
-            result = json.loads(await agent._execute_tool_calls("个人版", "", plan))
+            result = json.loads(await agent._execute_tool_calls("个人版", "fixture-family", plan))
 
-        request, body = observed[0]
-        self.assertEqual(request.url.path, "/ai-bill/orders")
-        self.assertEqual(request.headers["authorization"], "Bearer fixture-grant")
-        self.assertEqual(body["mode"], "个人版")
-        self.assertFalse({"phoneNum", "familyId", "userId"} & body.keys())
+        personal, family = observed
+        self.assertEqual([body["mode"] for _, body in observed], ["个人版", "家庭版"])
+        self.assertNotIn("x-ai-bill-family-scope", personal[0].headers)
+        self.assertEqual(family[0].headers["x-ai-bill-family-scope"], "fixture-family")
+        for request, body in observed:
+            self.assertEqual(request.url.path, "/ai-bill/orders")
+            self.assertEqual(request.headers["authorization"], "Bearer fixture-grant")
+            self.assertFalse({"phoneNum", "familyId", "userId"} & body.keys())
         self.assertEqual(result["toolResults"][0]["orderCount"], 1)
         self.assertNotIn("13800138001", json.dumps(result))
+
+    async def test_family_lookup_requires_verified_membership(self):
+        agent = BookAgent(BookkeepingApiClient("fixture-grant"))
+        plan = AgentPlan(toolCalls=[ToolCall(toolName="search_family_orders")])
+        with patch.object(agent.ledger_client, "search_orders") as lookup:
+            result = await agent._execute_tool_calls("个人版", "", plan)
+        lookup.assert_not_called()
+        self.assertIn("未加入家庭", agent._build_deterministic_reply(plan, result))
 
     async def test_unavailable_ledger_is_not_reported_as_empty(self):
         async def ledger(request):

@@ -16,6 +16,8 @@ async def search_orders(
     day: int | None = None,
     cost_type: str = "不限",
     remark: str = "",
+    *,
+    family_scope: str = "",
 ) -> dict[str, Any]:
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
     normalized_cost_type = normalize_cost_type(cost_type)
@@ -32,10 +34,10 @@ async def search_orders(
         ifIgnoreDay=day is None,
     )
     try:
-        data = await client.search_orders(request)
+        data = await client.search_orders(request, family_scope=family_scope)
         parsed = SearchOrdersResponse.model_validate(data)
     except httpx.HTTPStatusError as exc:
-        if exc.response.status_code in {401, 403}:
+        if exc.response.status_code in {401, 403, 409}:
             return {"ok": False, "error": "bookkeeping_access_denied"}
         return {"ok": False, "error": "bookkeeping_unavailable"}
     except (httpx.HTTPError, ValueError):

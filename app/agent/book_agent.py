@@ -20,7 +20,7 @@ from app.tools.order_calculations import (
     find_top_incomes,
 )
 from app.tools.order_search import search_orders
-from app.tools.registry import PLANNER_TOOL_BY_NAME
+from app.tools.registry import PLANNER_TOOL_BY_NAME, format_tool_call
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +84,10 @@ class BookAgent:
         try:
             book_mode = self._normalize_mode(mode)
             family_id = str(family_id or "").strip()
-            book_scope = f"family:{family_id}" if book_mode == "家庭版" else "personal"
+            book_scope = "family" if book_mode == "家庭版" else "personal"
+            if family_id:
+                # Both modes can answer comparisons with the authorized family.
+                book_scope = f"{book_scope}:{family_id}"
             yield {"type": "status", "content": "正在解析你的问题"}
             yield {"type": "status", "content": f"当前账本模式：{book_mode}"}
             resolved_session_id = await self.memory.ensure_session(
@@ -117,7 +120,7 @@ class BookAgent:
             )
             yield {
                 "type": "status",
-                "content": f"查询计划：{self._scope_text(plan.summary, book_mode)}",
+                "content": f"查询计划：{plan.summary}",
             }
 
             if plan.needsTools:
@@ -126,7 +129,7 @@ class BookAgent:
                         "type": "status",
                         "content": (
                             f"准备调用工具：{tool_call.id}，"
-                            f"{self._format_tool_call(tool_call, book_mode)}，"
+                            f"{format_tool_call(tool_call)}，"
                             f"分类={tool_call.args.cost_type or '不限'}"
                         ),
                     }
@@ -253,7 +256,7 @@ class BookAgent:
         family_id = str(family_id or "").strip()
 
         for tool_call in plan.toolCalls:
-            parsed_result = await self._execute_tool_call(tool_call, book_mode)
+            parsed_result = await self._execute_tool_call(tool_call, family_id)
             order_count = int(parsed_result.get("orderCount") or 0)
             total_order_count += order_count
             # 查询工具返回原始账单，统计工具再把原始账单加工成适合回答的摘要信息。
@@ -266,7 +269,7 @@ class BookAgent:
                     "toolName": tool_call.toolName,
                     "reason": tool_call.reason,
                     "args": tool_call.args.model_dump(mode="json"),
-                    "summary": self._format_tool_call(tool_call, book_mode),
+                    "summary": format_tool_call(tool_call),
                     "mode": parsed_result.get("mode", book_mode),
                     "ok": parsed_result.get("ok", False),
                     "error": parsed_result.get("error"),
@@ -288,7 +291,7 @@ class BookAgent:
             {
                 "ok": True,
                 "message": "账单查询完成。",
-                "planSummary": self._scope_text(plan.summary, book_mode),
+                "planSummary": plan.summary,
                 "analysisType": plan.analysisType,
                 "mode": book_mode,
                 "familyIdSet": bool(family_id),
@@ -301,11 +304,19 @@ class BookAgent:
             default=str,
         )
 
-    async def _execute_tool_call(self, tool_call: ToolCall, mode: str) -> dict:
-        if tool_call.toolName not in PLANNER_TOOL_BY_NAME:
+    async def _execute_tool_call(self, tool_call: ToolCall, family_id: str) -> dict:
+        tool = PLANNER_TOOL_BY_NAME.get(tool_call.toolName)
+        if tool is None:
             return {"ok": False, "error": "unsupported_tool"}
 
-        return await search_orders(self.ledger_client, mode, **tool_call.args.model_dump())
+        mode, _ = tool
+        family_scope = family_id if mode == "家庭版" else ""
+        if mode == "家庭版" and not family_scope:
+            return {"ok": False, "error": "family_not_available"}
+
+        return await search_orders(
+            self.ledger_client, mode, family_scope=family_scope, **tool_call.args.model_dump()
+        )
 
     def _calculate_orders(
         self, parsed_result: dict[str, Any], plan: AgentPlan
@@ -362,6 +373,8 @@ class BookAgent:
         tool_results = data.get("toolResults") or []
         if not tool_results:
             return None
+        if any(item.get("error") == "family_not_available" for item in tool_results):
+            return "当前账号未加入家庭账本。"
         if any(item.get("error") == "bookkeeping_access_denied" for item in tool_results):
             return "账本权限或会话已变化，请从自动记账重新进入。"
         if any(not item.get("ok") for item in tool_results):
@@ -399,11 +412,6 @@ class BookAgent:
             return "家庭版"
         return "个人版"
 
-    def _scope_text(self, text: str, mode: str) -> str:
-        if self._normalize_mode(mode) != "家庭版":
-            return text
-        return str(text or "").replace("个人账单", "家庭账单")
-
     @staticmethod
     def _mask_trace_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
         cleaned = {key: value for key, value in inputs.items() if key != "self"}
@@ -418,21 +426,6 @@ class BookAgent:
         except json.JSONDecodeError:
             return {"ok": False, "error": "invalid_tool_json", "raw": value}
         return data if isinstance(data, dict) else {"ok": False, "raw": data}
-
-    def _format_tool_call(self, tool_call: ToolCall, mode: str = "个人版") -> str:
-        args = tool_call.args
-        scope = self._normalize_mode(mode).replace("版", "")
-        if args.year is None:
-            if args.month is not None and args.day is not None:
-                return f"{args.month}月{args.day}日{scope}账单（不限年份）"
-            if args.month is not None:
-                return f"{args.month}月{scope}账单（不限年份）"
-            return f"全部{scope}账单"
-        if args.month is None:
-            return f"{args.year}年{scope}账单"
-        if args.day is None:
-            return f"{args.year}年{args.month}月{scope}账单"
-        return f"{args.year}年{args.month}月{args.day}日{scope}账单"
 
     def _format_history(self, messages: list[dict]) -> str:
         if not messages:

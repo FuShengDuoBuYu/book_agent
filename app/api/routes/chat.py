@@ -11,11 +11,9 @@ router = APIRouter(tags=["chat"])
 
 
 def _chat_args(request: ChatRequest, session: LedgerSession) -> dict:
-    family_id = ""
-    if request.mode == "家庭版":
-        family_id = session.account.familyId
-        if not family_id:
-            raise HTTPException(403, "当前账号未加入家庭账本。", headers=NO_STORE)
+    family_id = session.account.familyId
+    if request.mode == "家庭版" and not family_id:
+        raise HTTPException(403, "当前账号未加入家庭账本。", headers=NO_STORE)
     return {
         "phone_num": session.account.phoneNum,
         "message": request.message,

@@ -17,8 +17,8 @@ WebView ──HTTPS──▶ book_agent ──受限会话──▶ 账本 FastA
 
 1. Android 从当前 App 账号发起密码验证，调用 `POST /auth/ai-bill/ticket`。旧 App 登录资料只有账号标识，进入 AI 账单时需要确认密码。账本后端签发一次性短期票据。
 2. WebView 以表单 POST 调用 Agent 的 `/api/session/exchange`。Agent 向记账后端交换只读会话，向 WebView 设置 HTTPS、HttpOnly、SameSite Cookie，然后跳转到聊天页。
-3. Vue 通过 `GET /api/session` 获取可用账本模式，通过 `POST /api/chat/stream` 提交问题、模式和对话 ID。账号和家庭范围由账本服务根据会话计算。对话记忆按账号和账本范围绑定。
-4. Agent 把规划参数交给 `POST /ai-bill/orders`，在服务端计算金额并把汇总交给模型。模型和前端使用查询结果生成可核对的回复。账本接口失败时提示查询未完成。
+3. Vue 通过 `GET /api/session` 获取可用账本模式，通过 `POST /api/chat/stream` 提交问题、模式和对话 ID。账号和家庭范围由账本服务根据会话计算。服务端按已验证的账号、账本模式和家庭范围恢复最近对话。
+4. Agent 把规划参数交给 `POST /ai-bill/orders`，家庭请求携带由账本服务返回的家庭范围，后端在查询前重新核对。代码在服务端计算金额并把汇总交给模型。模型和前端使用查询结果生成可核对的回复。账本接口失败时提示查询未完成。
 
 ## 配置与发布
 
