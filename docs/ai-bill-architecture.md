@@ -33,3 +33,14 @@ WebView ──HTTPS──▶ book_agent ──受限会话──▶ 账本 FastA
 - 在隔离环境验证票据过期、票据重复兑换、跨账号请求、家庭权限变化和错误反馈，再用同一月份对照 Android 月报。正式接入真实账本前，确认旧账号密码修复、旧账单查询和家庭写接口的访问控制与迁移方案。
 
 [家庭部署信息清单](home-agent-checklist.md)
+
+
+## 家庭主机启动与域名映射
+
+在发布目录运行以下命令，启动回环上的 Agent 和账本服务。两端使用各自的 Python 虚拟环境，MongoDB 配置从现有 Agent 环境读取。
+
+```sh
+agent/.venv/bin/python agent/deploy/run-home.py --existing-env /root/apps/book-agent/.env
+```
+
+在 Cloudflare 的既有 Tunnel 下添加 Published application。主机名使用 `bill.fushengduobuyu.com`，Service 选择 HTTP，地址填 `127.0.0.1:18001`，Path 留空。域名生效后访问 `https://bill.fushengduobuyu.com/ready`，预期返回所选模型和 `status: ok`。
