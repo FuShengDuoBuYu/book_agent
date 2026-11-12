@@ -10,6 +10,36 @@ def plan(tool, follow=True, **kwargs):
 
 
 class AnalysisContextTests(unittest.TestCase):
+    def test_baseline_and_adjusted_comparison_remain_distinct(self):
+        current = AgentPlan(analyses=[AnalysisRequest(tool='projection', months=3),
+            AnalysisRequest(tool='projection', months=3, changes=[{'metric': 'income', 'source': '家教', 'percent': -50}])])
+        state = resolve_context(current, {})
+        self.assertEqual(current.analyses[0].changes, [])
+        self.assertEqual(current.analyses[1].changes[0].percent, -50)
+        self.assertTrue(state['ambiguous'])
+
+    def test_personal_and_family_balances_are_separate(self):
+        current = AgentPlan.model_validate({'toolCalls': [
+            {'id': 'p', 'toolName': 'search_personal_orders'}, {'id': 'f', 'toolName': 'search_family_orders'}],
+            'analyses': [{'tool': 'purchase', 'queryIds': ['p'], 'startingBalance': 10000, 'purchaseAmount': 6000},
+                         {'tool': 'purchase', 'queryIds': ['f'], 'purchaseAmount': 6000}]})
+        resolve_context(current, {})
+        self.assertIsNone(current.analyses[1].startingBalance)
+
+    def test_implicit_personal_scope_cannot_supply_family_balance(self):
+        first = plan('purchase', follow=False, startingBalance=10000, purchaseAmount=1000)
+        context = resolve_context(first, {}, book_mode='个人版')
+        second = plan('purchase', purchaseAmount=2000)
+        resolve_context(second, context, book_mode='家庭版')
+        self.assertIsNone(second.analyses[0].startingBalance)
+
+    def test_two_additive_changes_in_one_scenario_are_preserved(self):
+        current = plan('scenario', follow=False, changes=[{'metric': 'income', 'amount': 1000, 'label': '兼职'},
+                                                         {'metric': 'income', 'amount': 500, 'label': '授课'}])
+        state = resolve_context(current, {})
+        self.assertEqual(sum(row.amount for row in current.analyses[0].changes), 1500)
+        self.assertFalse(state.get('ambiguous'))
+
     def test_alternative_scenarios_keep_their_own_conditions(self):
         current = AgentPlan(analyses=[AnalysisRequest(tool='projection', months=3,
                     changes=[{'metric': 'income', 'source': '家教', 'percent': -50}]),

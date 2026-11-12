@@ -66,7 +66,7 @@ class QueryPlanner:
                     raise ValueError("Missing plan")
                 plan = AgentPlan.model_validate(data)
                 self._coalesce_forecasts(plan)
-                resolve_context(plan, previous_context or {})
+                resolve_context(plan, previous_context or {}, self._normalize_mode(book_mode))
                 return self._normalize_plan(plan, now, message, book_mode)
             except (asyncio.TimeoutError, json.JSONDecodeError, ValidationError, ValueError) as exc:
                 detail = "; ".join(f"{error['loc']}: {error['msg']}" for error in exc.errors()) if isinstance(exc, ValidationError) else str(exc)

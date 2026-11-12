@@ -6,7 +6,7 @@ from statistics import median
 
 from app.tools.financial_analysis import (
     _anomalies, _buckets, _date, _forecast, _nonrecurring_income,
-    _round_money, _source, _totals, shift_month,
+    _round_money, _series, _source, _totals, shift_month,
 )
 
 
@@ -63,6 +63,8 @@ def baseline(orders, as_of, changes=None, target_month=None):
     return {"sufficientData": True, "income": totals["income"], "expense": totals["expense"], "net": net,
             "lowerNet": _round_money(min(observed) + net_delta), "upperNet": _round_money(max(observed) + net_delta),
             "assumptions": adjusted["assumptions"], "baselineMonths": income["baselineMonths"],
+            "incomeRange": [income['lower'], income['upper']], "expenseRange": [expense['lower'], expense['upper']],
+            "incomeSources": [row['source'] for row in income['sources']['income'] if not row['possibleNonrecurring']],
             "latestCompleteChange": income["latestCompleteChange"], "limitations": income["limitations"]}
 
 
@@ -86,7 +88,8 @@ def projection(orders, *, as_of, months=None, starting_balance=None, changes=Non
 
 
 def income_stability(orders, *, as_of, **kwargs):
-    history = [row for row in orders if _date(row) < as_of.replace(day=1)]
+    complete = {row['month'] for row in _series(orders, as_of, kwargs.get('window_start'), kwargs.get('window_end')) if not row['partial']}
+    history = [row for row in orders if _date(row).strftime('%Y-%m') in complete]
     buckets = _buckets(history)
     earned = {month: [row for row in rows if not (float(row["money"]) > 0 and _nonrecurring_income(row))]
               for month, rows in buckets.items()}

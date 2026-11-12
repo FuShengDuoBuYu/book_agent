@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import AsyncMock
 
-from app.agent.evidence_report import EvidenceReporter, validate_draft, render_report, build_facts
+from app.agent.evidence_report import EvidenceReporter, validate_draft, render_report, build_facts, prepare_draft
 from app.schemas.report import ReportDraft
 
 
@@ -34,6 +34,35 @@ class EvidenceReportTests(unittest.TestCase):
             'expenseCategories': [{'name': '房租', 'amount': 1800, 'shareOfIncomePercent': 27.27}],
             'interpretation': '资产未知'}}])
         self.assertTrue(any('房租' in fact['text'] for fact in facts))
+
+    def test_savings_time_to_goal_is_available_to_the_answer(self):
+        from app.tools.financial_analysis import run_analysis
+        from tests.test_decision_analysis import ledger
+        from datetime import date
+        for starting, expected in ((10000, '3 个月'), (20000, '已经达到')):
+            evidence = run_analysis('savings', ledger(), as_of=date(2026, 11, 12), starting_balance=starting, target_amount=20000)
+            facts = build_facts([{'tool': 'savings', 'evidence': evidence}])
+            self.assertTrue(any(expected in fact['text'] and fact['required'] for fact in facts))
+
+    def test_unconfirmed_categorical_claims_are_not_sent(self):
+        facts = [{'id': 'f1', 'required': True, 'text': '检测到疑似重复组 0 组；未来医疗安排未知。'}]
+        draft = self.draft(title='医疗支出突增且记录不完整',
+            analysis='账本中存在疑似重复记录。家教属于不稳定的兼职收入。近期增加是一次性的医疗支出。建议确认后续是否有就诊计划。')
+        prepared, _ = prepare_draft(draft, facts)
+        reply = render_report(prepared, facts)
+        self.assertNotIn('存在疑似重复', reply)
+        self.assertNotIn('不稳定的兼职', reply)
+        self.assertNotIn('一次性的医疗', reply)
+        self.assertNotIn('记录不完整', reply)
+        self.assertIn('建议确认后续是否有就诊计划', reply)
+
+    def test_numeric_only_lead_does_not_discard_useful_later_analysis(self):
+        draft = ReportDraft.model_validate({'sections': [
+            {'title': '结余测算', 'factIds': ['f1'], 'analysis': '预计新增12000元。'},
+            {'title': '需确认的变化', 'factIds': ['f1'], 'analysis': '建议确认后续收入安排，再据实际到账情况调整计划。'}]})
+        prepared, _ = prepare_draft(draft, self.facts)
+        self.assertEqual(prepared.sections[0].analysis, '')
+        self.assertIn('建议确认', render_report(prepared, self.facts))
 
 
 class EvidenceReviewTests(unittest.IsolatedAsyncioTestCase):

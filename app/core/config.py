@@ -27,6 +27,8 @@ class Settings(BaseModel):
     llm_reasoning_effort: str | None = None
     llm_reasoning: bool = False
     ollama_num_ctx: int = Field(default=8192, gt=0)
+    ollama_keep_alive: str = '60s'
+    ollama_num_gpu: int | None = Field(default=None, ge=0)
     planner_timeout_seconds: float = Field(default=20.0, gt=0)
     planner_num_predict: int = Field(default=2048, gt=0)
     request_timeout_seconds: float = Field(default=120.0, gt=0)
@@ -73,6 +75,8 @@ def get_settings() -> Settings:
         llm_reasoning_effort=os.getenv("LLM_REASONING_EFFORT") or None,
         llm_reasoning=os.getenv("LLM_REASONING", str(defaults.llm_reasoning)),
         ollama_num_ctx=os.getenv("OLLAMA_NUM_CTX", str(defaults.ollama_num_ctx)),
+        ollama_keep_alive=os.getenv('OLLAMA_KEEP_ALIVE', defaults.ollama_keep_alive),
+        ollama_num_gpu=os.getenv('OLLAMA_NUM_GPU') or None,
         planner_timeout_seconds=os.getenv(
             "PLANNER_TIMEOUT_SECONDS", str(defaults.planner_timeout_seconds)
         ),

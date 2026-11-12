@@ -1,8 +1,10 @@
-"""Resolved user assumptions, independent of generated answer prose."""
+"""Resolve user conditions within a query scope and a single scenario."""
 
+from collections import Counter, defaultdict
 from copy import deepcopy
+import json
 
-from app.schemas.plan import AgentPlan, ScenarioChange
+from app.schemas.plan import AgentPlan, ScenarioChange, ToolCall
 
 FIELDS = ('months', 'startingBalance', 'targetAmount', 'monthlyImprovement',
           'purchaseAmount', 'reserveAmount', 'targetMonth')
@@ -16,61 +18,85 @@ def latest_context(messages):
     return {}
 
 
-def resolve_context(plan: AgentPlan, previous: dict) -> dict:
-    scope = sorted({(call.toolName, call.args.cost_type, call.args.remark) for call in plan.toolCalls})
-    scope = [list(row) for row in scope]
-    same_scope = not scope or not previous.get('scope') or scope == previous['scope']
-    inherit = plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext and same_scope
-    state = deepcopy(previous) if inherit else {}
-    if inherit and state.get('ambiguous'):
-        raise ValueError('上轮比较了多个不同情景，请明确沿用哪一个情景及其条件')
+def merge_changes(previous, current):
+    # Replace previous conditions for a source, preserving multiple changes
+    # stated together (e.g. two independent additional income streams).
+    replaced = {(row['metric'], row.get('source') or '') for row in current}
+    return [row for row in previous if (row['metric'], row.get('source') or '') not in replaced] + deepcopy(current)
+
+
+def resolve_group(tasks, previous, scope):
+    state = deepcopy(previous)
     state.pop('previousMonths', None)
-    changes = {(row['metric'], row.get('source') or ''): row for row in state.get('changes', [])}
-    protected = state.get('protectedCategories', [])
-    deltas = {task.monthsDelta for task in plan.analyses if task.monthsDelta is not None}
-    if len(deltas) > 1:
+    delta = {task.monthsDelta for task in tasks if task.monthsDelta is not None}
+    if len(delta) > 1:
         raise ValueError('Multiple incompatible deadline changes')
-    if deltas:
+    if delta:
         if not state.get('months'):
             raise ValueError('延长期限需要上一轮明确的月数，请确认期限')
         state['previousMonths'] = state['months']
-        state['months'] += deltas.pop()
+        state['months'] += delta.pop()
         if not 1 <= state['months'] <= 600:
             raise ValueError('Resulting horizon must be between 1 and 600 months')
-    decisions = [task for task in plan.analyses if task.tool in DECISION_TOOLS]
-    alternatives = False
     for field in FIELDS:
-        values = {getattr(task, field) for task in decisions if getattr(task, field) is not None
+        values = {getattr(task, field) for task in tasks if getattr(task, field) is not None
                   and not (field == 'months' and task.monthsDelta is not None)}
-        if len(values) == 1:
+        if len(values) > 1:
+            raise ValueError('同一情景存在互相冲突的条件，请分成独立情景')
+        if values:
             state[field] = values.pop()
-        elif len(values) > 1:
-            alternatives = True
-    new_changes = {}
-    for task in decisions:
-        for change in task.changes:
-            key = (change.metric, change.source)
-            new_changes.setdefault(key, {})[change.model_dump_json()] = change.model_dump()
-    for key, values in new_changes.items():
-        if len(values) == 1:
-            changes[key] = next(iter(values.values()))
-        else:
-            alternatives = True
-    for task in decisions:
-        protected = list(dict.fromkeys(protected + task.protectedCategories))
-    state['changes'] = list(changes.values())
-    state['protectedCategories'] = protected
-    state['scope'] = scope or state.get('scope', [])
+    new_sets = {json.dumps([row.model_dump() for row in task.changes], sort_keys=True, ensure_ascii=False)
+                for task in tasks if task.changes}
+    if len(new_sets) > 1:
+        raise ValueError('不同分析提供了不一致的变化条件，请分别明确情景')
+    changes = json.loads(new_sets.pop()) if new_sets else []
+    state['changes'] = merge_changes(state.get('changes', []), changes)
+    state['protectedCategories'] = list(dict.fromkeys(state.get('protectedCategories', []) +
+                                                     [name for task in tasks for name in task.protectedCategories]))
+    state['scope'] = [list(row) for row in scope]
+    if all(state.get(key) is not None for key in ('startingBalance', 'targetAmount', 'months')):
+        # The tool calculates the additional gap; never persist model arithmetic.
+        state.pop('monthlyImprovement', None)
+    for task in tasks:
+        for field in FIELDS:
+            setattr(task, field, state.get(field))
+        task.changes = [ScenarioChange.model_validate(row) for row in state['changes']]
+        task.protectedCategories = state['protectedCategories']
+        task.monthsDelta = None
+    return state
+
+
+def resolve_context(plan: AgentPlan, previous: dict, book_mode='个人版') -> dict:
+    if plan.analyses and not plan.toolCalls:
+        tool = 'search_family_orders' if book_mode == '家庭版' else 'search_personal_orders'
+        plan.toolCalls = [ToolCall(id='ledger', toolName=tool)]
+    sources = {call.id or f'query_{index}': (call.toolName, call.args.cost_type, call.args.remark)
+               for index, call in enumerate(plan.toolCalls, 1)}
+    groups = defaultdict(list)
     for task in plan.analyses:
         if task.tool in DECISION_TOOLS:
-            for field in FIELDS:
-                if field in state and (getattr(task, field) is None or (field == 'months' and task.monthsDelta is not None)):
-                    setattr(task, field, state[field])
-            local_changes = {**changes, **{(row.metric, row.source): row.model_dump() for row in task.changes}}
-            task.changes = [ScenarioChange.model_validate(row) for row in local_changes.values()]
-            task.protectedCategories = protected
-            task.monthsDelta = None
-    if alternatives:
-        state = {'ambiguous': True, 'scope': state['scope'], 'scenarios': [task.model_dump() for task in decisions]}
+            ids = task.queryIds or list(sources)
+            if set(ids) - sources.keys():
+                raise ValueError('An analysis references an unknown query id')
+            scope = tuple(sorted({sources[key] for key in ids}))
+            if len(scope) > 1:
+                raise ValueError('决策条件需要绑定单一账本与筛选范围，不能混用余额或假设')
+            groups[scope].append(task)
+    states = []
+    for scope, tasks in groups.items():
+        inherit = plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext
+        inherit = inherit and previous.get('scope') == [list(row) for row in scope]
+        if inherit and previous.get('ambiguous'):
+            raise ValueError('上轮比较了多个情景，请明确要沿用的情景及条件')
+        prior = previous if inherit else {}
+        alternatives = any(count > 1 for count in Counter(task.tool for task in tasks).values())
+        batches = [[task] for task in tasks] if alternatives else [tasks]
+        states.extend(resolve_group(batch, prior, scope) for batch in batches)
+    if len(states) == 1:
+        state = states[0]
+    elif states:
+        state = {'ambiguous': True, 'scenarios': states}
+    else:
+        state = deepcopy(previous) if plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext else {}
     plan._analysis_context = state
     return state

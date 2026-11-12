@@ -74,6 +74,12 @@ class DecisionAnalysisTests(unittest.TestCase):
         self.assertEqual(result["incomeMax"], 6600)
         self.assertEqual(result["sources"][0]["sharePercent"], 75.76)
 
+    def test_income_stability_excludes_partial_query_boundary_months(self):
+        rows = [row for row in ledger() if date(2026, 9, 2) <= date(row['year'], row['month'], row['day']) <= date(2026, 10, 2)]
+        result = self.tool('income_stability', rows, window_start=date(2026, 9, 2), window_end=date(2026, 10, 2))
+        self.assertFalse(result['sufficientData'])
+        self.assertEqual(result['observedMonths'], [])
+
     def test_goal_optimization_uses_additional_gap_not_total_required_saving(self):
         result = self.tool('optimization', starting_balance=10000, target_amount=20000, months=3,
                            monthly_improvement=3333.33)

@@ -283,7 +283,10 @@ class BookAgent:
                       "planningIssues": plan._planning_issues,
                       "model": {"provider": settings.llm_provider, "name": settings.llm_model,
                                 "reasoning": settings.llm_reasoning,
-                                "reasoningEffort": settings.llm_reasoning_effort}},
+                                "reasoningEffort": settings.llm_reasoning_effort,
+                                "contextLength": settings.ollama_num_ctx,
+                                "gpuLayers": settings.ollama_num_gpu,
+                                "keepAlive": settings.ollama_keep_alive}},
         )
 
     @traceable(name="book_agent_create_plan", run_type="chain")
