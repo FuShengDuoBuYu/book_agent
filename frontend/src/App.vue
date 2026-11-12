@@ -2,7 +2,7 @@
   <main class="app">
     <header class="topbar">
       <div class="title-block">
-        <h1>Book Agent</h1>
+        <h1>AI 账单</h1>
         <p>{{ subtitle }}</p>
       </div>
     </header>
@@ -12,6 +12,7 @@
         <button
           type="button"
           :class="{ active: bookMode === '个人版' }"
+          :disabled="isBusy || !hasSession"
           @click="setBookMode('个人版')"
         >
           个人版
@@ -19,31 +20,21 @@
         <button
           type="button"
           :class="{ active: bookMode === '家庭版' }"
+          :disabled="isBusy || !familyAvailable"
           @click="setBookMode('家庭版')"
         >
           家庭版
         </button>
       </div>
-      <input
-        v-if="isFamilyMode"
-        v-model="familyId"
-        class="family-input"
-        type="text"
-        inputmode="text"
-        autocomplete="off"
-        placeholder="familyId，可留空自动获取"
-        @change="syncSessionId"
-      />
     </section>
 
-    <section v-if="!phoneNum" class="context-banner">
-      等待 App 注入用户身份后即可开始对话。
+    <section v-if="!hasSession" class="context-banner" role="status">
+      {{ sessionStatus }}
     </section>
 
     <section ref="chatRef" class="chat" aria-live="polite">
-      <div v-if="messages.length === 0" class="empty">
+      <div v-if="hasSession && messages.length === 0" class="empty">
         <h2>今天想看哪笔账？</h2>
-        <p>先问一句，体验本地账单 Agent 的对话效果。</p>
         <div class="suggestions">
           <button
             v-for="item in suggestions"
@@ -105,14 +96,14 @@
         ref="inputRef"
         v-model="draft"
         rows="1"
-        :placeholder="phoneNum ? '发消息' : '等待用户身份'"
-        :disabled="isBusy || !phoneNum"
+        :placeholder="hasSession ? '发消息' : '等待验证'"
+        :disabled="isBusy || !hasSession"
         @input="resizeInput"
         @keydown.enter.exact.prevent="sendMessage"
       />
       <button
         type="submit"
-        :disabled="isBusy || !phoneNum || !draft.trim()"
+        :disabled="isBusy || !hasSession || !draft.trim()"
         aria-label="发送"
       >
         <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -134,10 +125,11 @@ import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 // 这里维护的是整个聊天页的核心状态：用户身份、当前会话、消息列表和流式渲染队列。
 const chatRef = ref(null);
 const inputRef = ref(null);
-const phoneNum = ref("");
+const hasSession = ref(false);
+const familyAvailable = ref(false);
+const sessionStatus = ref("正在验证账本会话…");
 const sessionId = ref("");
 const bookMode = ref("个人版");
-const familyId = ref("");
 const draft = ref("");
 const messages = ref([]);
 const isBusy = ref(false);
@@ -160,25 +152,15 @@ const suggestions = [
 ];
 
 const subtitle = computed(() =>
-  phoneNum.value ? `已连接 App 用户身份 · ${bookMode.value}` : "自动记账 Agent",
+  hasSession.value ? bookMode.value : "自动记账",
 );
-const isFamilyMode = computed(() => bookMode.value === "家庭版");
 
 onMounted(() => {
-  // 页面初始化时，优先从 URL、原生注入对象里恢复用户身份。
-  applyBookAgentContext(resolveInitialContext());
-  window.setBookAgentContext = setBookAgentContext;
-  window.setBookAgentPhoneNum = (value) => applyPhoneNum(value);
-  window.addEventListener("message", handleNativeMessage);
-  notifyNativeReady();
+  loadSession();
   resizeInput();
 });
 
-onUnmounted(() => {
-  window.removeEventListener("message", handleNativeMessage);
-  delete window.setBookAgentContext;
-  delete window.setBookAgentPhoneNum;
-});
+onUnmounted(() => clearTimeout(toastTimer));
 
 function showToast(text) {
   toast.value = text;
@@ -188,86 +170,28 @@ function showToast(text) {
   }, 2200);
 }
 
-function resolveInitialContext() {
-  const params = new URLSearchParams(window.location.search);
-  const context = window.__BOOK_AGENT_CONTEXT__ || {};
-
-  return {
-    phoneNum: params.get("phoneNum") || context.phoneNum,
-    mode: params.get("mode") || params.get("bookMode") || context.mode || context.bookMode,
-    familyId:
-      params.get("familyId") ||
-      params.get("familyID") ||
-      params.get("family") ||
-      context.familyId ||
-      context.familyID,
-  };
-}
-
-function applyBookAgentContext(context) {
-  if (!context) return;
-  if (typeof context === "string") {
-    applyPhoneNum(context);
-    return;
-  }
-
-  setBookMode(context.mode || context.bookMode || bookMode.value, false);
-  applyFamilyId(context.familyId || context.familyID || context.family);
-  applyPhoneNum(context.phoneNum || context.phone || context.userId);
-}
-
-function applyPhoneNum(value) {
-  const nextValue = String(value || "").trim();
-  if (!nextValue) return;
-  phoneNum.value = nextValue;
-  syncSessionId();
-  showToast("用户身份已连接");
-  nextTick(() => inputRef.value?.focus());
-}
-
-function setBookMode(value, notify = true) {
-  const nextMode = normalizeBookMode(value);
-  if (bookMode.value === nextMode) return;
-  bookMode.value = nextMode;
-  syncSessionId();
-  if (notify) showToast(`已切换到${nextMode}`);
-}
-
-function applyFamilyId(value) {
-  familyId.value = String(value || "").trim();
-  syncSessionId();
-}
-
-function setBookAgentContext(context) {
-  applyBookAgentContext(context);
-}
-
-function handleNativeMessage(event) {
-  const data = normalizeMessageData(event.data);
-  if (!data) return;
-
-  if (data.type && data.type !== "BOOK_AGENT_CONTEXT") return;
-  setBookAgentContext(data);
-}
-
-function normalizeMessageData(data) {
-  if (!data) return null;
-  if (typeof data === "string") {
-    try {
-      return JSON.parse(data);
-    } catch {
-      return null;
+async function loadSession() {
+  try {
+    const response = await fetch("/api/session", { cache: "no-store" });
+    if (!response.ok) {
+      sessionStatus.value = await readErrorMessage(response);
+      return;
     }
+    const context = await response.json();
+    familyAvailable.value = context.familyAvailable === true;
+    hasSession.value = true;
+    restoreSessionId();
+  } catch {
+    sessionStatus.value = "暂时无法连接账本服务，请从 App 重新进入。";
   }
-
-  return data;
 }
 
-function notifyNativeReady() {
-  // 兼容 React Native WebView 和 iOS WKWebView 两种宿主注入方式。
-  const payload = { type: "BOOK_AGENT_READY" };
-  window.ReactNativeWebView?.postMessage?.(JSON.stringify(payload));
-  window.webkit?.messageHandlers?.bookAgentReady?.postMessage?.(payload);
+function setBookMode(value) {
+  if (bookMode.value === value || isBusy.value) return;
+  bookMode.value = value;
+  restoreSessionId();
+  messages.value = [];
+  showToast(`已切换到${value}`);
 }
 
 function renderMarkdown(content) {
@@ -377,8 +301,8 @@ function resizeInput() {
 async function sendMessage() {
   // 这里是前端主流程入口：发请求、校验 SSE、消费流、更新消息状态。
   const message = draft.value.trim();
-  if (!phoneNum.value) {
-    showToast("等待 App 注入用户身份");
+  if (!hasSession.value) {
+    showToast(sessionStatus.value);
     return;
   }
   if (!message || isBusy.value) return;
@@ -394,19 +318,25 @@ async function sendMessage() {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "ngrok-skip-browser-warning": "true",
       },
       body: JSON.stringify({
-        phoneNum: phoneNum.value,
         sessionId: sessionId.value || null,
         mode: bookMode.value,
-        familyId: isFamilyMode.value ? familyId.value || null : null,
         message,
       }),
     });
 
     if (!response.ok) {
-      throw new Error(await readErrorMessage(response));
+      const detail = await readErrorMessage(response);
+      if (response.status === 401) {
+        hasSession.value = false;
+        familyAvailable.value = false;
+        sessionId.value = "";
+        sessionStatus.value = detail;
+      } else if (response.status === 403 && bookMode.value === "家庭版") {
+        familyAvailable.value = false;
+      }
+      throw new Error(detail);
     }
 
     assertStreamResponse(response);
@@ -423,7 +353,7 @@ async function readErrorMessage(response) {
   const contentType = response.headers.get("content-type") || "";
   if (contentType.includes("application/json")) {
     const data = await response.json();
-    return data.detail || "请求失败";
+    return typeof data.detail === "string" ? data.detail : "请求失败";
   }
 
   const text = await response.text();
@@ -579,29 +509,25 @@ function sleep(ms) {
   });
 }
 
-function setSessionId(value) {
-  const nextValue = String(value || "").trim();
-  if (!nextValue || !phoneNum.value) return;
-  sessionId.value = nextValue;
-  localStorage.setItem(sessionStorageKey(), nextValue);
-}
-
-function syncSessionId() {
-  if (!phoneNum.value) {
-    sessionId.value = "";
-    return;
-  }
-  sessionId.value = localStorage.getItem(sessionStorageKey()) || "";
-}
-
-function normalizeBookMode(value) {
-  return ["家庭版", "家庭", "family", "family_mode"].includes(String(value || "").trim())
-    ? "家庭版"
-    : "个人版";
-}
-
 function sessionStorageKey() {
-  const scope = isFamilyMode.value ? familyId.value || "auto_family" : "personal";
-  return `book_agent_session_${phoneNum.value}_${bookMode.value}_${scope}`;
+  return `book-agent.conversation.${bookMode.value}`;
+}
+
+function restoreSessionId() {
+  try {
+    sessionId.value = localStorage.getItem(sessionStorageKey()) || "";
+  } catch {
+    sessionId.value = "";
+  }
+}
+
+function setSessionId(value) {
+  if (!value || !hasSession.value) return;
+  sessionId.value = value;
+  try {
+    localStorage.setItem(sessionStorageKey(), value);
+  } catch {
+    // The active conversation also works when storage is unavailable.
+  }
 }
 </script>

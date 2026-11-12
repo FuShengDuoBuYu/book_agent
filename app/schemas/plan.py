@@ -45,11 +45,11 @@ def render_analysis_types_for_prompt() -> str:
 
 
 class SearchPersonalOrdersArgs(BaseModel):
-    year: int | None = None
-    month: int | None = None
-    day: int | None = None
-    cost_type: str = "不限"
-    remark: str = ""
+    year: int | None = Field(default=None, description="查询年份")
+    month: int | None = Field(default=None, description="查询月份，1–12")
+    day: int | None = Field(default=None, description="查询日期，1–31")
+    cost_type: str = Field(default="不限", description="账单分类")
+    remark: str = Field(default="", description="备注关键词")
 
     @field_validator("month")
     @classmethod

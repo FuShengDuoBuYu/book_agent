@@ -10,18 +10,18 @@ class MongoMemoryStore:
         phone_num: str,
         session_id: str | None,
         first_message: str,
+        book_scope: str,
     ) -> str:
         # session 的职责是把一轮轮消息归到同一个会话里，便于多轮上下文和前端续聊。
         db = get_memory_db()
         now = datetime.now(UTC)
 
         if session_id:
-            session = await db.agent_sessions.find_one(
-                {"_id": session_id, "phoneNum": phone_num}
-            )
+            owner = {"_id": session_id, "phoneNum": phone_num, "bookScope": book_scope}
+            session = await db.agent_sessions.find_one(owner)
             if session:
                 await db.agent_sessions.update_one(
-                    {"_id": session_id, "phoneNum": phone_num},
+                    owner,
                     {"$set": {"updatedAt": now}},
                 )
                 return session_id
@@ -31,6 +31,7 @@ class MongoMemoryStore:
             {
                 "_id": new_session_id,
                 "phoneNum": phone_num,
+                "bookScope": book_scope,
                 "title": self._build_title(first_message),
                 "createdAt": now,
                 "updatedAt": now,
