@@ -63,7 +63,7 @@ python -m scripts.evaluate_acceptance --case chain
 
 上述命令使用配置中的模型，但账本及记忆由虚构样本替代，不访问用户数据库。输出 JSONL 包含问题类型、所选工具、数值检查和回答，可用于比较模型与提示词。程序检查不能替代对解释是否准确、是否把推断说成事实的人工复核。
 
-`evaluate_acceptance` 覆盖综合诊断、变化归因、收入韧性、多月预测、节支优化、购买判断、储蓄目标、数据质量及连续追问。合成样本的标准值和实际验收记录见 [分析质量回归](docs/analysis-quality-evaluation.md)。
+`evaluate_acceptance` 覆盖八类分析问题、四轮连续追问及四个输入变体，共十六次回答；`--case variants` 可单独执行来源比例、购买储备、目标期限与全部停薪变体。合成样本的标准值和实际验收记录见 [分析质量回归](docs/analysis-quality-evaluation.md)。
 
 原生 Ollama 规划使用 `AgentPlan` JSON Schema。`OLLAMA_NUM_CTX` 控制上下文长度，`PLANNER_NUM_PREDICT` 控制计划输出上限，`LLM_REASONING=true` 开启回答阶段推理；规划阶段关闭推理。按机器能力设置 `PLANNER_TIMEOUT_SECONDS` 和 `REQUEST_TIMEOUT_SECONDS`，并用上述回归验证后再发布。
 
