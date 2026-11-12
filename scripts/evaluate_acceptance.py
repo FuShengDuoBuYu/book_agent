@@ -29,6 +29,12 @@ FOLLOWUPS = [
     ("chain_3", "房租不能动，吃饭也不想再省，其他地方还能怎么调整？"),
     ("chain_4", "那把目标推迟两个月，压力能小多少？"),
 ]
+VARIANTS = [
+    ('variant_source', '家教收入减少30%，其余不变，未来三个月能新增结余多少？'),
+    ('variant_purchase', '我现在可动用12000元，买6000元电脑后还要留5000元应急钱，是否足够？'),
+    ('variant_goal', '现在有10000元，保持当前收支，多久能存到20000元？'),
+    ('variant_runway', '假设所有收入都停了，现有可动用10000元，支出维持原样，能撑多久？'),
+]
 
 
 def assess(record):
@@ -65,6 +71,18 @@ def assess(record):
         context = metadata.get('analysisContext', {})
         checks['protectedRetained'] = {'房租', '餐饮'} <= set(context.get('protectedCategories', []))
         checks['sourceScenarioRetained'] = any(c.get('source') == '家教' and c.get('percent') == -50 for c in context.get('changes', []))
+    if name == 'variant_source':
+        checks['sourceSpecificArithmetic'] = has('projection', 'totalNet', 10560)
+        checks['answerUsesProjection'] = '10560' in record.get('reply', '').replace(',', '')
+    if name == 'variant_purchase':
+        checks['cashAfterPurchase'] = has('purchase', 'cashAfterPurchase', 6000)
+        checks['reserveMargin'] = has('purchase', 'reserveMargin', 1000)
+    if name == 'variant_goal':
+        checks['timeToGoal'] = has('savings', 'estimatedMonthsToTarget', 3)
+        checks['answerUsesTimeToGoal'] = '3 个月' in record.get('reply', '')
+    if name == 'variant_runway':
+        checks['allIncomeStops'] = has('runway', 'monthlyDeficit', 2600)
+        checks['runwayUsesCash'] = has('runway', 'runwayMonths', 3.85)
     return checks
 
 
@@ -97,6 +115,9 @@ async def main(args):
         agent = make_agent()
         for name, question in FOLLOWUPS:
             await run_case(agent, name, question, args.timeout)
+    for name, question in VARIANTS:
+        if not args.case or 'variants' in args.case or name in args.case:
+            await run_case(make_agent(), name, question, args.timeout)
 
 
 if __name__ == "__main__":

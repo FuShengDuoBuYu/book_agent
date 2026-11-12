@@ -103,6 +103,8 @@ class QueryPlanner:
         if plan.analyses:
             plan.intent = "analyze_orders"
             plan.needsTools = True
+            if plan.analysisWindow and plan.analysisWindow.startDate > now.date():
+                raise ValueError('analysisWindow 是已发生账单的历史范围，不能填未来购买或预测月份；历史范围未指定时填 null，未来月份填 targetMonth。')
             quantified_change = re.search(r"(?:增加|减少|新增|少花|多花|节省|多赚|少赚)[^\d，。；,\n]{0,6}\d+(?:\.\d+)?\s*(?:元|块|节|次)", message)
             if quantified_change and any(task.tool == "scenario" and not task.changes for task in plan.analyses):
                 raise ValueError("scenario.changes 未提取用户明确给出的变化金额和次数")

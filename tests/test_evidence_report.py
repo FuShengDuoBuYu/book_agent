@@ -64,6 +64,27 @@ class EvidenceReportTests(unittest.TestCase):
         self.assertEqual(prepared.sections[0].analysis, '')
         self.assertIn('建议确认', render_report(prepared, self.facts))
 
+    def test_advice_does_not_turn_unknown_recurrence_into_a_fact(self):
+        facts = [{'id': 'f1', 'required': True, 'text': '医疗记录备注：一次就诊。不能确认是否再次发生。'}]
+        draft = self.draft(analysis='建议将这笔一次性支出从常规预算中剔除。若确认后续无需复诊，再单独评估预算。')
+        prepared, _ = prepare_draft(draft, facts)
+        self.assertNotIn('一次性支出', prepared.sections[0].analysis)
+        self.assertIn('若确认', prepared.sections[0].analysis)
+
+    def test_no_identified_candidates_does_not_prove_no_adjustment_possible(self):
+        facts = [{'id': 'f1', 'required': True, 'text': '可逐项核查的月度支出上界为 0 元；不能证明现实没有优化空间。'}]
+        draft = self.draft(analysis='其他所有支出均无调整余地。常规支出已无进一步压缩的可能。建议核对未分类项目，并考虑增收或延长期限。')
+        prepared, _ = prepare_draft(draft, facts)
+        self.assertNotIn('无调整余地', prepared.sections[0].analysis)
+        self.assertNotIn('无进一步压缩', prepared.sections[0].analysis)
+        self.assertIn('考虑增收或延长期限', prepared.sections[0].analysis)
+
+    def test_chinese_proportions_cannot_change_the_scope_of_a_scenario(self):
+        draft = self.draft(analysis='在收入减少一半的情况下，压力会增加。建议确认家教后续安排。')
+        prepared, _ = prepare_draft(draft, self.facts)
+        self.assertNotIn('收入减少一半', prepared.sections[0].analysis)
+        self.assertIn('确认家教', prepared.sections[0].analysis)
+
 
 class EvidenceReviewTests(unittest.IsolatedAsyncioTestCase):
     async def test_numeric_restatement_removed_but_qualitative_advice_reviewed(self):

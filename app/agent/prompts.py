@@ -68,6 +68,7 @@ PLANNER_SYSTEM_PROMPT = """
 - 收入稳定性用 income_stability；问能承受多久，加 runway。未知可动用余额和变化幅度留空，不能擅自假设完全失业。
 - 节省优化选 optimization，monthlyImprovement 是想每月多留下的金额；protectedCategories 保存用户不想削减的类别，例如房租、餐饮。
 - 大额购买选 purchase，purchaseAmount 是购买价，startingBalance 是用户明确给出的可用余额，reserveAmount 是用户明确的储备底线。不可用月结余代替余额。
+- 购买问题未给余额时，先用 purchase 明确缺少的条件；未指定后续测算期限时，不自行附加多个月份预测。购买月份不是历史查询窗口。
 - 账本口径、完整性、可能误判选 data_quality，可同时选 anomalies。
 - 例“增加8节课，每节200元，少花300元”对应 changes 为 [{{"metric":"income","amount":200,"count":8,"label":"新增8节课，每节200元"}},{{"metric":"expense","amount":-300,"count":1,"label":"减少支出300元"}}]。
 - 预算选 budget，budgetAmount 为用户的预算，targetMonth 默认本月。
@@ -83,7 +84,7 @@ PLANNER_SYSTEM_PROMPT = """
 - 分析任务的时间范围放在 analysisWindow，由程序展开查询。最近半年按当前日期向前取六个完整月及本月；用户明确的起止日按原意填写；只有一个指定月份时填该月首日至末日。不要只取范围的第一个月。
 - analysisWindow 的格式为 {{"startDate":"YYYY-MM-DD","endDate":"YYYY-MM-DD"}}，例如 {{"startDate":"2026-05-01","endDate":"2026-11-12"}}。日期应按当前问题计算，没有限定时填 null。
 - 普通简单查询使用 toolCalls.args 的 year/month/day。无日期默认当前年月，昨天和上个月须跨月跨年计算。
-- 预测、情景和储蓄任务的历史窗口由程序统一保证。analysisWindow 可填 null。
+- 预测、情景、购买和储蓄任务的历史窗口由程序统一保证。analysisWindow 可填 null；未来目标月份不能写入这个历史窗口，也不能用 cashflow 查询未来账单代替预测。
 - 未限定分类与备注时 cost_type="不限"、remark=""。不要把“收入/支出”当分类筛选。
 - 追问必须 followUpOfPreviousQuestion=true；程序沿用上轮已解析条件，本轮只填写用户新增或修改的条件。独立问题设 false。用户要求恢复原假设或重新开始时 resetAnalysisContext=true。
 - “推迟两个月”填写 monthsDelta=2，不要自行把 months 改成 2。程序将原期限加上增量。没有明确目标金额时继续 projection，不能臆造 savings.targetAmount。

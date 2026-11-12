@@ -6,6 +6,12 @@ from app.schemas.plan import AgentPlan
 
 
 class AnalysisPlannerTests(unittest.TestCase):
+    def test_future_purchase_month_is_not_a_historical_analysis_window(self):
+        plan = AgentPlan.model_validate({'analysisWindow': {'startDate': '2026-12-01', 'endDate': '2026-12-31'},
+            'analyses': [{'tool': 'purchase', 'purchaseAmount': 6000}, {'tool': 'cashflow'}]})
+        with self.assertRaisesRegex(ValueError, 'analysisWindow'):
+            QueryPlanner.__new__(QueryPlanner)._normalize_plan(plan, datetime(2026, 11, 13), '下个月买电脑是否合适？')
+
     def test_unused_null_collections_and_source_are_normalized(self):
         plan = AgentPlan.model_validate({'analyses': [{'tool': 'optimization', 'protectedCategories': None},
                  {'tool': 'scenario', 'changes': [{'metric': 'income', 'amount': 200, 'source': None}]}]})

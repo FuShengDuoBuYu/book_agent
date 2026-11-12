@@ -149,7 +149,7 @@ def validate_draft(draft, facts):
     return list(dict.fromkeys(issues))
 
 
-QUANTITY = re.compile(r'\d|[零〇一二两三四五六七八九十百千万亿半]+\s*(?:元|块|%|％|个月|月的|成|分之)')
+QUANTITY = re.compile(r'\d|一半|减半|翻倍|[零〇一二两三四五六七八九十百千万亿半]+\s*(?:元|块|%|％|个月|月的|成|分之)')
 
 
 def unsupported_assertion(text, facts):
@@ -158,18 +158,26 @@ def unsupported_assertion(text, facts):
     Ledger records do not establish completeness, health, future job stability,
     recurrence, or affordability benchmarks. Conditional questions remain valid.
     """
-    duplicate_counts = re.findall(r'疑似重复组 (\d+) 组', ' '.join(row['text'] for row in facts))
+    evidence_text = ' '.join(row['text'] for row in facts)
+    duplicate_counts = re.findall(r'疑似重复组 (\d+) 组', evidence_text)
     if '健康风险' in text:
         return '账本分析不能推断健康状况'
     for clause in re.split(r'[，；。！？]', text):
-        if re.search(r'如果|若|建议|是否|待确认|不能|不证明|未知|无法确认|尚未确认|可能', clause):
+        if re.search(r'如果|若|是否|待确认|不能|不证明|未知|无法确认|尚未确认', clause):
+            continue
+        # A suggestion can contain an unsupported premise ("remove this one-off
+        # expense"). The word "建议" must not exempt that premise from checking.
+        if re.search(r'(?:一次性|非经常性|偶发).{0,6}(?:支出|开销|费用|医疗)|医疗.{0,8}(?:一次性|非经常性|偶发)', clause):
+            return '不能据历史出现次数确定未来发生频率，也不能以此直接剔除预算'
+        if ('月度支出上界为 0 元' in evidence_text and
+                re.search(r'无调整余地|无进一步压缩|没有任何.{0,4}(?:调整|优化|压缩)空间|无需调整|只需关注', clause)):
+            return '没有识别出候选项不等于已证明没有调整余地'
+        if '可能' in clause:
             continue
         if duplicate_counts and all(int(n) == 0 for n in duplicate_counts) and re.search(r'存在(?:疑似)?重复|发现(?:了)?(?:疑似)?重复', clause):
             return '规则没有重复线索，不能断言存在重复'
         if re.search(r'记录不完整|存在漏记|健康风险', clause):
             return '记录样本不足不能证明漏记、完整性或健康状况'
-        if '医疗' in clause and re.search(r'一次性|非经常性|偶发', clause):
-            return '不能据就诊记录确定未来发生频率'
         if re.search(r'家教|兼职|收入|来源', clause) and re.search(r'不稳定|波动性', clause):
             return '不能仅按来源名称断言未来收入稳定性'
         if re.search(r'偏高|过高|压力过大|(?:结构|占比).{0,4}合理|最大的.{0,6}(?:变数|风险)', clause):
@@ -216,6 +224,7 @@ analysis 只写不带数字的含义、因果推测和建议，不重复抄写�
 示例：{"sections":[{"title":"收入来源集中","factIds":["f1","f2"],"analysis":"历史入账虽然平稳，但对主要来源依赖较大。建议确认后续工作安排，再分别测算减少和维持原状的情景。"}]}。不要在 analysis 写“收入为多少”或“已有几个完整月份”。
 用户问值得注意的问题时，也可以给出观察和待确认事项，不要强行编造问题。来源名称不证明兼职不稳定，支出占比不证明房租偏高，样本不足不证明漏记或健康风险。
 解释必须有事实依据，区分历史观察、用户假设和待确认原因。不得将备注“一次就诊”断定为未来不会发生。
+建议中的前提也要有证据：不能称它为“一次性支出”并建议剔除预算；应先核对发生背景和后续安排。没有识别出可削减项目时，不能说“均无调整余地”，可建议核查未分类项目、增收或调整期限。
 未完月不能证明支出回落；来源集中不等于将失业；没有余额不能判断抗风险差或能否购买；未检出异常不能证明账本正确。
 遵守用户明确保护的支出，不用强行节省生活费来凑目标。不编造余额、负债、收入变化或未来安排。
 若只给了预测期限而没有存款目标，延长期限只改变累计结余，不能声称月度赚钱能力提高或算出目标压力。
@@ -233,6 +242,8 @@ REVIEW_PROMPT = '''/no_think
 - 历史没有可识别的非必要支出，建议考虑增收或延长期限。
 以下应不通过：
 - 一次医疗记录证明以后不会再发生；下个月医疗肯定为零。
+- 建议把这笔一次性医疗支出剔除预算（一次记录不能证明一次性，“建议”不豁免其错误前提）。
+- 没有识别出可削减项，因此所有支出均无调整余地、无需任何调整。
 - 没检测出重复，证明所有账单无错。
 - 不知道余额，但你只能再撑一个月或肯定买不起。
 - 工具算出无需额外节支，报告却说必须增收才能达标。
