@@ -1,104 +1,31 @@
-# book_agent
+# AI 账单 · book_agent
 
-用于自动记账的本地 Agent demo。
+自动记账的账本对话服务。FastAPI 同源提供 Vue 聊天页和 SSE API，使用已验证的账本会话调用记账后端。Agent 规划查询，代码统计金额，模型解释结果。
 
-## 功能
+## 本地开发
 
-- 提供一个 Vue 3 + Vite 的移动端聊天界面。
-- 通过 FastAPI 暴露 `/api/chat`。
-- 通过 LangChain 调用本地 Ollama 的 `qwen3:14b` 模型。
-- 通过工具调用外部记账 API，并在本地做账单统计与总结。
+使用 Python 3.11 和 Node.js 22 或更高版本。创建虚拟环境并激活后运行以下命令。
 
-## 后端结构
-
-```text
-app/
-  api/routes/        FastAPI 路由
-  agent/             LangChain Agent、prompt、编排逻辑
-  clients/           外部 API 客户端，后续放云端账单接口
-  core/              配置、LLM 初始化等基础设施
-  schemas/           请求/响应模型
-  services/          普通业务服务
-  tools/             LangChain tools，后续放账单查询/统计工具
-main.py              uvicorn 兼容入口
-```
-## 准备 Ollama
-
-先确认本地已经安装 Ollama，并拉取模型：
-
-```bash
-ollama run qwen3:14b
+```sh
+python -m pip install -r requirements.txt
+npm --prefix frontend ci
+npm --prefix frontend run build
+python -m unittest discover -s tests -v
 ```
 
-如果想临时使用其他模型：
+复制 `.env.example` 为 `.env`，填写记账后端、聊天记忆 MongoDB 和模型网关配置。然后启动服务。
 
-```bash
-export OLLAMA_MODEL=qwen3:8b
+```sh
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
 ```
 
-## 配置 MongoDB 记忆
+- `GET /health` 检查应用进程。
+- `GET /ready` 检查聊天记忆配置和网关是否列出所选模型。
+- `GET /` 提供 WebView 页面。从 Android 进入时，原生端使用一次性票据建立 WebView 会话。
+- `npm --prefix frontend run dev` 启动 Vue 开发服务器。Vite 代理 `/api` 和 `/health`。
 
-Agent 使用 MongoDB Atlas 保存会话和历史消息。连接串不要写进代码，启动前设置环境变量：
+`LLM_PROVIDER=openai_compatible` 使用配置的兼容网关。原生 Ollama 可用 `LLM_PROVIDER=ollama`、`LLM_BASE_URL=http://127.0.0.1:11434` 和 `LLM_MODEL`；已有的 `OLLAMA_BASE_URL`、`OLLAMA_MODEL` 等仍可作为回退配置。
 
-```bash
-export AGENT_MONGODB_URI='mongodb+srv://用户名:密码@你的集群.mongodb.net/?appName=AutoBookKeeping'
-export AGENT_MONGODB_DB='book_agent'
-```
-
-如果更换过 Atlas 密码，记得同步更新 `AGENT_MONGODB_URI`。
-
-## 启动服务
-
-安装后端依赖：
-
-```bash
-pip install -r requirements.txt
-```
-
-启动后端 Agent：
-
-```bash
-uvicorn main:app --reload --host 0.0.0.0 --port 8001
-```
-
-安装前端依赖：
-
-```bash
-cd frontend
-npm install
-```
-
-开发模式启动前端：
-
-```bash
-npm run dev
-```
-
-浏览器打开 Vite 地址：
-
-```text
-http://localhost:5173
-```
-
-Vite 会把 `/api` 和 `/health` 代理到后端的 `http://localhost:8001`。
-
-## WebView 构建
-
-如果要让 FastAPI 直接服务前端页面：
-
-```bash
-cd frontend
-npm run build
-```
-
-然后访问：
-
-```text
-http://localhost:8001
-```
-
-健康检查：
-
-```text
-http://localhost:8001/health
-```
+- [架构与部署](docs/ai-bill-architecture.md)
+- [家庭部署信息清单](docs/home-agent-checklist.md)
+- [开发规范](CONTRIBUTING.md)
