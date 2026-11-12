@@ -10,10 +10,12 @@ from pydantic import ValidationError
 
 from app.core.config import get_settings
 from app.core.llm import get_planner_model
+from app.agent.analysis_context import resolve_context
 from app.agent.prompts import PLANNER_HUMAN_PROMPT, PLANNER_SYSTEM_PROMPT
 from app.schemas.plan import (
     AgentPlan,
     AnalysisRequest,
+    ScenarioChange,
     SearchPersonalOrdersArgs,
     ToolCall,
     render_analysis_types_for_prompt,
@@ -21,6 +23,8 @@ from app.schemas.plan import (
 )
 from app.tools.registry import PLANNER_TOOL_BY_NAME, format_tool_call, render_planner_tools_for_prompt
 from app.tools.financial_analysis import ANALYSIS_TOOLS, shift_month
+
+HISTORY_BASED_TOOLS = {'forecast', 'scenario', 'savings', 'projection', 'purchase', 'runway', 'optimization'}
 
 
 class QueryPlanner:
@@ -41,17 +45,18 @@ class QueryPlanner:
 
     @traceable(name="query_planner", run_type="chain")
     async def create_plan(
-        self, message: str, history: str, book_mode: str = "个人版"
+        self, message: str, history: str, book_mode: str = "个人版", previous_context: dict | None = None
     ) -> AgentPlan:
         # 这里的核心任务是：拿到 LLM 输出后，尽量把它收敛成一个可执行的 AgentPlan。
         now = datetime.now(ZoneInfo("Asia/Shanghai"))
         prompt_values = {
             "current_date": now.strftime("%Y-%m-%d"),
             "book_mode": self._normalize_mode(book_mode),
-            "history": history,
+            "history": history + '\n上轮已解析的用户条件（追问时沿用，独立新问题不沿用）：' + json.dumps(previous_context or {}, ensure_ascii=False),
             "message": message,
         }
         plan = self._fallback_plan()
+        issues = []
         for attempt in range(2):
             try:
                 response = await asyncio.wait_for(
@@ -63,13 +68,19 @@ class QueryPlanner:
                 if not data:
                     raise ValueError("Missing plan")
                 plan = AgentPlan.model_validate(data)
+                self._normalize_explicit_conditions(plan, message)
+                self._coalesce_forecasts(plan)
+                resolve_context(plan, previous_context or {}, self._normalize_mode(book_mode))
                 return self._normalize_plan(plan, now, message, book_mode)
             except (asyncio.TimeoutError, json.JSONDecodeError, ValidationError, ValueError) as exc:
+                detail = "; ".join(f"{error['loc']}: {error['msg']}" for error in exc.errors()) if isinstance(exc, ValidationError) else str(exc)
+                issues.append({'type': type(exc).__name__, 'detail': detail[:800]})
                 if attempt == 0:
-                    detail = "; ".join(f"{error['loc']}: {error['msg']}" for error in exc.errors()) if isinstance(exc, ValidationError) else str(exc)
                     prompt_values["message"] = message + "\n上次计划校验失败：" + detail[:800] + "\n请重新生成符合 JSON schema 的计划。用户的情景金额与次数必须填入 scenario.changes，预算和储蓄条件也要填写，不能只写在 finalInstruction。"
 
-        return self._fallback_plan()
+        plan = self._fallback_plan()
+        plan._planning_issues = issues
+        return plan
 
     def _extract_json(self, content: str) -> dict:
         # 模型有时会包一层 markdown code fence，或带 <think> 标签，这里先做清洗再取 JSON。
@@ -86,15 +97,69 @@ class QueryPlanner:
 
         return json.loads(content[start : end + 1])
 
+    def _normalize_explicit_conditions(self, plan, message):
+        """Recover narrow, unambiguous user inputs before resolving context.
+
+        Multiple alternatives and negated statements remain the planner's job;
+        this must never impose one scenario's numbers on another scope.
+        """
+        scopes = {(call.toolName, call.args.cost_type, call.args.remark) for call in plan.toolCalls}
+        if len(scopes) > 1 or ('个人' in message and '家庭' in message):
+            return
+        clauses = re.split(r'[，。；,;\n]', message)
+        positive = [clause for clause in clauses if not re.search(r'不是|并非|不会|并未|并不|不用|无需|不需要|不保留|不留', clause)]
+        purchases = [task for task in plan.analyses if task.tool == 'purchase']
+        amounts = set()
+        patterns = (r'(?:保留|预留|留出|留)\s*(\d+(?:\.\d+)?)\s*(万)?\s*(?:元|块)?\s*(?:的|作为)?(?:应急|备用|储备)',
+                    r'(?:应急金|应急钱|备用金|储备金|储备底线)\s*(?:设为|至少|为|是|要)?\s*(\d+(?:\.\d+)?)\s*(万)?')
+        for clause in positive:
+            for pattern in patterns:
+                amounts.update(float(amount) * (10000 if unit else 1) for amount, unit in re.findall(pattern, clause))
+        if len(purchases) == 1 and len(amounts) == 1:
+            reserve = amounts.pop()
+            if not 0 <= reserve <= 1e12:
+                raise ValueError('reserveAmount 超出允许范围')
+            task = purchases[0]
+            if task.reserveAmount != reserve:
+                task.reserveAmount = reserve
+                # A wrongly classified reserve must not become a future goal.
+                if task.targetAmount == reserve and not any(t.tool == 'savings' for t in plan.analyses):
+                    task.targetAmount = None
+                plan._planning_issues.append({'type': 'normalized_explicit_condition', 'field': 'reserveAmount', 'value': reserve})
+        scenarios = [task for task in plan.analyses if task.tool in {'runway', 'projection', 'scenario', 'savings'}]
+        stopped = any(re.search(r'(?:(?:所有|全部)(?:的)?收入(?:都|完全|全部)?|收入(?:全部|全都|都))(?:停了|停止|中断|归零|没有了)', clause) for clause in positive)
+        if stopped and len(scenarios) == 1 and not re.search(r'比较|对比|两种|分别', message):
+            task = scenarios[0]
+            if not any(change.metric == 'income' and not change.source and change.percent == -100 for change in task.changes):
+                task.changes = [change for change in task.changes if change.metric != 'income'] + [
+                    ScenarioChange(metric='income', percent=-100, source='', label='用户明确假设全部收入中断')]
+                plan._planning_issues.append({'type': 'normalized_explicit_condition', 'field': 'changes', 'detail': '用户明确假设全部收入中断，按全部收入减少100%计算'})
+
     def _normalize_plan(
         self, plan: AgentPlan, now: datetime, message: str, book_mode: str = "个人版"
     ) -> AgentPlan:
         # normalize 的目的，是把“不稳定的 LLM 输出”整理成“稳定的程序输入”。
+        self._coalesce_forecasts(plan)
         if plan.analysisType == "financial_analysis" and not plan.analyses:
             plan.analyses = [AnalysisRequest(tool=name) for name in ("cashflow", "trends", "changes", "anomalies", "recurring")]
         if plan.analyses:
             plan.intent = "analyze_orders"
             plan.needsTools = True
+            explicit_history = re.search(r'本月|这个月|当月|今天|本周|这周|最近|过去|\d{1,4}[-年/]\d{1,2}|(?:\d{1,2}|[一二三四五六七八九十]+)月', message)
+            if (plan.analysisWindow and plan.analysisWindow.startDate >= now.date().replace(day=1)
+                    and any(task.tool in HISTORY_BASED_TOOLS for task in plan.analyses) and not explicit_history):
+                plan._planning_issues.append({'type': 'normalized_implicit_history_window',
+                    'detail': '用户未限定历史月份；当前余额或未来目标不将历史样本限制为本月。'})
+                plan.analysisWindow = None
+            if plan.analysisWindow and plan.analysisWindow.startDate > now.date():
+                if not any(task.tool in HISTORY_BASED_TOOLS for task in plan.analyses):
+                    raise ValueError('analysisWindow 不能用未来月份查询已发生的历史收支；未来估计需要预测工具。')
+                # A future decision date is not a sample of recorded transactions.
+                # Let the existing history expansion supply the decision baseline.
+                plan._planning_issues.append({'type': 'normalized_future_window',
+                    'window': plan.analysisWindow.model_dump(mode='json'),
+                    'detail': '未来决策月份误放入历史窗口，改用默认历史基准；预测目标保持在 targetMonth。'})
+                plan.analysisWindow = None
             quantified_change = re.search(r"(?:增加|减少|新增|少花|多花|节省|多赚|少赚)[^\d，。；,\n]{0,6}\d+(?:\.\d+)?\s*(?:元|块|节|次)", message)
             if quantified_change and any(task.tool == "scenario" and not task.changes for task in plan.analyses):
                 raise ValueError("scenario.changes 未提取用户明确给出的变化金额和次数")
@@ -154,8 +219,25 @@ class QueryPlanner:
 
         return plan
 
+    def _coalesce_forecasts(self, plan):
+        groups = {}
+        for task in plan.analyses:
+            if task.tool == 'forecast' and task.targetMonth:
+                groups.setdefault(tuple(sorted(task.queryIds)), []).append(task)
+        for query_ids, tasks in groups.items():
+            targets = sorted({task.targetMonth for task in tasks})
+            if len(targets) < 2:
+                continue
+            start = datetime.strptime(targets[0], '%Y-%m').date()
+            contiguous = [shift_month(start, i).strftime('%Y-%m') for i in range(len(targets))]
+            metrics = [{task.metric for task in tasks if task.targetMonth == target} for target in targets]
+            if targets == contiguous and all(value == metrics[0] for value in metrics):
+                plan.analyses = [task for task in plan.analyses if task not in tasks]
+                plan.analyses.append(AnalysisRequest(tool='projection', queryIds=list(query_ids),
+                                                     targetMonth=targets[0], months=len(targets)))
+
     def _prepare_analysis_queries(self, plan: AgentPlan, now: datetime, book_mode: str) -> None:
-        forecasting = [task for task in plan.analyses if task.tool in {"forecast", "scenario", "savings"}]
+        forecasting = [task for task in plan.analyses if task.tool in HISTORY_BASED_TOOLS]
         for task in forecasting:
             if task.targetMonth is None:
                 task.targetMonth = shift_month(now.date(), 1).strftime("%Y-%m")

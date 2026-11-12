@@ -81,3 +81,8 @@ class ModelConfigurationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(chat.reasoning)
         self.assertFalse(planner.reasoning)
         self.assertEqual(chat.num_ctx, 32768)
+        self.assertEqual(chat.keep_alive, '60s')
+
+    def test_gpu_offload_can_leave_room_for_other_workloads(self):
+        with patch.dict(os.environ, {'LLM_PROVIDER': 'ollama', 'OLLAMA_NUM_GPU': '24'}, clear=True):
+            self.assertEqual(get_chat_model().num_gpu, 24)

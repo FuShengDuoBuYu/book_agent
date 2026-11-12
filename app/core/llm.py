@@ -26,6 +26,14 @@ def get_planner_model() -> Runnable:
     return _compatible(settings, planner=True).bind(response_format={"type": "json_object"})
 
 
+@lru_cache
+def get_structured_model(schema: type) -> Runnable:
+    settings = get_settings()
+    if settings.llm_provider == "ollama":
+        return _ollama(settings, planner=True).bind(format=schema.model_json_schema())
+    return _compatible(settings, planner=True).bind(response_format={"type": "json_object"})
+
+
 def _ollama(settings: Settings, planner: bool = False) -> ChatOllama:
     return ChatOllama(
         model=settings.llm_model,
@@ -33,6 +41,8 @@ def _ollama(settings: Settings, planner: bool = False) -> ChatOllama:
         reasoning=False if planner else settings.llm_reasoning,
         temperature=0 if planner else settings.llm_temperature,
         num_ctx=settings.ollama_num_ctx,
+        keep_alive=settings.ollama_keep_alive,
+        num_gpu=settings.ollama_num_gpu,
         format=AgentPlan.model_json_schema() if planner else None,
         num_predict=settings.planner_num_predict if planner else None,
         client_kwargs={"timeout": settings.request_timeout_seconds},

@@ -62,8 +62,14 @@ PLANNER_SYSTEM_PROMPT = """
 - 全面分析选择 cashflow、trends、changes、recurring、anomalies。支付方式、备注来源、收支比例由 cashflow 提供。
 - 只有 forecast 需要按 metric 分别生成任务；cashflow、trends、changes、recurring 已同时包含收支，同一范围不要重复生成。
 - 问为什么增长或减少时选 changes 和 trends。问周期性收入与固定支出选 recurring。异常与重复记账选 anomalies。
-- 预测未来收入、支出、结余使用 forecast，metric 只能是 income、expense、net 之一。用户问三者时生成三个分析任务。targetMonth 为 YYYY-MM，默认下个月。
-- 假设调整收入或支出，使用 scenario。changes 按用户给的每次金额 amount 和次数 count 填写，增加为正、减少为负，metric 只能是 income 或 expense。label 引用用户的条件。不要自行乘算。
+- 预测单个月份使用 forecast，metric 为 income、expense、net。预测未来多个月份，或问“几个月能存下多少钱”，使用 projection，months 填月份数量，同时计算收支和累计新增结余，不需要 startingBalance。targetMonth 默认下个月，不能填历史月份。
+- 假设调整使用 scenario；若追问已有的多月测算，继续使用 projection 或 savings。changes 中 amount 表示金额、percent 表示百分比，两者只能填一个；source 填被调整的来源，增加为正、减少为负，不要自行乘算。
+- “家教少一半”对应 changes: [{{"metric":"income","percent":-50,"source":"家教","label":"家教收入减少一半"}}]。只能减少家教部分，不能把百分比当成金额，也不能替换为总收入。
+- 收入稳定性用 income_stability；问能承受多久，加 runway。未知可动用余额和变化幅度留空，不能擅自假设完全失业。
+- 节省优化选 optimization，monthlyImprovement 是想每月多留下的金额；protectedCategories 保存用户不想削减的类别，例如房租、餐饮。
+- 大额购买选 purchase，purchaseAmount 是购买价，startingBalance 是用户明确给出的可用余额，reserveAmount 是用户明确的储备底线。不可用月结余代替余额。
+- 购买问题未给余额时，先用 purchase 明确缺少的条件；未指定后续测算期限时，不自行附加多个月份预测。购买月份不是历史查询窗口。
+- 账本口径、完整性、可能误判选 data_quality，可同时选 anomalies。
 - 例“增加8节课，每节200元，少花300元”对应 changes 为 [{{"metric":"income","amount":200,"count":8,"label":"新增8节课，每节200元"}},{{"metric":"expense","amount":-300,"count":1,"label":"减少支出300元"}}]。
 - 预算选 budget，budgetAmount 为用户的预算，targetMonth 默认本月。
 - 例“本月预算4000元还剩多少”必须填 analyses: [{{"tool":"budget","queryIds":["ledger"],"budgetAmount":4000}}]。
@@ -78,9 +84,11 @@ PLANNER_SYSTEM_PROMPT = """
 - 分析任务的时间范围放在 analysisWindow，由程序展开查询。最近半年按当前日期向前取六个完整月及本月；用户明确的起止日按原意填写；只有一个指定月份时填该月首日至末日。不要只取范围的第一个月。
 - analysisWindow 的格式为 {{"startDate":"YYYY-MM-DD","endDate":"YYYY-MM-DD"}}，例如 {{"startDate":"2026-05-01","endDate":"2026-11-12"}}。日期应按当前问题计算，没有限定时填 null。
 - 普通简单查询使用 toolCalls.args 的 year/month/day。无日期默认当前年月，昨天和上个月须跨月跨年计算。
-- 预测、情景和储蓄任务的历史窗口由程序统一保证。analysisWindow 可填 null。
+- 预测、情景、购买和储蓄任务的历史窗口由程序统一保证。analysisWindow 可填 null；未来目标月份不能写入这个历史窗口，也不能用 cashflow 查询未来账单代替预测。
 - 未限定分类与备注时 cost_type="不限"、remark=""。不要把“收入/支出”当分类筛选。
-- 追问根据最近用户消息和上一轮计划沿用分析目标与条件，最新问题覆盖冲突条件。历史回答中的数字不能当新条件。
+- 追问必须 followUpOfPreviousQuestion=true；程序沿用上轮已解析条件，本轮只填写用户新增或修改的条件。独立问题设 false。用户要求恢复原假设或重新开始时 resetAnalysisContext=true。
+- “推迟两个月”填写 monthsDelta=2，不要自行把 months 改成 2。程序将原期限加上增量。没有明确目标金额时继续 projection，不能臆造 savings.targetAmount。
+- 追问保护开销但已有 projection 目标时，同时选择 optimization 和 projection，以便展示当前假设下的结余。延长期限不会改变月度收入能力。
 - 纯闲聊或能力介绍用 intent="chat"、needsTools=false、toolCalls=[]、analyses=[]、analysisWindow=null。
 """.strip()
 

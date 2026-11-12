@@ -32,6 +32,12 @@ ANALYSIS_TOOLS = {
     "scenario": "在历史月度基准上计算用户给定的收入或支出变化及净结余",
     "budget": "根据用户提供的 budgetAmount 计算目标月份剩余预算、超支及剩余每日额度",
     "savings": "根据用户提供的 startingBalance、targetAmount 和 months 计算储蓄目标进度及所需月结余",
+    "projection": "未来多个月的收入、支出与累计新增结余，支持来源按比例变化，不需要当前存款余额",
+    "income_stability": "历史收入来源占比、波动与连续性，仅评价已观察的月份",
+    "optimization": "在保留用户 protectedCategories 和必要生活支出的前提下，分析 monthlyImprovement 的节支空间",
+    "purchase": "购买 purchaseAmount 对现金余额和 reserveAmount 的影响；缺少 startingBalance 时不能判断买得起",
+    "runway": "用户给定收入变化后，现有 startingBalance 能覆盖多久的现金缺口",
+    "data_quality": "退款、转入、一次性入账、缺失字段及重复线索对分析的影响",
 }
 
 
@@ -301,13 +307,11 @@ def _scenario(orders: list[dict], *, as_of: date, target_month=None, changes=Non
     changes = changes or []
     if not income["sufficientData"] or not changes:
         return {"sufficientData": False, "baseline": income, "reason": "需要历史月度基准和用户明确给出的变化金额或次数。"}
-    totals = {"income": income["estimate"], "expense": expense["estimate"]}
-    assumptions = []
-    for change in changes:
-        delta = _round_money(change["amount"] * change.get("count", 1))
-        totals[change["metric"]] += delta
-        assumptions.append({**change, "totalChange": delta})
-    totals = {name: _round_money(amount) for name, amount in totals.items()}
+    from app.tools.decision_analysis import apply_changes
+    adjusted = apply_changes(orders, income, expense, changes)
+    if not adjusted["sufficientData"]:
+        return adjusted
+    totals, assumptions = adjusted["totals"], adjusted["assumptions"]
     net = _round_money(totals["income"] - totals["expense"])
     baseline_net = _round_money(income["estimate"] - expense["estimate"])
     ratio = _round_money(net / totals["income"] * 100) if totals["income"] else None
@@ -342,6 +346,11 @@ def _budget(orders: list[dict], *, as_of: date, target_month=None, budget_amount
 def _savings(orders: list[dict], *, as_of: date, starting_balance=None, target_amount=None, months=None, **kwargs) -> dict:
     missing = [name for name, value in (("startingBalance", starting_balance), ("targetAmount", target_amount)) if value is None]
     baseline = _forecast(orders, as_of=as_of, metric="net")
+    if kwargs.get("changes"):
+        changed = _scenario(orders, as_of=as_of, changes=kwargs["changes"])
+        if not changed["sufficientData"]:
+            return changed
+        baseline = {**baseline, "estimate": changed["net"], "assumptions": changed["assumptions"]}
     if missing or not baseline["sufficientData"]:
         return {"sufficientData": False, "missingInputs": missing, "baseline": baseline}
     remaining = max(0, _round_money(target_amount - starting_balance))
@@ -378,5 +387,9 @@ def run_analysis(name: str, orders: list[dict], *, as_of: date, **kwargs) -> dic
             continue
         if when and when <= as_of and math.isfinite(amount):
             valid.append(order)
-    result = _IMPLEMENTATIONS[name](valid, as_of=as_of, **kwargs)
+    implementation = _IMPLEMENTATIONS.get(name)
+    if implementation is None:
+        from app.tools.decision_analysis import DECISION_IMPLEMENTATIONS
+        implementation = DECISION_IMPLEMENTATIONS[name]
+    result = implementation(valid, as_of=as_of, **kwargs)
     return {**result, "asOf": as_of.isoformat(), "excludedInvalidOrFutureRows": len(orders) - len(valid)}
