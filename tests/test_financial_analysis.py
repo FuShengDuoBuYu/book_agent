@@ -77,6 +77,8 @@ class FinancialAnalysisTests(unittest.TestCase):
         self.assertEqual(result["income"], 6600)
         self.assertEqual(result["expense"], 900)
         self.assertEqual(result["net"], 5700)
+        self.assertEqual(result["netChange"], 1900)
+        self.assertEqual(result["netIncomeRatioPercent"], 86.36)
         self.assertEqual(len(result["assumptions"]), 2)
 
     def test_anomalies_identify_large_spend_without_calling_it_fraud(self):

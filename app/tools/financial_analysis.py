@@ -143,6 +143,7 @@ def _cashflow(orders: list[dict], *, as_of: date, **kwargs) -> dict:
                                "sharePercent": _round_money(amount / income * 100) if income else None}
                               for name, amount in sorted(sources.items(), key=lambda item: item[1], reverse=True)][:20],
             "completeMonthAverage": {**averages, "months": [row["month"] for row in complete]},
+            "computedConclusion": (f"完整月份共 {len(complete)} 个，月均收入 {averages['income']} 元，月均支出 {averages['expense']} 元，月均结余 {averages['net']} 元，完整月份结余率 {averages['netIncomeRatioPercent']}%。这组均值包含完整月份中的大额支出，不能用常态或中位数替换。" if complete else "缺少可计算月均值的完整月份。"),
             "interpretation": "支出占比说明结构，shareOfIncomePercent 才是该支出占收入的比例。资产与债务余额未知，不能据此判断抗风险能力或偿付压力。",
             "averageDefinition": "averageIncome 与 averageExpense 是每笔交易均值；completeMonthAverage 不含未完月份，外层比例为整个查询期累计比例。"}
 
@@ -307,7 +308,12 @@ def _scenario(orders: list[dict], *, as_of: date, target_month=None, changes=Non
         totals[change["metric"]] += delta
         assumptions.append({**change, "totalChange": delta})
     totals = {name: _round_money(amount) for name, amount in totals.items()}
-    return {"sufficientData": True, **totals, "net": _round_money(totals["income"] - totals["expense"]),
+    net = _round_money(totals["income"] - totals["expense"])
+    baseline_net = _round_money(income["estimate"] - expense["estimate"])
+    ratio = _round_money(net / totals["income"] * 100) if totals["income"] else None
+    return {"sufficientData": True, **totals, "net": net,
+            "baselineNet": baseline_net, "netChange": _round_money(net - baseline_net), "netIncomeRatioPercent": ratio,
+            "computedConclusion": f"在用户假设实现且其他收支延续历史基准的条件下，收入 {totals['income']} 元，支出 {totals['expense']} 元，结余 {net} 元，结余占收入 {ratio}%。基准结余 {baseline_net} 元，改善 {_round_money(net - baseline_net)} 元。这不证明真实资产或抗风险能力。",
             "assumptions": assumptions, "baseline": {"income": income, "expense": expense}}
 
 
@@ -345,11 +351,13 @@ def _savings(orders: list[dict], *, as_of: date, starting_balance=None, target_a
         months_to_goal = 0
     elif monthly > 0:
         months_to_goal = math.ceil(remaining / monthly)
+    projected = _round_money(starting_balance + monthly * months) if months else None
     return {"sufficientData": True, "startingBalance": starting_balance, "targetAmount": target_amount,
             "remainingToTarget": remaining, "baselineMonthlySaving": monthly,
             "estimatedMonthsToTarget": months_to_goal, "months": months,
             "requiredMonthlySaving": _round_money(remaining / months) if months else None,
-            "projectedBalance": _round_money(starting_balance + monthly * months) if months else None,
+            "projectedBalance": projected,
+            "computedConclusion": (f"仅在后续净现金流延续历史基准的假设下，{months} 个月后预计余额 {projected} 元，{'达到' if projected >= target_amount else '未达到'}目标 {target_amount} 元；未来收支变化可能改变结果，不能保证达成。" if months else "需要结合未来收支变化判断目标期限，历史基准不能保证未来结果。"),
             "baseline": baseline, "assumption": "当前余额、目标和期限来自用户，后续净现金流假设延续历史模式。"}
 
 

@@ -23,6 +23,7 @@ BOOK_AGENT_ANALYSIS_PROMPT = """
 {orders_json}
 
 回答要求
+- 工具含 computedConclusion 时，核心数值结论以该字段为准，并保留其中的条件；解释时不得换用其他月份或常态值替代。
 - 先直接回答问题，再解释最有价值的证据及其影响。一般分析用三至五段，不重复总结，不输出与问题无关的系统规则、字段名和内部流程。
 - 数字只能引用本轮工具的计算字段，并保持原来的含义、时间和范围。月均值用 completeMonthAverage，典型值用 recurring.typicalAmount，笔数用 incomeOrderCount / expenseOrderCount。累计比例、单月比例、占收入比例和占支出比例不可混用。不要自行编造金额或比率。
 - 严格遵守每个工具的 interpretation、coverageNote、limitations、missingInputs。标记 partial 的月份尚未结束，不能据此说消费已恢复、回落或整月稳定。没有记录不能证明真实金额为零。

@@ -83,6 +83,7 @@ async def evaluate(selected=None):
         reply_numbers = {float(value.replace(",", "")) for value in re.findall(r"\d[\d,]*(?:\.\d+)?", reply)}
         if name == "overview":
             checks["fullHistory"] = results.get("cashflow", {}).get("incomeTotal", 0) >= 39600
+            checks["answerUsesCompleteMonthAverage"] = {2750, 3850} <= reply_numbers
         if name == "changes":
             checks["expenseDriver"] = results.get("changes", {}).get("expenseChange") == 900
             checks["answerMentionsDriverAmount"] = 900 in reply_numbers
@@ -96,6 +97,7 @@ async def evaluate(selected=None):
         if name == "scenario":
             checks["scenarioArithmetic"] = results.get("scenario", {}).get("net") == 5900
             checks["answerUsesScenario"] = 5900 in reply_numbers
+            checks["scenarioRatio"] = results.get("scenario", {}).get("netIncomeRatioPercent") == 71.95
         if name == "budget":
             checks["budgetArithmetic"] = results.get("budget", {}).get("remaining") == 1400
             checks["answerUsesBudget"] = 1400 in reply_numbers
