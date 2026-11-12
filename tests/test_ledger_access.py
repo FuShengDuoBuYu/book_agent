@@ -36,17 +36,12 @@ class LedgerAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["analysisResults"][0]["evidence"]["remaining"], 300)
 
     async def test_normal_chat_entry_runs_tools_and_persists_evidence(self):
-        from types import SimpleNamespace
         from unittest.mock import AsyncMock
         from scripts.evaluate_analysis import FixtureLedger, FixtureMemory
 
-        async def answer(payload):
-            self.assertTrue(json.loads(payload["orders_json"])["analysisResults"])
-            yield SimpleNamespace(content="合成账本分析完成")
-
         agent = BookAgent(FixtureLedger())
         agent.memory = FixtureMemory()
-        agent.chain = SimpleNamespace(astream=answer)
+        agent.reporter.answer = AsyncMock(return_value=('合成账本分析完成', {'status': 'reviewed'}))
         plan = AgentPlan.model_validate({"analyses": [{"tool": "cashflow"}],
             "toolCalls": [{"toolName": "search_personal_orders"}]})
         with patch.object(agent, "_create_plan", AsyncMock(return_value=plan)):

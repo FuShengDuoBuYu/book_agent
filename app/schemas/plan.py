@@ -1,7 +1,7 @@
 from datetime import date
 from typing import Literal, get_args
 
-from pydantic import AliasChoices, BaseModel, Field, FiniteFloat, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, FiniteFloat, PrivateAttr, field_validator, model_validator
 
 from app.tools.financial_analysis import ANALYSIS_TOOLS
 
@@ -82,16 +82,35 @@ class ToolCall(BaseModel):
 
 # Agent plan的完整计划
 class ScenarioChange(BaseModel):
+    @model_validator(mode='before')
+    @classmethod
+    def normalize_unused_defaults(cls, value):
+        if isinstance(value, dict):
+            value = {key: item for key, item in value.items()
+                     if item is not None or key not in {'source', 'count', 'label'}}
+        return value
+
     metric: Literal["income", "expense"]
-    amount: FiniteFloat
+    amount: FiniteFloat | None = None
+    percent: float | None = Field(default=None, ge=-100, le=1000, allow_inf_nan=False)
+    source: str = Field(default="", max_length=100)
     count: float = Field(default=1, gt=0, le=100000, allow_inf_nan=False)
     label: str = Field(default="用户假设", max_length=200)
+
+    @model_validator(mode="after")
+    def validate_change(self):
+        if (self.amount is None) == (self.percent is None):
+            raise ValueError("Provide exactly one of amount or percent")
+        return self
 
 
 class AnalysisRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def omit_unused_metric(cls, value):
+        if isinstance(value, dict):
+            value = {key: item for key, item in value.items()
+                     if item is not None or key not in {'changes', 'queryIds', 'protectedCategories'}}
         if isinstance(value, dict) and value.get("tool") != "forecast" and value.get("metric", "income") is None:
             value = dict(value)
             value.pop("metric")
@@ -106,6 +125,11 @@ class AnalysisRequest(BaseModel):
     startingBalance: FiniteFloat | None = None
     targetAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False)
     months: int | None = Field(default=None, ge=1, le=600)
+    monthsDelta: int | None = Field(default=None, ge=-599, le=599)
+    monthlyImprovement: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False)
+    purchaseAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False)
+    reserveAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False)
+    protectedCategories: list[str] = Field(default_factory=list, max_length=30)
 
     @field_validator("tool")
     @classmethod
@@ -134,6 +158,10 @@ class AnalysisWindow(BaseModel):
 
 
 class AgentPlan(BaseModel):
+    _analysis_context: dict = PrivateAttr(default_factory=dict)
+    _planning_issues: list = PrivateAttr(default_factory=list)
+    resetAnalysisContext: bool = False
+
     @model_validator(mode="before")
     @classmethod
     def normalize_analysis_tool_alias(cls, value):

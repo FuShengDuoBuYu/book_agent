@@ -26,6 +26,14 @@ def get_planner_model() -> Runnable:
     return _compatible(settings, planner=True).bind(response_format={"type": "json_object"})
 
 
+@lru_cache
+def get_structured_model(schema: type) -> Runnable:
+    settings = get_settings()
+    if settings.llm_provider == "ollama":
+        return _ollama(settings, planner=True).bind(format=schema.model_json_schema())
+    return _compatible(settings, planner=True).bind(response_format={"type": "json_object"})
+
+
 def _ollama(settings: Settings, planner: bool = False) -> ChatOllama:
     return ChatOllama(
         model=settings.llm_model,

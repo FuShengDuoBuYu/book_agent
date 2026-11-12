@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from collections import defaultdict
@@ -11,6 +12,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langsmith import traceable
 
 from app.agent.planner import QueryPlanner
+from app.agent.analysis_context import latest_context
+from app.agent.evidence_report import EvidenceReporter
 from app.agent.prompts import BOOK_AGENT_ANALYSIS_PROMPT, BOOK_AGENT_SYSTEM_PROMPT
 from app.clients.bookkeeping_api import BookkeepingApiClient
 from app.core.llm import get_chat_model
@@ -48,6 +51,7 @@ class BookAgent:
         self.chain = self.prompt | self.model
         self.memory = MongoMemoryStore()
         self.planner = QueryPlanner()
+        self.reporter = EvidenceReporter()
 
     async def chat(
         self,
@@ -124,7 +128,8 @@ class BookAgent:
 
             yield {"type": "status", "content": "正在规划账单查询"}
             plan = await self._create_plan(
-                message=message, history=history_text, book_mode=book_mode
+                message=message, history=history_text, book_mode=book_mode,
+                previous_context=latest_context(history_messages),
             )
             yield {
                 "type": "status",
@@ -176,6 +181,28 @@ class BookAgent:
                     duration_ms=round((perf_counter() - started_at) * 1000),
                 )
                 yield {"type": "done", "content": ""}
+                return
+
+            if plan.analyses:
+                report_task = asyncio.create_task(self.reporter.answer(
+                    message, plan._analysis_context, self._safe_json_loads(orders_json).get('analysisResults', [])))
+                try:
+                    while not report_task.done():
+                        done, _ = await asyncio.wait({report_task}, timeout=12)
+                        if not done:
+                            yield {'type': 'status', 'content': '正在核对分析结论与账单依据'}
+                    reply, validation = await report_task
+                finally:
+                    if not report_task.done():
+                        report_task.cancel()
+                        await asyncio.gather(report_task, return_exceptions=True)
+                assistant_chunks.append(reply)
+                yield {'type': 'delta', 'content': reply}
+                await self._save_assistant_reply(
+                    phone_num=phone_num, session_id=resolved_session_id, reply=reply, plan=plan,
+                    evidence=self._safe_json_loads(orders_json),
+                    duration_ms=round((perf_counter() - started_at) * 1000), validation=validation)
+                yield {'type': 'done', 'content': ''}
                 return
 
             # ThinkTagStreamParser 把模型流式输出拆成“思考”和“最终回答”两类事件。
@@ -240,6 +267,7 @@ class BookAgent:
         plan: AgentPlan,
         evidence: dict | None = None,
         duration_ms: int | None = None,
+        validation: dict | None = None,
     ) -> None:
         if not reply or not session_id:
             return
@@ -250,7 +278,9 @@ class BookAgent:
             role="assistant",
             content=reply,
             metadata={"plan": plan.model_dump(mode="json"), "evidence": evidence or {},
-                      "analysisVersion": 2, "durationMs": duration_ms,
+                      "analysisVersion": 3, "durationMs": duration_ms,
+                      "analysisContext": plan._analysis_context, "validation": validation or {},
+                      "planningIssues": plan._planning_issues,
                       "model": {"provider": settings.llm_provider, "name": settings.llm_model,
                                 "reasoning": settings.llm_reasoning,
                                 "reasoningEffort": settings.llm_reasoning_effort}},
@@ -258,12 +288,13 @@ class BookAgent:
 
     @traceable(name="book_agent_create_plan", run_type="chain")
     async def _create_plan(
-        self, message: str, history: str, book_mode: str
+        self, message: str, history: str, book_mode: str, previous_context: dict | None = None
     ) -> AgentPlan:
         return await self.planner.create_plan(
             message=message,
             history=history,
             book_mode=book_mode,
+            previous_context=previous_context,
         )
 
     @traceable(
@@ -338,7 +369,7 @@ class BookAgent:
                             "sufficientData": False, "reason": "该分析尚未明确关联哪个分类或备注范围，需要确认查询范围。"}})
                         continue
                     records = merge_orders([rows for _, rows in bound])
-                    window = plan.analysisWindow if task.tool not in {"forecast", "scenario", "savings", "budget"} else None
+                    window = plan.analysisWindow if task.tool not in {"forecast", "scenario", "savings", "budget", "projection", "purchase", "runway", "optimization"} else None
                     selected = records
                     if window:
                         selected = [order for order in records if _date(order) and window.startDate <= _date(order) <= window.endDate]
@@ -348,6 +379,9 @@ class BookAgent:
                         changes=[change.model_dump() for change in task.changes],
                         budget_amount=task.budgetAmount, starting_balance=task.startingBalance,
                         target_amount=task.targetAmount, months=task.months,
+                        monthly_improvement=task.monthlyImprovement,
+                        purchase_amount=task.purchaseAmount, reserve_amount=task.reserveAmount,
+                        protected_categories=task.protectedCategories,
                         window_start=window.startDate if window else None,
                         window_end=window.endDate if window else None,
                     )
@@ -462,7 +496,7 @@ class BookAgent:
             return f"{scope}没有查到账单记录。"
 
         analyses = data.get("analysisResults") or []
-        if analyses and all(item.get("evidence", {}).get("sufficientData") is False for item in analyses):
+        if analyses and not plan.analyses and all(item.get("evidence", {}).get("sufficientData") is False for item in analyses):
             input_names = {"budgetAmount": "预算金额", "startingBalance": "当前存款余额", "targetAmount": "目标金额"}
             missing = list(dict.fromkeys(input_names.get(field, field) for item in analyses
                                         for field in item["evidence"].get("missingInputs", [])))
@@ -514,16 +548,11 @@ class BookAgent:
 
         lines = []
         for item in messages:
-            role = "用户" if item.get("role") == "user" else "助手"
+            if item.get('role') != 'user':
+                continue
             content = str(item.get("content", "")).strip()
             if content:
-                lines.append(f"{role}: {self._sanitize_history_content(content)}")
-            plan = item.get("metadata", {}).get("plan")
-            if plan:
-                lines.append(
-                    "上一轮计划: "
-                    + json.dumps(plan, ensure_ascii=False, separators=(",", ":"))
-                )
+                lines.append(f"用户: {self._sanitize_history_content(content)}")
 
         return "\n".join(lines) or "无历史消息。"
 

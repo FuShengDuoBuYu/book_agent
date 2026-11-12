@@ -6,6 +6,11 @@ from app.schemas.plan import AgentPlan
 
 
 class AnalysisPlannerTests(unittest.TestCase):
+    def test_unused_null_collections_and_source_are_normalized(self):
+        plan = AgentPlan.model_validate({'analyses': [{'tool': 'optimization', 'protectedCategories': None},
+                 {'tool': 'scenario', 'changes': [{'metric': 'income', 'amount': 200, 'source': None}]}]})
+        self.assertEqual(plan.analyses[0].protectedCategories, [])
+        self.assertEqual(plan.analyses[1].changes[0].source, '')
     def test_past_history_reference_does_not_override_forecast_target(self):
         plan = AgentPlan.model_validate({"analyses": [{"tool": "forecast", "targetMonth": "2026-12"}]})
         normalized = QueryPlanner.__new__(QueryPlanner)._normalize_plan(plan, datetime(2026, 11, 12), "根据上个月的收入，预测未来一个月收入")

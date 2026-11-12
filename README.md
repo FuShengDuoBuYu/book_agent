@@ -40,20 +40,30 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
 | `recurring` | 多月出现的收入来源和周期性支出 |
 | `forecast` | 收入、支出、净现金流的条件预测 |
 | `scenario` | 用户指定金额、次数与增减条件下的推演 |
+| `projection` | 多月收支和累计新增结余；按来源调整金额或百分比 |
+| `income_stability` / `runway` | 历史收入波动、来源集中度、给定余额和收入冲击下的现金缺口 |
+| `optimization` / `purchase` | 保留必要支出的调整空间、大额购买后的现金及储备余量 |
+| `data_quality` | 非持续性入账、缺失字段及重复线索对分析口径的影响 |
 | `budget` / `savings` | 预算执行、剩余额度及储蓄目标测算 |
 
 各分析绑定查询来源，避免分类范围与个人/家庭账本混用。未完月份单独标记；缺失月份不按零处理。预测采用最近六个完整月内最近三个有记录月份的中位数基准，区间表示历史情景，不是置信区间。现有账单无法证明真实资产、未偿债务或未来收入安排，这些条件需要用户提供。
 
-`GET /api/conversations` 和 `GET /api/conversations/{id}` 提供授权分页历史。消息的内部元数据保存执行计划、工具证据、分析版本和耗时，前端历史接口不返回内部元数据。默认每次规划读取最近六条消息。
+`GET /api/conversations` 和 `GET /api/conversations/{id}` 提供授权分页历史。消息的内部元数据保存执行计划、工具证据、分析版本、耗时、已解析的用户条件、报告引用和审查结果，前端历史接口不返回内部元数据。默认每次规划读取最近六条消息，追问沿用结构化条件，不把旧回答中的数字当作用户输入。独立问题、切换查询范围及明确重置会清除旧情景。
+
+复杂分析先生成带证据引用的报告，再检查解释是否受证据支持。金额和期限由程序渲染；未通过的解释不会先流式发送。重试仍不通过时只返回已核算事实和缺失条件，并记录 `verified_facts_fallback`，该状态不算分析质量验收通过。生成期间 SSE 会持续显示核对进度。模型审查仍可能遗漏语义错误，需结合实际问答持续回归。
 
 ## 模型回归
 
 ```sh
 python -m scripts.evaluate_analysis
 python -m scripts.evaluate_analysis --case scenario --case forecast
+python -m scripts.evaluate_acceptance
+python -m scripts.evaluate_acceptance --case chain
 ```
 
 上述命令使用配置中的模型，但账本及记忆由虚构样本替代，不访问用户数据库。输出 JSONL 包含问题类型、所选工具、数值检查和回答，可用于比较模型与提示词。程序检查不能替代对解释是否准确、是否把推断说成事实的人工复核。
+
+`evaluate_acceptance` 覆盖综合诊断、变化归因、收入韧性、多月预测、节支优化、购买判断、储蓄目标、数据质量及连续追问。合成样本的标准值和实际验收记录见 [分析质量回归](docs/analysis-quality-evaluation.md)。
 
 原生 Ollama 规划使用 `AgentPlan` JSON Schema。`OLLAMA_NUM_CTX` 控制上下文长度，`PLANNER_NUM_PREDICT` 控制计划输出上限，`LLM_REASONING=true` 开启回答阶段推理；规划阶段关闭推理。按机器能力设置 `PLANNER_TIMEOUT_SECONDS` 和 `REQUEST_TIMEOUT_SECONDS`，并用上述回归验证后再发布。
 

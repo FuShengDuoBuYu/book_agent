@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from app.core.config import get_settings
 from app.core.llm import get_planner_model
+from app.agent.analysis_context import resolve_context
 from app.agent.prompts import PLANNER_HUMAN_PROMPT, PLANNER_SYSTEM_PROMPT
 from app.schemas.plan import (
     AgentPlan,
@@ -41,17 +42,18 @@ class QueryPlanner:
 
     @traceable(name="query_planner", run_type="chain")
     async def create_plan(
-        self, message: str, history: str, book_mode: str = "个人版"
+        self, message: str, history: str, book_mode: str = "个人版", previous_context: dict | None = None
     ) -> AgentPlan:
         # 这里的核心任务是：拿到 LLM 输出后，尽量把它收敛成一个可执行的 AgentPlan。
         now = datetime.now(ZoneInfo("Asia/Shanghai"))
         prompt_values = {
             "current_date": now.strftime("%Y-%m-%d"),
             "book_mode": self._normalize_mode(book_mode),
-            "history": history,
+            "history": history + '\n上轮已解析的用户条件（追问时沿用，独立新问题不沿用）：' + json.dumps(previous_context or {}, ensure_ascii=False),
             "message": message,
         }
         plan = self._fallback_plan()
+        issues = []
         for attempt in range(2):
             try:
                 response = await asyncio.wait_for(
@@ -63,13 +65,18 @@ class QueryPlanner:
                 if not data:
                     raise ValueError("Missing plan")
                 plan = AgentPlan.model_validate(data)
+                self._coalesce_forecasts(plan)
+                resolve_context(plan, previous_context or {})
                 return self._normalize_plan(plan, now, message, book_mode)
             except (asyncio.TimeoutError, json.JSONDecodeError, ValidationError, ValueError) as exc:
+                detail = "; ".join(f"{error['loc']}: {error['msg']}" for error in exc.errors()) if isinstance(exc, ValidationError) else str(exc)
+                issues.append({'type': type(exc).__name__, 'detail': detail[:800]})
                 if attempt == 0:
-                    detail = "; ".join(f"{error['loc']}: {error['msg']}" for error in exc.errors()) if isinstance(exc, ValidationError) else str(exc)
                     prompt_values["message"] = message + "\n上次计划校验失败：" + detail[:800] + "\n请重新生成符合 JSON schema 的计划。用户的情景金额与次数必须填入 scenario.changes，预算和储蓄条件也要填写，不能只写在 finalInstruction。"
 
-        return self._fallback_plan()
+        plan = self._fallback_plan()
+        plan._planning_issues = issues
+        return plan
 
     def _extract_json(self, content: str) -> dict:
         # 模型有时会包一层 markdown code fence，或带 <think> 标签，这里先做清洗再取 JSON。
@@ -90,6 +97,7 @@ class QueryPlanner:
         self, plan: AgentPlan, now: datetime, message: str, book_mode: str = "个人版"
     ) -> AgentPlan:
         # normalize 的目的，是把“不稳定的 LLM 输出”整理成“稳定的程序输入”。
+        self._coalesce_forecasts(plan)
         if plan.analysisType == "financial_analysis" and not plan.analyses:
             plan.analyses = [AnalysisRequest(tool=name) for name in ("cashflow", "trends", "changes", "anomalies", "recurring")]
         if plan.analyses:
@@ -154,8 +162,25 @@ class QueryPlanner:
 
         return plan
 
+    def _coalesce_forecasts(self, plan):
+        groups = {}
+        for task in plan.analyses:
+            if task.tool == 'forecast' and task.targetMonth:
+                groups.setdefault(tuple(sorted(task.queryIds)), []).append(task)
+        for query_ids, tasks in groups.items():
+            targets = sorted({task.targetMonth for task in tasks})
+            if len(targets) < 2:
+                continue
+            start = datetime.strptime(targets[0], '%Y-%m').date()
+            contiguous = [shift_month(start, i).strftime('%Y-%m') for i in range(len(targets))]
+            metrics = [{task.metric for task in tasks if task.targetMonth == target} for target in targets]
+            if targets == contiguous and all(value == metrics[0] for value in metrics):
+                plan.analyses = [task for task in plan.analyses if task not in tasks]
+                plan.analyses.append(AnalysisRequest(tool='projection', queryIds=list(query_ids),
+                                                     targetMonth=targets[0], months=len(targets)))
+
     def _prepare_analysis_queries(self, plan: AgentPlan, now: datetime, book_mode: str) -> None:
-        forecasting = [task for task in plan.analyses if task.tool in {"forecast", "scenario", "savings"}]
+        forecasting = [task for task in plan.analyses if task.tool in {"forecast", "scenario", "savings", "projection", "purchase", "runway", "optimization"}]
         for task in forecasting:
             if task.targetMonth is None:
                 task.targetMonth = shift_month(now.date(), 1).strftime("%Y-%m")
