@@ -7,6 +7,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
 from app.core.config import Settings, get_settings
+from app.schemas.plan import AgentPlan
 
 
 @lru_cache
@@ -29,10 +30,10 @@ def _ollama(settings: Settings, planner: bool = False) -> ChatOllama:
     return ChatOllama(
         model=settings.llm_model,
         base_url=settings.llm_base_url,
-        reasoning=False,
+        reasoning=False if planner else settings.llm_reasoning,
         temperature=0 if planner else settings.llm_temperature,
         num_ctx=settings.ollama_num_ctx,
-        format="json" if planner else None,
+        format=AgentPlan.model_json_schema() if planner else None,
         num_predict=settings.planner_num_predict if planner else None,
         client_kwargs={"timeout": settings.request_timeout_seconds},
     )

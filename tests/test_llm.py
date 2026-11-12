@@ -70,4 +70,14 @@ class ModelConfigurationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(chat.base_url, "http://localhost:11435")
         self.assertEqual(chat.model, "fixture:8b")
-        self.assertEqual(planner.format, "json")
+        self.assertEqual(planner.format["title"], "AgentPlan")
+        self.assertIn("analysisWindow", planner.format["properties"])
+
+    def test_analysis_reasoning_and_context_are_configurable(self):
+        with patch.dict(os.environ, {"LLM_PROVIDER": "ollama", "LLM_MODEL": "fixture",
+                                    "LLM_REASONING": "true", "OLLAMA_NUM_CTX": "32768"}, clear=True):
+            chat = get_chat_model()
+            planner = get_planner_model()
+        self.assertTrue(chat.reasoning)
+        self.assertFalse(planner.reasoning)
+        self.assertEqual(chat.num_ctx, 32768)

@@ -25,9 +25,10 @@ class Settings(BaseModel):
     llm_api_key: SecretStr | None = None
     llm_temperature: float = Field(default=0.2, ge=0, le=2)
     llm_reasoning_effort: str | None = None
+    llm_reasoning: bool = False
     ollama_num_ctx: int = Field(default=8192, gt=0)
     planner_timeout_seconds: float = Field(default=20.0, gt=0)
-    planner_num_predict: int = Field(default=512, gt=0)
+    planner_num_predict: int = Field(default=2048, gt=0)
     request_timeout_seconds: float = Field(default=120.0, gt=0)
     frontend_dist: Path = BASE_DIR / "frontend" / "dist"
 
@@ -70,6 +71,7 @@ def get_settings() -> Settings:
         llm_temperature=os.getenv("LLM_TEMPERATURE")
         or os.getenv("OLLAMA_TEMPERATURE", str(defaults.llm_temperature)),
         llm_reasoning_effort=os.getenv("LLM_REASONING_EFFORT") or None,
+        llm_reasoning=os.getenv("LLM_REASONING", str(defaults.llm_reasoning)),
         ollama_num_ctx=os.getenv("OLLAMA_NUM_CTX", str(defaults.ollama_num_ctx)),
         planner_timeout_seconds=os.getenv(
             "PLANNER_TIMEOUT_SECONDS", str(defaults.planner_timeout_seconds)

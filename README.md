@@ -26,6 +26,37 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
 
 `LLM_PROVIDER=openai_compatible` 使用配置的兼容网关。原生 Ollama 可用 `LLM_PROVIDER=ollama`、`LLM_BASE_URL=http://127.0.0.1:11434` 和 `LLM_MODEL`；已有的 `OLLAMA_BASE_URL`、`OLLAMA_MODEL` 等仍可作为回退配置。
 
+## 分析与历史对话
+
+页面顶部的“历史对话”可回看、续聊和分页加载旧消息，“新对话”创建独立上下文。历史按服务端验证的账号及个人/家庭账本范围隔离。刷新页面自动恢复最近会话。
+
+查询由授权账本接口执行，计算工具处理金额，模型组合证据作解释。支持以下可组合分析。
+
+| 工具 | 用途 |
+| --- | --- |
+| `cashflow` | 收支结构、分类、支付方式、备注来源与结余比例 |
+| `trends` / `changes` | 月度与每日趋势、最近完整月份变化及类别贡献 |
+| `anomalies` | 同类异常大额和疑似重复账单线索 |
+| `recurring` | 多月出现的收入来源和周期性支出 |
+| `forecast` | 收入、支出、净现金流的条件预测 |
+| `scenario` | 用户指定金额、次数与增减条件下的推演 |
+| `budget` / `savings` | 预算执行、剩余额度及储蓄目标测算 |
+
+各分析绑定查询来源，避免分类范围与个人/家庭账本混用。未完月份单独标记；缺失月份不按零处理。预测采用最近六个完整月内最近三个有记录月份的中位数基准，区间表示历史情景，不是置信区间。现有账单无法证明真实资产、未偿债务或未来收入安排，这些条件需要用户提供。
+
+`GET /api/conversations` 和 `GET /api/conversations/{id}` 提供授权分页历史。消息的内部元数据保存执行计划、工具证据、分析版本和耗时，前端历史接口不返回内部元数据。默认每次规划读取最近六条消息。
+
+## 模型回归
+
+```sh
+python -m scripts.evaluate_analysis
+python -m scripts.evaluate_analysis --case scenario --case forecast
+```
+
+上述命令使用配置中的模型，但账本及记忆由虚构样本替代，不访问用户数据库。输出 JSONL 包含问题类型、所选工具、数值检查和回答，可用于比较模型与提示词。程序检查不能替代对解释是否准确、是否把推断说成事实的人工复核。
+
+原生 Ollama 规划使用 `AgentPlan` JSON Schema。`OLLAMA_NUM_CTX` 控制上下文长度，`PLANNER_NUM_PREDICT` 控制计划输出上限，`LLM_REASONING=true` 开启回答阶段推理；规划阶段关闭推理。按机器能力设置 `PLANNER_TIMEOUT_SECONDS` 和 `REQUEST_TIMEOUT_SECONDS`，并用上述回归验证后再发布。
+
 - [架构与部署](docs/ai-bill-architecture.md)
 - [家庭部署信息清单](docs/home-agent-checklist.md)
 - [开发规范](CONTRIBUTING.md)

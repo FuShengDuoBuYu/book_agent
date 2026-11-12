@@ -14,13 +14,16 @@ def _chat_args(request: ChatRequest, session: LedgerSession) -> dict:
     family_id = session.account.familyId
     if request.mode == "家庭版" and not family_id:
         raise HTTPException(403, "当前账号未加入家庭账本。", headers=NO_STORE)
-    return {
+    args = {
         "phone_num": session.account.phoneNum,
         "message": request.message,
         "session_id": request.sessionId,
         "mode": request.mode,
         "family_id": family_id,
     }
+    if request.newSession:
+        args["new_session"] = True
+    return args
 
 
 @router.post("/chat", response_model=ChatResponse)
