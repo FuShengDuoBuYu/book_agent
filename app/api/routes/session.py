@@ -2,9 +2,9 @@ from dataclasses import dataclass, field
 from typing import Annotated
 
 import httpx
-from fastapi import APIRouter, Cookie, Depends, Form, HTTPException, Response
+from fastapi import APIRouter, Cookie, Depends, Form, HTTPException, Request, Response
 from fastapi.responses import PlainTextResponse, RedirectResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 from app.clients.bookkeeping_api import BookkeepingApiClient
 
@@ -12,6 +12,16 @@ router = APIRouter(tags=["session"])
 COOKIE_NAME = "__Host-book-agent"
 NO_STORE = {"Cache-Control": "no-store"}
 COOKIE_OPTIONS = {"path": "/", "secure": True, "httponly": True, "samesite": "strict"}
+
+
+class TicketCredentials(BaseModel):
+    phoneNum: str = Field(min_length=1, max_length=32)
+    password: SecretStr = Field(min_length=1, max_length=128)
+
+
+class LedgerTicket(BaseModel):
+    ticket: str = Field(min_length=1, max_length=128)
+    expiresIn: int = Field(gt=0, le=3600)
 
 
 class LedgerGrant(BaseModel):
@@ -48,6 +58,32 @@ async def require_session(
 
 
 SessionDependency = Annotated[LedgerSession, Depends(require_session)]
+
+
+@router.post("/session/ticket", response_model=LedgerTicket)
+async def issue_ticket(request: Request, response: Response) -> LedgerTicket:
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > 4096:
+            raise HTTPException(413, "请求体过大。", headers=NO_STORE)
+        body.extend(chunk)
+    try:
+        credentials = TicketCredentials.model_validate_json(body)
+    except ValueError:
+        raise HTTPException(401, "账号或密码验证失败。", headers=NO_STORE) from None
+
+    try:
+        ticket = LedgerTicket.model_validate(await BookkeepingApiClient().issue_ticket(
+            credentials.phoneNum, credentials.password.get_secret_value()
+        ))
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in {400, 401, 403, 422}:
+            raise HTTPException(401, "账号或密码验证失败。", headers=NO_STORE) from None
+        raise HTTPException(503, "账本服务暂不可用。", headers=NO_STORE) from None
+    except (httpx.HTTPError, ValueError):
+        raise HTTPException(503, "账本服务暂不可用。", headers=NO_STORE) from None
+    response.headers.update(NO_STORE)
+    return ticket
 
 
 @router.post("/session/exchange")

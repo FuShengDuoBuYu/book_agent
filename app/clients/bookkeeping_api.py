@@ -13,6 +13,11 @@ class BookkeepingApiClient:
         self.timeout = settings.request_timeout_seconds
         self._session_token = session_token
 
+    async def issue_ticket(self, phone_num: str, password: str) -> dict[str, Any]:
+        return await self._request(
+            "POST", "/auth/ai-bill/ticket", {"phoneNum": phone_num, "password": password}
+        )
+
     async def exchange_ticket(self, ticket: str) -> dict[str, Any]:
         return await self._request("POST", "/ai-bill/session", {"ticket": ticket})
 

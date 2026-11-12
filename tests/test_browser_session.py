@@ -123,3 +123,26 @@ class BrowserSessionTests(unittest.TestCase):
             self.assertEqual(response.headers["x-accel-buffering"], "no")
             self.assertIn('"content": "12.50"', response.text)
             self.assertIn('"type": "done"', response.text)
+
+
+    def test_native_ticket_uses_ledger_and_disables_caching(self):
+        with patch(
+            "app.api.routes.session.BookkeepingApiClient.issue_ticket",
+            AsyncMock(return_value={"ticket": "fixture-ticket", "expiresIn": 60}),
+            create=True,
+        ) as issue:
+            response = self.client.post("/api/session/ticket", json={
+                "phoneNum": "13800138001", "password": "fixture-password",
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ticket": "fixture-ticket", "expiresIn": 60})
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        issue.assert_awaited_once_with("13800138001", "fixture-password")
+
+    def test_invalid_native_ticket_body_does_not_echo_password(self):
+        response = self.client.post("/api/session/ticket", json={
+            "phoneNum": "", "password": "fixture-password",
+        })
+        self.assertEqual(response.status_code, 401)
+        self.assertNotIn("fixture-password", response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
