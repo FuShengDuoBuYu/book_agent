@@ -8,7 +8,7 @@ from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
 from app.core.config import get_settings
-from app.core.llm import get_chat_model, get_planner_model
+from app.core.llm import get_chat_model, get_planner_model, get_structured_model
 
 
 class ModelConfigurationTests(unittest.IsolatedAsyncioTestCase):
@@ -22,8 +22,26 @@ class ModelConfigurationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(analysis['properties']['tool']['enum']), set(ANALYSIS_TOOLS))
         self.assertTrue({'tool', 'queryIds', 'metric', 'targetMonth'} <= set(analysis['required']))
         self.assertEqual(set(schema['$defs']['ToolCall']['properties']['toolName']['enum']), set(PLANNER_TOOL_BY_NAME))
+
+    def test_planner_schema_requires_explicit_grouping_filters_and_horizon_fields(self):
+        with patch.dict(os.environ, {'LLM_PROVIDER': 'ollama'}, clear=True):
+            schema = get_planner_model().format
+        self.assertTrue({'aggregate', 'changes', 'months'} <= set(schema['$defs']['AnalysisRequest']['required']))
+        self.assertTrue({'groupBy', 'periods', 'filters'} <= set(schema['$defs']['AggregateSpec']['required']))
+        self.assertTrue({'includeCategories', 'excludeCategories'} <= set(schema['$defs']['AggregateFilters']['required']))
+
+    def test_structured_writer_has_an_independent_actual_output_budget(self):
+        from app.schemas.report import ReportReview
+        with patch.dict(os.environ, {'LLM_PROVIDER': 'ollama', 'PLANNER_NUM_PREDICT': '4096'}, clear=True):
+            reviewer = get_structured_model(ReportReview, reasoning=False, num_predict=512)
+            planner = get_planner_model()
+        self.assertEqual(reviewer.bound.num_predict, 512)
+        self.assertFalse(reviewer.bound.reasoning)
+        self.assertEqual(planner.num_predict, 4096)
+        self.assertTrue(planner.reasoning)
+
     def setUp(self):
-        for factory in (get_settings, get_chat_model, get_planner_model):
+        for factory in (get_settings, get_chat_model, get_planner_model, get_structured_model):
             factory.cache_clear()
             self.addCleanup(factory.cache_clear)
 
@@ -89,7 +107,7 @@ class ModelConfigurationTests(unittest.IsolatedAsyncioTestCase):
             chat = get_chat_model()
             planner = get_planner_model()
         self.assertTrue(chat.reasoning)
-        self.assertFalse(planner.reasoning)
+        self.assertTrue(planner.reasoning)
         self.assertEqual(chat.num_ctx, 32768)
         self.assertEqual(chat.keep_alive, '60s')
 

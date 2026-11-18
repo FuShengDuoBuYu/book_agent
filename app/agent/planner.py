@@ -13,7 +13,7 @@ from app.core.config import get_settings
 from app.core.llm import get_planner_model
 from app.agent.analysis_context import resolve_context
 from app.agent.plan_parsing import repair_descriptive_arrays
-from app.agent.plan_review import PlanReviewer, sanitize_user_conditions
+from app.agent.plan_review import NUMBER, PlanReviewer, explicit_month_delta, named_percent_changes, sanitize_user_conditions
 from app.agent.prompts import PLANNER_HUMAN_PROMPT, PLANNER_SYSTEM_PROMPT
 from app.schemas.plan import (
     AgentPlan,
@@ -28,6 +28,7 @@ from app.schemas.plan import (
 from app.tools.registry import PLANNER_TOOL_BY_NAME, format_tool_call, render_planner_tools_for_prompt
 from app.tools.order_search import normalize_cost_type
 from app.tools.financial_analysis import ANALYSIS_TOOLS, shift_month
+from app.tools.aggregate_analysis import AggregatePeriod
 
 HISTORY_BASED_TOOLS = {'forecast', 'scenario', 'savings', 'projection', 'purchase', 'runway', 'optimization'}
 
@@ -87,6 +88,31 @@ def explicit_complete_month_window(message, today):
         raise ValueError('完整自然月范围应为 1 至 24 个月')
     current_month = today.replace(day=1)
     return AnalysisWindow(startDate=shift_month(current_month, -count), endDate=current_month - timedelta(days=1))
+
+
+def _future_month_count(message):
+    match = re.findall(rf"(?:未来|接下来|今后|往后)\s*({NUMBER})\s*个月(?!\s*后)", message)
+    if len(match) == 1:
+        value = explicit_goal_amount(match[0])
+        if value is not None and value == int(value) and 1 < value <= 600:
+            return int(value)
+    return None
+
+
+def _relative_month_comparison(message, today):
+    """Resolve two explicitly compared whole calendar months from the local date."""
+    token = r"(?:上上?个?月|本月|这个月)"
+    match = re.search(rf"({token})\s*(?:和|与|对比|相比|跟|、)\s*({token})", message)
+    if not match or len(re.findall(token, message)) != 2:
+        return []
+    rest = message[:match.start()] + message[match.end():]
+    if re.search(r"同期|上旬|下旬|中旬|第.{1,3}[天周]|月初|月底|截至|截止|\d+\s*[日号月]|[一二三四五六七八九十]+月", rest):
+        return []
+    periods = {}
+    for label in match.groups():
+        start = shift_month(today.replace(day=1), -label.count("上"))
+        periods[start] = AggregatePeriod(label=label, startDate=start, endDate=min(today, shift_month(start, 1)-timedelta(days=1)))
+    return [periods[start] for start in sorted(periods)] if len(periods) == 2 else []
 
 
 class QueryPlanner:
@@ -149,6 +175,8 @@ class QueryPlanner:
                     decision, plan._semantic_review = await self.reviewer.review(
                         message, history, plan, now.date(), self._normalize_mode(book_mode), previous_context)
                     plan._semantic_review['adopted'] = bool(decision is not None and not decision.adequate)
+                    if plan._semantic_review.get('error') == 'inconsistent_adequacy':
+                        raise ValueError('审查未能确认可执行任务。请根据问题明确工具、预测期限和变化来源。')
                     if decision is not None and not decision.adequate:
                         plan.analyses = decision.analyses
                         plan.analysisWindow = decision.analysisWindow
@@ -158,8 +186,15 @@ class QueryPlanner:
                     plan.analysisWindow = requested_window
                     plan._planning_issues.append({'type': 'normalized_complete_month_window',
                         'window': requested_window.model_dump(mode='json')})
+                relative_periods = _relative_month_comparison(message, now.date())
+                if relative_periods:
+                    plan.analysisWindow = AnalysisWindow(startDate=relative_periods[0].startDate, endDate=relative_periods[-1].endDate)
+                    for task in plan.analyses:
+                        if task.aggregate:
+                            task.aggregate.periods = relative_periods
                 self._preserve_referent_window(plan, previous_context or {}, message, now)
                 context = self._inherit_conversation(plan, previous_context or {})
+                self._normalize_projection(plan, message, context, book_mode)
                 self._normalize_explicit_conditions(plan, message)
                 self._sanitize_conditions(plan, message, book_mode, context)
                 self._coalesce_forecasts(plan)
@@ -201,6 +236,77 @@ class QueryPlanner:
         except json.JSONDecodeError:
             repaired, self._parse_repairs = repair_descriptive_arrays(content)
             return json.loads(repaired)
+
+    def _normalize_projection(self, plan, message, context, book_mode):
+        if plan.intent != 'analyze_orders' or not plan.analyses:
+            return
+        scopes = {(c.toolName, c.args.cost_type, c.args.remark) for c in plan.toolCalls}
+        if not scopes:
+            default = 'search_family_orders' if self._normalize_mode(book_mode) == '家庭版' else 'search_personal_orders'
+            scopes = {(default, '不限', '')}
+        if len(scopes) > 1 or ('个人' in message and '家庭' in message):
+            return
+        prior = context if (plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext
+                            and not context.get('ambiguous') and len(context.get('scope', [])) == 1
+                            and list(next(iter(scopes))) == context['scope'][0]) else {}
+        active = [row for row in prior.get('activeAnalyses', []) if row.get('tool') == 'projection']
+        projections = [t for t in plan.analyses if t.tool == 'projection']
+        scenarios = [t for t in plan.analyses if t.tool == 'scenario']
+        intent = ' '.join([plan.understanding.objective, *plan.understanding.requestedAnswers])
+        conditions = named_percent_changes(message)
+        horizon = _future_month_count(message)
+        delta = explicit_month_delta(message)
+        other_goals = any(t.tool in {'purchase', 'runway', 'savings', 'budget', 'optimization'} for t in plan.analyses)
+        cumulative = bool(re.search(r'累计.*?结余|多月推演|累计.*?存', intent))
+        amend = (len(active) == 1 and not re.search(r'只(?:看|算)|仅(?:看|算)|下下?个?月(?:的|会|能)', message)
+                 and ((not other_goals and bool(conditions)) or delta is not None or cumulative))
+        outlook = bool(scenarios or any(t.tool == 'forecast' for t in plan.analyses)
+                       or re.search(r'收支|结余|能存|收入预测|支出预测', message))
+        if not projections and ((horizon and outlook and not other_goals) or amend):
+            if len(scenarios) == 1:
+                task = scenarios[0]
+                task.tool = 'projection'
+            elif not scenarios:
+                task = AnalysisRequest(tool='projection')
+                plan.analyses.append(task)
+            else:
+                raise ValueError('多个情景需要分别绑定预测期限')
+            projections = [task]
+        if len(projections) == 1:
+            projection = projections[0]
+            if horizon:
+                projection.months = horizon
+            elif amend:
+                projection.months = prior.get('months')
+                projection.targetMonth = prior.get('targetMonth')
+            if delta is not None and prior.get('months'):
+                projection.monthsDelta = delta
+        adjustable = [t for t in plan.analyses if t.tool in {'projection', 'scenario', 'runway', 'savings', 'optimization'}]
+        if not adjustable or not conditions:
+            return
+        # An existing source-specific model input has already passed the provenance
+        # check. Materialize omissions only for a single literal source and scenario.
+        if len(conditions) != 1 or len({(t.tool, tuple(t.queryIds)) for t in adjustable}) != len(adjustable):
+            if not all(any(c.source in {source, source+'收入', source+'支出'} and c.percent == rate
+                           and role in (None, c.metric)
+                           for t in adjustable for c in t.changes) for source, role, rate in conditions):
+                raise ValueError('每个明确的来源变化必须绑定到对应情景，不能作为所有收入或支出的变化')
+            return
+        name, metric, percent = conditions[0]
+        if any(c.percent == percent and c.source in {name, name+'收入', name+'支出'} for t in adjustable for c in t.changes):
+            return
+        if not metric:
+            hints = ' '.join([intent, *plan.understanding.referents])
+            terms = {'income': '收入|income', 'expense': '支出|expense'}
+            roles = [key for key, term in terms.items() if re.search(
+                re.escape(name) + rf"""[’'"”」)\s(的]*(?:{term})""", hints, re.I)]
+            if len(roles) != 1:
+                raise ValueError(f'请明确「{name}」的变化属于收入还是支出，并将该来源和比例绑定到情景计算')
+            metric = roles[0]
+        change = ScenarioChange(metric=metric, source=name, percent=percent)
+        for task in adjustable:
+            task.changes = [c for c in task.changes if (c.metric, c.source) != (metric, name)] + [change]
+        plan._planning_issues.append({'type': 'normalized_explicit_condition', 'field': 'changes', 'source': name})
 
     def _normalize_explicit_conditions(self, plan, message):
         """Recover narrow, unambiguous user inputs before resolving context.
@@ -267,6 +373,17 @@ class QueryPlanner:
             plan.intent = "analyze_orders"
             plan.needsTools = True
             explicit_history = self._has_history_reference(message, now)
+            current_month = now.date().replace(day=1)
+            vague_history = re.sub(r'最近(?!\s*(?:[\d零一二两三四五六七八九十半几]|一段|一周))', '', message)
+            user_limited = self._has_history_reference(vague_history, now) or bool(re.search(
+                r'天内|日内|星期|本周|前\s*[\d一二两三四五六七八九十]+\s*[天日周]|\d+\s*[日号]', message))
+            if (plan.analysisWindow and not user_limited and not plan.followUpOfPreviousQuestion
+                    and plan.analysisWindow.startDate > shift_month(current_month, -2)
+                    and shift_month(current_month, -1) <= plan.analysisWindow.endDate <= now.date()):
+                if any(t.tool == 'projection' for t in plan.analyses) and _future_month_count(message):
+                    plan.analysisWindow = None
+                elif any(t.tool == 'changes' for t in plan.analyses):
+                    plan.analysisWindow = AnalysisWindow(startDate=shift_month(current_month, -2), endDate=now.date())
             if (plan.analysisWindow and plan.analysisWindow.startDate >= now.date().replace(day=1)
                     and any(task.tool in HISTORY_BASED_TOOLS for task in plan.analyses) and not explicit_history):
                 plan._planning_issues.append({'type': 'normalized_implicit_history_window',

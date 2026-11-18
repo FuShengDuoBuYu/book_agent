@@ -10,8 +10,9 @@ from app.schemas.report import ReportDraft, ReportReview
 from pydantic import ValidationError
 from time import perf_counter
 from app.agent.artifacts import render_artifacts_markdown
+from app.agent.report_context import build_report_context, repair_context
 from app.agent.report_values import (expand_values, literal, literal_links, numerical_issues,
-                                     quantity as q, sanitize_fact, value_catalog)
+                                     quantity as q, sanitize_fact)
 
 INPUT_NAMES = {'startingBalance': '当前可动用余额', 'targetAmount': '希望达到的存款目标',
                'months': '测算期限（月数）', 'changes': '收入减少的来源和幅度',
@@ -26,7 +27,7 @@ def money(value):
 def build_facts(results):
     facts = []
 
-    def add(text, required=False, values=()):
+    def add(text, required=False, values=(), model_text=None):
         values = list(values)
         if tool == 'forecast' and required:
             values.extend(q('参考月份', month, 'month') for month in e.get('baselineMonths', []))
@@ -49,8 +50,13 @@ def build_facts(results):
                     values.append(q('结余占收入', e.get('netIncomeRatioPercent'), '%'))
                 if tool == 'savings':
                     values.append(q('目标期限', e.get('months'), '个月'))
-        facts.append({'id': f'f{len(facts) + 1}', 'text': sanitize_fact(prefix + text, result),
-                      'required': required, 'values': values})
+        fact = {'id': f'f{len(facts) + 1}', 'text': sanitize_fact(prefix + text, result),
+                'required': required and not result.get('supplemental', False), 'values': values}
+        if tool == 'forecast' and e.get('targetMonth'):
+            fact['calendars'] = [e['targetMonth']]
+        if model_text:
+            fact['modelText'] = sanitize_fact(prefix + model_text, result)
+        facts.append(fact)
 
     for result in results:
         tool, e = result['tool'], result['evidence']
@@ -133,7 +139,10 @@ def build_facts(results):
         elif tool == 'sources':
             for row in e.get('sources', [])[:8]:
                 label = '收入' if row['metric'] == 'income' else '支出'
-                add(f"{row.get('member', '归属未知')}的{label}来源“{row['source']}”已记录 {money(row['amount'])} 元，备注依据：{'；'.join(row.get('remarks', []))}。", values=[q('金额', row['amount']), q('账单笔数', row.get('recordCount'), '笔')] + [q('账单月份', month, 'month') for month in row.get('monthlyAmounts', {})])
+                summary = f"{row.get('member', '归属未知')}的{label}来源“{row['source']}”已记录 {money(row['amount'])} 元，备注依据："
+                add(summary + '；'.join(row.get('remarks', [])) + '。',
+                    model_text=summary + '；'.join(str(remark)[:80] for remark in row.get('remarks', [])[:2]) + '。',
+                    values=[q('金额', row['amount']), q('账单笔数', row.get('recordCount'), '笔')] + [q('账单月份', month, 'month') for month in row.get('monthlyAmounts', {})])
             if e.get('omittedSourceCount'):
                 add(f"来源摘要另有 {e['omittedSourceCount']} 项未展开，不能据摘要断言不存在其他来源。", True, values=[q('省略来源', e['omittedSourceCount'], '项')])
         elif tool == 'changes':
@@ -171,7 +180,10 @@ def build_facts(results):
                     values=[q('历史观察月份', month, 'month') for month in e.get('observedMonths', [])])
             for row in e.get('sourceForecasts', [])[:8]:
                 historical = f"历史样本入账 {money(row['amount'])} 元，" if row.get('amount') is not None else ''
-                add(f"{row.get('member', '归属未知')}的“{row['source']}”{historical}条件估计 {money(row.get('estimate'))} 元。备注依据：{'；'.join(row.get('remarks', []))}。" + ('此项为已剔除的入账，不计入持续收入。' if row.get('excluded') else ''),
+                summary = f"{row.get('member', '归属未知')}的“{row['source']}”{historical}条件估计 {money(row.get('estimate'))} 元。备注依据："
+                exclusion = '此项为已剔除的入账，不计入持续收入。' if row.get('excluded') else ''
+                add(summary + '；'.join(row.get('remarks', [])) + '。' + exclusion,
+                    model_text=summary + '；'.join(str(remark)[:80] for remark in row.get('remarks', [])[:2]) + '。' + exclusion,
                     values=[q('该来源预测贡献', row.get('estimate')), q('该来源历史样本入账', row.get('amount'))])
             if e.get('excludedIncomeTotal'):
                 add(f"历史样本中按备注识别并剔除非持续性入账 {money(e['excludedIncomeTotal'])} 元；归类仍需核查。", values=[q('excludedIncomeTotal', e['excludedIncomeTotal'])])
@@ -245,7 +257,7 @@ def build_facts(results):
     seen = set()
     facts = [row for row in facts if not (row['text'] in seen or seen.add(row['text']))]
     if facts:
-        facts[0]['calendars'] = sorted({value for row in results for value in
+        facts[0]['calendars'] = sorted(set(facts[0].get('calendars', [])) | {value for row in results for value in
             (row.get('evidence', {}).get('asOf', ''), row.get('evidence', {}).get('asOf', '')[:7]) if value})
     return facts
 
@@ -318,8 +330,16 @@ def unsupported_assertion(text, facts):
 def prepare_draft(draft, facts):
     """Reject unsupported prose for repair; never silently erase a user's answer."""
     draft = draft.model_copy(deep=True)
+    known = {row['id'] for row in facts}
+    restored = []
     for section in draft.sections:
-        # Hide only declared internal markers; unknown references still fail.
+        # An explicit known inline citation carries the same provenance as factIds.
+        # Restore it before hiding internal markers; unknown references still fail.
+        for match in re.finditer(r'[(（](f\d+)[)）]', section.analysis):
+            key = match[1]
+            if key in known and key not in section.factIds and len(section.factIds) < 8:
+                section.factIds.append(key)
+                restored.append(key)
         section.analysis = re.sub(r'[(（](f\d+)[)）]',
             lambda match: '' if match[1] in section.factIds else match[0], section.analysis)
     used = {key for section in draft.sections for key in section.factIds}
@@ -333,7 +353,7 @@ def prepare_draft(draft, facts):
     issues = validate_draft(draft, facts)
     if issues:
         raise ValueError('；'.join(issues))
-    return draft, {'restoredReferences': missing}
+    return draft, {'restoredReferences': list(dict.fromkeys(restored + missing))}
 
 
 def render_report(draft, facts):
@@ -389,9 +409,10 @@ class EvidenceReporter:
     async def _invoke(self, schema, system, payload):
         started = perf_counter()
         self._last_call = {'schema': schema.__name__}
-        response = await asyncio.wait_for(get_structured_model(schema).ainvoke([
-            ('system', system + '\n必须遵守的 JSON schema：' + json.dumps(schema.model_json_schema(), ensure_ascii=False)),
-            ('human', json.dumps(payload, ensure_ascii=False))]),
+        output_limit = 512 if schema is ReportReview else 2048
+        response = await asyncio.wait_for(get_structured_model(schema, reasoning=False, num_predict=output_limit).ainvoke([
+            ('system', system + '\n必须遵守的 JSON schema：' + json.dumps(schema.model_json_schema(), ensure_ascii=False, separators=(',', ':'))),
+            ('human', json.dumps(payload, ensure_ascii=False, separators=(',', ':')))]),
             timeout=get_settings().request_timeout_seconds if schema is ReportReview else get_settings().planner_timeout_seconds)
         self._last_call.update(durationMs=round((perf_counter() - started) * 1000),
             promptTokens=response.response_metadata.get('prompt_eval_count'),
@@ -411,12 +432,19 @@ class EvidenceReporter:
 
     async def answer(self, question, context, results, *, history='', instruction='', artifacts=None, understanding=None):
         needs = set((understanding or {}).get('evidenceNeeds', []))
-        has_forecast = any(row['tool'] == 'forecast' for row in results)
+        forecast_metrics = {row['evidence'].get('metric') for row in results if row['tool'] == 'forecast'}
+        has_forecast = bool(forecast_metrics)
         focused = [row for row in results if not (
             row['tool'] == 'sources' and (has_forecast or (understanding and not needs & {'sources', 'members', 'remarks'})))]
+        if len(forecast_metrics) == 1 and forecast_metrics <= {'income', 'expense'}:
+            metric = next(iter(forecast_metrics))
+            forecast_modes = {row.get('mode') for row in results if row['tool'] == 'forecast'}
+            focused = [{**row, 'evidence': {**row['evidence'], 'expense' if metric == 'income' else 'income': []}}
+                       if row['tool'] == 'recurring' and row.get('mode') in forecast_modes
+                       and (row.get('supplemental') or row.get('metric') == metric) else row for row in focused]
         facts = build_facts(focused)
         # Keep required conditions and a bounded selection of observations in the model context.
-        facts = [row for row in facts if row['required']] + [row for row in facts if not row['required']][:18]
+        facts = [row for row in facts if row['required']] + [row for row in facts if not row['required']]
         artifacts = artifacts or []
         artifact_preview = [{**row, 'rows': row['rows'][:12], 'totalRows': len(row['rows'])} for row in artifacts[:8]]
         # History resolves referents; fresh computed facts supply financial values.
@@ -437,18 +465,42 @@ class EvidenceReporter:
                 + ('未给出明确存款目标，尚不能计算所需月结余能降低多少。' if context.get('targetAmount') is None else ''),
                 'values': [q('原期限', previous, '个月'), q('新期限', projection['months'], '个月'),
                            q('新增结余增量', extra), q('月度结余', projection['monthlyNet'])]})
+        all_facts = facts
         issues, attempts, previous = [], [], None
+        payload = None
+        settings = get_settings()
+        budget_options = {'num_ctx': settings.ollama_num_ctx, 'num_predict': 2048}
         for attempt in range(2):
+            budget_stats = {}
+            calls = {}
             try:
-                draft = await self._draft({**base_payload, 'facts': facts, 'values': value_catalog(facts),
-                                           'corrections': issues, 'previousReport': previous})
+                if payload is None:
+                    payload, facts, budget_stats['draft'] = build_report_context(
+                        base_payload, facts, DRAFT_PROMPT, ReportDraft, **budget_options)
+                current_payload = payload
+                if issues:
+                    current_payload, budget_stats['repair'] = repair_context(
+                        payload, previous, issues, DRAFT_PROMPT, ReportDraft, **budget_options)
+                draft = await self._draft(current_payload)
+                calls['draft'] = dict(getattr(self, '_last_call', {}))
                 previous = draft.model_dump()
                 draft, repairs = prepare_draft(draft, facts)
                 issues = validate_draft(draft, facts)
                 if not issues:
-                    issues = await self._review({**base_payload, 'facts': facts, 'report': render_report(draft, facts)})
+                    used = {key for section in draft.sections for key in section.factIds}
+                    # Facts are supplied once; the critic sees expanded prose and its
+                    # citations without a second copy of every rendered evidence sentence.
+                    report = {'sections': [{**section.model_dump(),
+                        'title': expand_values(section.title, facts),
+                        'analysis': expand_values(section.analysis, facts)} for section in draft.sections]}
+                    review_facts = [{**row, 'required': row['required'] or row['id'] in used} for row in facts]
+                    review_payload, _, budget_stats['review'] = build_report_context(
+                        {**base_payload, 'report': report}, review_facts, REVIEW_PROMPT, ReportReview,
+                        num_ctx=settings.ollama_num_ctx, num_predict=512)
+                    issues = await self._review(review_payload)
+                    calls['review'] = dict(getattr(self, '_last_call', {}))
                 attempts.append({'issues': issues, 'draft': draft.model_dump(), 'repairs': repairs,
-                                 'call': getattr(self, '_last_call', {})})
+                                 'call': getattr(self, '_last_call', {}), 'calls': calls, 'contextBudget': budget_stats})
                 if not issues:
                     reply = render_report(draft, facts)
                     table_text = render_artifacts_markdown(artifacts)
@@ -456,8 +508,10 @@ class EvidenceReporter:
             except Exception as exc:
                 detail = '; '.join(f"{err['loc']}: {err['msg']}" for err in exc.errors()) if isinstance(exc, ValidationError) else (str(exc) if isinstance(exc, ValueError) else '')
                 issues = ['报告生成失败：' + type(exc).__name__ + ' ' + detail[:500]]
-                attempts.append({'issues': issues, 'draft': previous, 'call': getattr(self, '_last_call', {})})
-        selected = [row['text'] for row in facts[:12]]
+                attempts.append({'issues': issues, 'draft': previous, 'call': getattr(self, '_last_call', {}),
+                                 'calls': calls, 'contextBudget': budget_stats})
+        selected = [row['text'] for row in all_facts if row['required']]
+        selected += [row['text'] for row in all_facts if not row['required']][:12]
         table_text = render_artifacts_markdown(artifacts)
         return ('以下是本次账本核算结果：\n\n' + '\n\n'.join(selected) + ('\n\n' + table_text if table_text else ''),
-                {'status': 'computed_fallback', 'facts': facts, 'attempts': attempts})
+                {'status': 'computed_fallback', 'facts': all_facts, 'attempts': attempts})

@@ -119,6 +119,45 @@ def _same_change(change, prior):
                for k, default in (("metric", None), ("source", ""), ("amount", None), ("percent", None), ("count", 1)))
 
 
+def named_percent_changes(question):
+    """Read a literal subject and percentage from a single directed change clause."""
+    result = []
+    for clause in CLAUSES.split(question):
+        if NEGATED.search(clause):
+            continue
+        # A condition may follow an introductory phrase ("未来三个月如果…").
+        clause = re.split(r"如果|假如|假设|假定|要是", clause)[-1].strip()
+        clause = re.sub(r"^(?:那么?|我的?|下个?月|未来\s*(?:" + NUMBER + r")\s*个月)+", "", clause)
+        match = re.match(
+            rf"(?P<subject>[\w·'‘’「」“”]{{1,100}}?)(?:预计|可能|将会|将|会|大概|大约)*\s*"
+            rf"(?P<verb>减少|降低|下降|缩减|少|减|增加|上涨|多)\s*"
+            rf"(?P<rate>一半|半|百分之{NUMBER}|{NUMBER}\s*[%％])", clause)
+        if not match:
+            continue
+        subject = match["subject"].strip("'‘’「」“”")
+        direction = re.search(r"(收入|支出)$", subject)
+        metric = {"收入": "income", "支出": "expense"}[direction[1]] if direction else None
+        source = (subject[:direction.start()] if direction else subject).rstrip("的").strip("'‘’「」“”")
+        if not source or re.fullmatch(r"(?:所有|全部|整体|总体|总|每月|每个月|这项|该项|这个来源|它)+", source):
+            continue
+        raw = match["rate"].replace("百分之", "").rstrip("%％").strip()
+        rate = 50 if "半" in raw else _number(raw)
+        if rate is not None:
+            percent = rate if match["verb"] in {"增加", "上涨", "多"} else -rate
+            result.append((source, metric, percent))
+    return result
+
+
+def explicit_month_delta(question):
+    matches = [(verb, _number(raw)) for clause in CLAUSES.split(question) if not NEGATED.search(clause)
+               for verb, raw in re.findall(rf"(推迟|延长|延后|提前|缩短)\s*({NUMBER})\s*个?月", clause)]
+    if len(matches) == 1:
+        verb, count = matches[0]
+        if count is not None and count == int(count) and 0 < count <= 599:
+            return int(count) * (-1 if verb in {"提前", "缩短"} else 1)
+    return None
+
+
 def _change_supported(change, question, prior):
     if any(_same_change(change, old) for old in prior.get("changes", [])):
         return True
@@ -138,6 +177,13 @@ def _change_supported(change, question, prior):
         # A following unit-rate clause can explain the user's stated number of lessons/visits.
         if i + 1 < len(clauses) and clauses[i+1].lstrip().startswith(("每", "按每")):
             context += "，" + clauses[i+1]
+        named = named_percent_changes(clause)
+        if named and change.amount is not None and not re.search(r"元|块|￥|¥", context):
+            continue
+        if named and change.percent is not None and not any(
+                (change.source == name or change.source == name + {"income": "收入", "expense": "支出"}[change.metric])
+                and metric in (None, change.metric) and change.percent == percent for name, metric, percent in named):
+            continue
         if change.source and change.source not in context:
             previous_sources = {c.get("source") for c in prior.get("changes", []) if c.get("metric") == change.metric}
             if previous_sources != {change.source} or not re.search(r"这项|该项|这个来源|它", context):
@@ -261,9 +307,29 @@ def _binding_issue(decision, plan, logical_ids, question, today, mode, previous)
             valid = targets or ({prior_target} if prior_target else defaults)
             if target not in valid:
                 return "unsupported_targetMonth"
-        if task.months is not None and task.months not in (durations or {prior.get("months")}):
+        delta = explicit_month_delta(question)
+        if task.monthsDelta is not None and (delta != task.monthsDelta or not prior.get("months")):
+            return "unsupported_monthsDelta"
+        horizons = ({prior["months"] + delta} if delta and prior.get("months")
+                    else durations or {prior.get("months")})
+        if task.tool in DECISION_TOOLS and task.months is not None and task.months not in horizons:
             return "unsupported_months"
     return None
+
+
+def _execution_tasks(tasks, plan, mode):
+    records = []
+    for task in tasks:
+        fields = task.model_dump(mode="json", exclude={"queryIds"})
+        for change in fields["changes"]:
+            change.pop("label", None)
+        if task.tool not in DECISION_TOOLS:
+            for ignored in ("months", "monthsDelta", "targetMonth"):
+                fields.pop(ignored, None)
+        # Query IDs may differ while resolving to identical authorized data.
+        fields["scope"] = sorted(map(str, _scope_for(task, plan, mode)))
+        records.append(json.dumps(fields, sort_keys=True))
+    return sorted(records)
 
 
 def _call_metadata(response):
@@ -297,6 +363,7 @@ class PlanReviewer:
         system = PROMPT + json.dumps(ANALYSIS_TOOLS, ensure_ascii=False) + "\nJSON schema：" + json.dumps(
             PlanReviewDecision.model_json_schema(), ensure_ascii=False, separators=(",", ":"))
         attempts = []
+        unresolved_conflict = False
         audit = {"status": "unavailable", "attempts": attempts}
         for attempt in range(2):
             started = perf_counter()
@@ -310,16 +377,26 @@ class PlanReviewer:
                 decision = _parse(response)
                 issue = _binding_issue(decision, plan, logical_ids, question, today, book_mode, previous)
                 if issue:
-                    return None, {**audit, "error": issue}
+                    return None, {**audit, "error": "inconsistent_adequacy" if unresolved_conflict else issue}
+                if decision.adequate and (decision.analysisWindow != plan.analysisWindow or
+                        _execution_tasks(decision.analyses, plan, book_mode) != _execution_tasks(plan.analyses, plan, book_mode)):
+                    unresolved_conflict = True
+                    call["error"] = "inconsistent_adequacy"
+                    if attempt:
+                        return None, {**audit, "error": "inconsistent_adequacy"}
+                    payload["corrections"] = ["adequate=true 与 analyses 或 analysisWindow 的实质修改矛盾。"
+                        "原计划足够时返回相同的执行条件；确实需要修改时置 adequate=false 并给出完整修正计划。"]
+                    continue
                 return decision, {**audit, "status": "reviewed", "decision": decision.model_dump(mode="json")}
             except ValidationError as exc:
                 call["error"] = "invalid_structure"
                 errors = exc.errors(include_input=False, include_context=False, include_url=False)
                 if attempt:
-                    return None, {**audit, "error": "invalid_structure"}
+                    return None, {**audit, "error": "inconsistent_adequacy" if unresolved_conflict else "invalid_structure"}
                 payload["corrections"] = [{"field": ".".join(map(str, e["loc"]))[:100], "type": e["type"][:60]}
                                           for e in errors[:5]]
             except Exception as exc:
-                return None, {**audit, "error": type(exc).__name__}
+                call["error"] = type(exc).__name__
+                return None, {**audit, "error": "inconsistent_adequacy" if unresolved_conflict else type(exc).__name__}
             finally:
                 call["durationMs"] = round((perf_counter() - started) * 1000)

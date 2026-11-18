@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from app.agent.evidence_report import EvidenceReporter, validate_draft, render_report, build_facts, prepare_draft
 from app.schemas.report import ReportDraft
@@ -15,6 +15,31 @@ class EvidenceReportTests(unittest.TestCase):
 
     def test_unknown_reference_rejected(self):
         self.assertTrue(validate_draft(self.draft(factIds=['fake']), self.facts))
+
+    def test_declared_inline_evidence_reference_is_restored_before_validation(self):
+        facts = [*self.facts, {'id': 'f2', 'required': False, 'text': '旧设备出售被剔除。'}]
+        draft = self.draft(analysis='设备出售不属于持续入账（f2），需要核对后续来源安排。')
+        prepared, repairs = prepare_draft(draft, facts)
+        self.assertEqual(prepared.sections[0].factIds, ['f1', 'f2'])
+        self.assertNotIn('(f2)', prepared.sections[0].analysis)
+        self.assertNotIn('（f2）', prepared.sections[0].analysis)
+        self.assertIn('f2', repairs['restoredReferences'])
+
+    def test_forecast_child_evidence_supports_the_shared_target_date(self):
+        from datetime import date
+        from app.tools.financial_analysis import run_analysis
+        from tests.test_decision_analysis import ledger
+        evidence = run_analysis('forecast', ledger(), as_of=date(2026, 11, 19), metric='income', target_month='2027-01')
+        facts = build_facts([{'tool': 'forecast', 'evidence': evidence}])
+        child = next(row for row in facts if '条件估计' in row['text'] and not row['required'])
+        draft = self.draft(title='2027-01 分项收入', factIds=[child['id']], analysis='先确认这些来源后续是否继续。')
+        self.assertFalse([issue for issue in validate_draft(draft, facts) if '日期' in issue])
+
+    def test_supplemental_investigation_does_not_add_mandatory_answer_objectives(self):
+        facts = build_facts([{'tool': 'purchase', 'supplemental': True, 'evidence': {
+            'sufficientData': False, 'missingInputs': ['startingBalance']}}])
+        self.assertTrue(facts)
+        self.assertTrue(all(not row['required'] for row in facts))
 
     def test_model_arithmetic_rejected_including_chinese_money(self):
         for prose in ('你还可支撑1.5个月。', '可存三千元。'):
@@ -111,6 +136,38 @@ class EvidenceReportTests(unittest.TestCase):
 
 
 class EvidenceReviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_completeness_review_receives_uncited_available_evidence(self):
+        reporter = EvidenceReporter()
+        reporter._draft = AsyncMock(return_value=ReportDraft.model_validate({'sections': [
+            {'title': '固定开销', 'factIds': ['f1'], 'analysis': '请确认后续安排。'}]}))
+        reporter._review = AsyncMock(return_value=[])
+        rows = [{'source': name, 'activeMonths': 2, 'transactions': 2, 'typicalAmount': 100}
+                for name in ('租房开支', '交通定期充值')]
+        await reporter.answer('列出重复支出', {}, [{'tool': 'recurring', 'evidence': {'expense': rows}}])
+        self.assertEqual(len(reporter._review.call_args.args[0]['facts']), 2)
+        self.assertIn('交通定期充值', str(reporter._review.call_args.args[0]))
+
+    async def test_fallback_preserves_every_required_fact(self):
+        reporter = EvidenceReporter()
+        reporter._draft = AsyncMock(side_effect=TimeoutError)
+        reporter._review = AsyncMock(return_value=[])
+        facts = [{'id': f'f{i}', 'text': f'必要条件甲{"乙" * i}。', 'required': True} for i in range(1, 14)]
+        with patch('app.agent.evidence_report.build_facts', return_value=facts):
+            reply, result = await reporter.answer('逐项核查必要条件', {}, [])
+        self.assertEqual(result['status'], 'computed_fallback')
+        self.assertIn(facts[-1]['text'], reply)
+
+    async def test_other_scope_forecast_does_not_hide_explicit_recurring_expenses(self):
+        from tests.test_analysis_artifacts import forecast_result
+        reporter = EvidenceReporter()
+        reporter._draft = AsyncMock(side_effect=TimeoutError)
+        rows = [{'source': '租房开支', 'activeMonths': 2, 'transactions': 2, 'typicalAmount': 100}]
+        forecast = forecast_result()
+        forecast['mode'] = '家庭版'
+        _, result = await reporter.answer('个人固定开销和家庭收入预测', {}, [forecast,
+            {'tool': 'recurring', 'mode': '个人版', 'metric': 'expense', 'evidence': {'expense': rows}}])
+        self.assertIn('租房开支', str(result['facts']))
+
     async def test_numeric_restatement_repaired_before_qualitative_review(self):
         reporter = EvidenceReporter.__new__(EvidenceReporter)
         draft = ReportDraft.model_validate({'sections': [{'title': '购买影响', 'factIds': ['f1'],

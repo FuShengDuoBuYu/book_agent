@@ -81,7 +81,7 @@ python -m scripts.evaluate_intent --case forecast_followups --output intent-resu
 
 `evaluate_acceptance` 覆盖八类分析问题、四轮连续追问及四个输入变体，共十六次回答；`--case variants` 可单独执行来源比例、购买储备、目标期限与全部停薪变体。合成样本的标准值和实际验收记录见 [分析质量回归](docs/analysis-quality-evaluation.md)。
 
-原生 Ollama 规划使用 `AgentPlan` JSON Schema。`OLLAMA_NUM_CTX` 控制上下文长度，`PLANNER_NUM_PREDICT` 控制计划输出上限，`LLM_REASONING=true` 开启回答阶段推理；规划阶段关闭推理。按机器能力设置 `PLANNER_TIMEOUT_SECONDS` 和 `REQUEST_TIMEOUT_SECONDS`，并用上述回归验证后再发布。
+原生 Ollama 规划使用 `AgentPlan` JSON Schema。`LLM_PLANNING_REASONING=true` 默认让规划、计划核对和证据调查使用模型推理，`PLANNER_NUM_PREDICT=4096` 为推理和结构化计划留出输出空间；隐藏推理不展示给用户。`OLLAMA_NUM_CTX` 控制上下文长度。报告写作与校对关闭推理，并分别限制输出与输入预算，避免长历史或重复证据挤掉用户目标。按机器能力设置 `PLANNER_TIMEOUT_SECONDS` 和 `REQUEST_TIMEOUT_SECONDS`，并用上述回归验证后再发布。
 
 复杂分析的结构化报告和审查使用零温度、关闭推理；普通聊天仍使用聊天配置。原生 Ollama 默认请求 8K 上下文，`OLLAMA_KEEP_ALIVE=60s` 表示请求完成后空闲一分钟释放模型。共享显卡时可设置 `OLLAMA_NUM_GPU` 限制 GPU 执行的层数，其他层由 CPU 执行；应实测显存余量和延迟，不把该值当作显存容量。对话元数据同时记录上下文、GPU 层数及驻留配置。
 

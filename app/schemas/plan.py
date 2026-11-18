@@ -107,6 +107,8 @@ class ScenarioChange(BaseModel):
 
 class AnalysisRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', json_schema_extra={'required': ['tool', 'queryIds', 'metric', 'targetMonth']})
+    _supplemental: bool = PrivateAttr(default=False)
+
     @model_validator(mode="before")
     @classmethod
     def omit_unused_metric(cls, value):

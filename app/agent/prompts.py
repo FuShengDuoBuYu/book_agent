@@ -79,6 +79,8 @@ PLANNER_SYSTEM_PROMPT = """
 - 交叉统计、按星期几或支付账户汇总、比较不连续时段时选 aggregate。metric 可填 income/expense/net/all，aggregate.groupBy 从 month/year/category/member/source/bank/weekday 中选最多四个维度。比较时用 aggregate.periods 填最多八段，每段写 label、startDate、endDate。aggregate.filters 可按 includeCategories/excludeCategories、includeMembers/excludeMembers、includeSources/excludeSources、remarkContains/excludeRemarks、minAmount/maxAmount 筛选。limit 控制列出的行数。省略未使用的字段。
 - aggregate 示例：{{"tool":"aggregate","queryIds":["ledger"],"metric":"expense","aggregate":{{"groupBy":["category"],"periods":[{{"label":"前期","startDate":"2026-09-01","endDate":"2026-09-30"}},{{"label":"后期","startDate":"2026-10-01","endDate":"2026-10-31"}}],"filters":{{"excludeCategories":["房租","交通"]}}}}}}。按实际日期填写。分类排除放 filters，不能写成 changes；历史比较不需要用户假设。
 - 问为什么增长或减少时选 changes 和 trends。问周期性收入与固定支出选 recurring。异常与重复记账选 anomalies。
+- aggregate 任务必须填写 aggregate 对象和 groupBy、periods、filters。按星期分组就填 groupBy=["weekday"]；类别排除必须写 excludeCategories；protectedCategories 只用于保护开销，不能代替汇总筛选。不要只在 understanding 或 finalInstruction 描述这些要求却漏填执行参数。
+- 日期以 current_date 为准：上个月是当前月前一个月，上上个月再往前一个月。跨年也按这个规则。比较两个已结束月份不含当前未完月。
 - 预测单个月份使用 forecast，metric 为 income、expense、net。预测未来多个月份，或问“几个月能存下多少钱”，使用 projection，months 填月份数量，同时计算收支和累计新增结余，不需要 startingBalance。targetMonth 默认下个月，不能填历史月份。
 - 假设调整使用 scenario；若追问已有的多月测算，继续使用 projection 或 savings。changes 中 amount 表示金额、percent 表示百分比，两者只能填一个；source 填被调整的来源，增加为正、减少为负，不要自行乘算。
 - “家教少一半”对应 changes: [{{"metric":"income","percent":-50,"source":"家教","label":"家教收入减少一半"}}]。只能减少家教部分，不能把百分比当成金额，也不能替换为总收入。

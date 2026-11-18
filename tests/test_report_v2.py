@@ -19,7 +19,7 @@ class ReportContractTests(unittest.TestCase):
     def test_remark_numbers_cannot_be_promoted_to_income_values(self):
         facts = [{'id': 'f1', 'text': '收入 100 元，票据编号 777。', 'required': True,
                   'values': [{'label': '收入', 'value': 100, 'unit': '元'}]}]
-        from app.agent.evidence_report import value_catalog
+        from app.agent.report_values import value_catalog
         self.assertFalse(any('777' in row['display'] for row in value_catalog(facts)))
 
     def test_value_reference_requires_its_own_fact_and_its_own_unit(self):

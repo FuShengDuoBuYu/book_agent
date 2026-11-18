@@ -17,6 +17,21 @@ def planner_schema():
         'toolCalls', 'analyses', 'analysisWindow', 'finalInstruction', 'followUpOfPreviousQuestion']
     schema['$defs']['ToolCall']['properties']['toolName']['enum'] = list(PLANNER_TOOL_BY_NAME)
     schema['$defs']['IntentUnderstanding']['required'] = list(schema['$defs']['IntentUnderstanding']['properties'])
+    return _execution_schema(schema)
+
+
+def _execution_schema(schema):
+    """Native generation must fill execution fields, rather than rely on API defaults."""
+    definitions = schema.get('$defs', {})
+    for name, fields in {
+        'AnalysisRequest': ['aggregate', 'changes', 'months'],
+        'AggregateSpec': ['groupBy', 'periods', 'filters', 'limit'],
+        'AggregateFilters': None,
+    }.items():
+        if name in definitions:
+            definition = definitions[name]
+            definition['required'] = list(dict.fromkeys([
+                *definition.get('required', []), *(fields or definition['properties'])]))
     return schema
 
 
@@ -37,18 +52,27 @@ def get_planner_model() -> Runnable:
 
 
 @lru_cache
-def get_structured_model(schema: type) -> Runnable:
+def get_structured_model(schema: type, *, reasoning: bool | None = None, num_predict: int | None = None) -> Runnable:
     settings = get_settings()
     if settings.llm_provider == "ollama":
-        return _ollama(settings, planner=True).bind(format=schema.model_json_schema())
-    return _compatible(settings, planner=True).bind(response_format={"type": "json_object"})
+        model = _ollama(settings, planner=True)
+        options = {}
+        if reasoning is not None:
+            options['reasoning'] = reasoning
+        if num_predict is not None:
+            options['num_predict'] = num_predict
+        return model.model_copy(update=options).bind(format=_execution_schema(schema.model_json_schema()))
+    model = _compatible(settings, planner=True)
+    if num_predict is not None:
+        model = model.model_copy(update={'max_tokens': num_predict})
+    return model.bind(response_format={"type": "json_object"})
 
 
 def _ollama(settings: Settings, planner: bool = False) -> ChatOllama:
     return ChatOllama(
         model=settings.llm_model,
         base_url=settings.llm_base_url,
-        reasoning=False if planner else settings.llm_reasoning,
+        reasoning=settings.planner_reasoning if planner else settings.llm_reasoning,
         temperature=0 if planner else settings.llm_temperature,
         num_ctx=settings.ollama_num_ctx,
         keep_alive=settings.ollama_keep_alive,

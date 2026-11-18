@@ -27,7 +27,9 @@ def collect_analysis_results(plan, datasets, today):
     for scope, queries in datasets.items():
         tasks = list(plan.analyses)
         if not any(task.tool == 'sources' for task in tasks):
-            tasks.append(AnalysisRequest(tool='sources'))
+            catalog = AnalysisRequest(tool='sources')
+            catalog._supplemental = True
+            tasks.append(catalog)
         for task in tasks:
             bound = [(call, rows) for call, rows in queries
                      if not task.queryIds or set(task.queryIds) & set(call.sourceIds or [call.id])]
@@ -35,7 +37,7 @@ def collect_analysis_results(plan, datasets, today):
                 continue
             filters = {(call.args.cost_type, call.args.remark) for call, _ in bound}
             if len(filters) > 1 and not task.queryIds:
-                analysis_results.append({"mode": scope, "tool": task.tool, "evidence": {
+                analysis_results.append({"mode": scope, "tool": task.tool, "supplemental": task._supplemental, "evidence": {
                     "sufficientData": False, "reason": "该分析尚未明确关联哪个分类或备注范围，需要确认查询范围。"}})
                 continue
             records = merge_orders([rows for _, rows in bound])
@@ -63,6 +65,7 @@ def collect_analysis_results(plan, datasets, today):
                 window_end=window.endDate if window else None,
             )
             analysis_results.append({"mode": scope, "tool": task.tool, "queryIds": task.queryIds,
+                                     "supplemental": task._supplemental, "metric": task.metric,
                                      "filters": [{"category": category, "remark": remark} for category, remark in sorted(filters)],
                                      "evidence": result})
 

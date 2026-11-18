@@ -5,6 +5,29 @@ from app.schemas.plan import AgentPlan
 
 
 class InvestigationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_source_selectors_resolve_observations_and_groups_or_skip_the_entire_task(self):
+        from app.agent.investigation import EvidenceInvestigator, InvestigationDecision
+        plan = AgentPlan.model_validate({'toolCalls': [{'id': 'ledger', 'toolName': 'search_personal_orders'}],
+            'sourceGroups': [{'label': '原计划项目', 'sourceKeys': ['observed_c']}]})
+        sources = [{'sourceKey': f'observed_{key}', 'source': label, 'amount': amount, 'metric': 'income'}
+                   for key, label, amount in [('a', '稿酬', 100), ('b', '奖金', 50), ('c', '实习', 35)]]
+        filters = [
+            {'includeSources': ['k1', '稿酬', '课程合计', '原计划项目'], 'excludeSources': ['k2']},
+            {'includeSources': ['k1', 'k99']}, {'excludeSources': ['凭空编的']},
+            {'includeSources': ['observed_c']}]
+        investigator = EvidenceInvestigator()
+        investigator._invoke = AsyncMock(return_value=InvestigationDecision.model_validate({
+            'sourceGroups': [{'label': '课程合计', 'sourceKeys': ['k1']}],
+            'additionalAnalyses': [{'tool': 'aggregate', 'queryIds': ['ledger'],
+                'aggregate': {'filters': selectors}} for selectors in filters]}))
+        decision, audit = await investigator.refine('按来源核对', '', plan, [{'mode': '个人版', 'sources': sources}])
+        accepted = [task.aggregate.filters for task in decision.additionalAnalyses]
+        self.assertEqual(len(accepted), 2)
+        self.assertEqual(accepted[0].includeSources, ['observed_a', '稿酬', '课程合计', '原计划项目'])
+        self.assertEqual(accepted[0].excludeSources, ['observed_b'])
+        self.assertEqual(accepted[1].includeSources, ['observed_c'])
+        self.assertEqual(len(audit['issues']), 2)
+
     async def test_aggregate_dates_are_json_safe_in_model_payload_and_saved_audit(self):
         import json
         from app.agent.investigation import EvidenceInvestigator, InvestigationDecision
@@ -17,6 +40,22 @@ class InvestigationTests(unittest.IsolatedAsyncioTestCase):
         _, audit = await investigator.refine('按月比较', '', plan, [])
         json.dumps(investigator._invoke.await_args.args[0])
         self.assertIn('2026-10-01', json.dumps(audit))
+
+    async def test_source_in_family_catalog_cannot_be_used_as_a_personal_query_selector(self):
+        from app.agent.investigation import EvidenceInvestigator, InvestigationDecision
+        investigator = EvidenceInvestigator()
+        analyst = {'tool': 'aggregate', 'aggregate': {'filters': {'excludeSources': ['k2']}}}
+        investigator._invoke = AsyncMock(return_value=InvestigationDecision.model_validate({
+            'additionalAnalyses': [{**analyst, 'queryIds': [key]} for key in ('mine', 'family')]}))
+        plan = AgentPlan.model_validate({'toolCalls': [{'id': 'mine', 'toolName': 'search_personal_orders'},
+                                                      {'id': 'family', 'toolName': 'search_family_orders'}]})
+        catalogs = [{'mode': mode, 'sources': [{'source': name, 'sourceKey': key, 'amount': 50, 'metric': 'income'}]}
+                    for mode, name, key in [('个人版', '稿费', 'observed_a'), ('家庭版', '项目', 'observed_b')]]
+        decision, audit = await investigator.refine('核对个人和家庭来源', '', plan, catalogs)
+        self.assertEqual([task.queryIds for task in decision.additionalAnalyses], [['family']])
+        self.assertEqual(decision.additionalAnalyses[0].aggregate.filters.excludeSources, ['observed_b'])
+        self.assertEqual(len(audit['issues']), 1)
+
     async def test_invalid_model_structure_is_repaired_once_using_the_same_evidence(self):
         from app.agent.investigation import EvidenceInvestigator, InvestigationDecision
         investigator = EvidenceInvestigator()

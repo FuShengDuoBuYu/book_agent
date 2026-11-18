@@ -10,12 +10,50 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.config import get_settings
 from app.core.llm import get_structured_model
-from app.schemas.plan import AnalysisRequest, SourceGroup
+from app.schemas.plan import SourceGroup
 from app.tools.aggregate_analysis import AggregateSpec
+from app.tools.registry import PLANNER_TOOL_BY_NAME
 from app.tools.source_analysis import validate_source_groups
 
 
 READ_ONLY_ANALYSES = {'aggregate', 'sources', 'cashflow', 'trends', 'changes', 'recurring', 'anomalies', 'income_stability', 'data_quality'}
+
+
+def merged_source_groups(existing, new):
+    replaced = {key for group in new for key in group.sourceKeys}
+    kept = []
+    for group in existing:
+        remaining = [key for key in group.sourceKeys if key not in replaced]
+        if remaining:
+            kept.append(SourceGroup(label=group.label, sourceKeys=remaining))
+    return (kept + new)[:30]
+
+
+def _resolve_source_filters(task, mapping, catalogs, calls, groups):
+    filters = task.aggregate.filters
+    if not (filters.includeSources or filters.excludeSources):
+        return
+    modes = {PLANNER_TOOL_BY_NAME[call.toolName][0] for call in calls
+             if not task.queryIds or set(task.queryIds).intersection(call.sourceIds or [call.id])}
+    observations = {row['sourceKey']: row['source'] for catalog in catalogs if catalog.get('mode') in modes
+                    for row in catalog.get('sources', [])}
+    labels = set(observations.values())
+    labels.update(group.label for group in groups if observations.keys() & set(group.sourceKeys))
+
+    def resolve(selectors):
+        normalized = []
+        for selector in selectors:
+            if re.fullmatch(r'k[0-9]+', selector):
+                selector = mapping.get(selector)
+                if selector not in observations:
+                    raise ValueError('补查的来源短键不属于所选查询，已忽略此项补查')
+            elif selector not in labels and selector not in observations:
+                raise ValueError('补查来源未在所选目录或有效归组中找到，已忽略此项补查')
+            if selector not in normalized:
+                normalized.append(selector)
+        return normalized
+
+    filters.includeSources, filters.excludeSources = resolve(filters.includeSources), resolve(filters.excludeSources)
 
 
 class InvestigationAnalysis(BaseModel):
@@ -46,6 +84,8 @@ observations 每一行是归集后的来源，不是一笔账单；recordCount �
 PROMPT += '''\n输出形状示例：{"answerFocus":"解释同一项目合并后的来源贡献和依据，不在本阶段计算金额", "sourceGroups":[{"label":"同一课程项目", "sourceKeys":["k1","k2"]}], "additionalAnalyses":[], "informationGaps":[]}。
 sourceGroups 必须是对象数组，不是键值字典。只做来源归类和补查计划，绝不自行算金额。'''
 
+PROMPT += '''\nsourceGroups 归并的是同一工作或项目的不同备注，不是按成员、方向、日期或类别做总计。同一个人的工资、另一个项目和设备出售仍是独立来源；禁止把它们合成“某人的收入来源”。若用户要求按成员分清已有来源，保留每人之下的独立来源，不要把目录压成每人一行。没有共同业务依据的备注不合并。'''
+
 
 class EvidenceInvestigator:
     async def _invoke(self, payload):
@@ -69,7 +109,7 @@ class EvidenceInvestigator:
             for row in catalog.get('sources', [])[:40]:
                 key = f'k{len(mapping) + 1}'
                 mapping[key] = row['sourceKey']
-                rows.append({'key': key, 'source': row['source'][:100], 'member': row.get('member', '归属未知'),
+                rows.append({'key': key, 'source': row['source'][:120], 'member': row.get('member', '归属未知'),
                              'metric': row['metric'], 'category': row.get('category'),
                              'recordCount': row.get('recordCount'), 'months': list(row.get('monthlyAmounts', {}))[-6:],
                              'amount': row['amount'], 'remarks': [str(v)[:100] for v in row.get('remarks', [])[:2]]})
@@ -118,14 +158,21 @@ class EvidenceInvestigator:
                 issues.append('来源归组重复或无效，保留原始来源')
                 decision.sourceGroups = []
             known_ids = {key for call in plan.toolCalls for key in (call.sourceIds or [call.id])}
+            applied_groups = merged_source_groups(plan.sourceGroups, decision.sourceGroups)
             safe = []
             for task in decision.additionalAnalyses:
                 if task.tool not in READ_ONLY_ANALYSES or set(task.queryIds) - known_ids:
                     issues.append('补查任务超出已授权查询或只读分析范围，已忽略')
                     continue
+                if task.tool == 'aggregate' and task.aggregate:
+                    try:
+                        _resolve_source_filters(task, mapping, catalogs, plan.toolCalls, applied_groups)
+                    except ValueError as exc:
+                        issues.append(str(exc))
+                        continue
                 if any(old.tool == task.tool and old.queryIds == task.queryIds
                        and (task.tool != 'aggregate' or (old.metric == task.metric and old.aggregate == task.aggregate))
-                       for old in plan.analyses):
+                       for old in [*plan.analyses, *safe]):
                     continue
                 safe.append(task)
             decision.additionalAnalyses = safe

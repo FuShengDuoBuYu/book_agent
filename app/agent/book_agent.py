@@ -14,14 +14,14 @@ from app.agent.planner import QueryPlanner
 from app.agent.analysis_context import latest_context, logical_queries
 from app.agent.evidence_report import EvidenceReporter
 from app.agent.artifacts import build_artifacts
-from app.agent.investigation import EvidenceInvestigator
+from app.agent.investigation import EvidenceInvestigator, merged_source_groups
 from app.agent.progress import with_progress
 from app.agent.prompts import BOOK_AGENT_ANALYSIS_PROMPT, BOOK_AGENT_SYSTEM_PROMPT
 from app.clients.bookkeeping_api import BookkeepingApiClient
 from app.core.llm import get_chat_model
 from app.core.config import get_settings
 from app.memory.store import MongoMemoryStore, conversation_scope
-from app.schemas.plan import AgentPlan, AnalysisRequest, SourceGroup, ToolCall
+from app.schemas.plan import AgentPlan, AnalysisRequest, ToolCall
 from app.tools.order_calculations import (
     calculate_category_breakdown,
     calculate_order_summary,
@@ -297,13 +297,14 @@ class BookAgent:
         if not reply or not session_id:
             return
         settings = get_settings()
-        active = [task.model_dump(mode='json', exclude_none=True) for task in plan.analyses if task.tool != 'sources']
+        primary = [task.model_dump(mode='json', exclude_none=True) for task in plan.analyses if not task._supplemental]
+        active = [task for task in primary if task['tool'] != 'sources']
         if active:
             plan._analysis_context['activeAnalyses'] = active
             plan._analysis_context['activeHistoryWindow'] = plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None
         plan._analysis_context['conversation'] = {
             'objective': plan.understanding.objective,
-            'analyses': [task.model_dump(mode='json', exclude_none=True) for task in plan.analyses],
+            'analyses': primary,
             'queries': logical_queries(plan),
             'analysisWindow': plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None,
             'output': plan.output.model_dump(),
@@ -323,6 +324,7 @@ class BookAgent:
                       "planningIssues": plan._planning_issues,
                       "model": {"provider": settings.llm_provider, "name": settings.llm_model,
                                 "reasoning": settings.llm_reasoning,
+                                "planningReasoning": settings.planner_reasoning,
                                 "reasoningEffort": settings.llm_reasoning_effort,
                                 "contextLength": settings.ollama_num_ctx,
                                 "gpuLayers": settings.ollama_num_gpu,
@@ -411,12 +413,11 @@ class BookAgent:
             if question and getattr(self, 'investigator', None):
                 decision, plan._investigation = await self.investigator.refine(question, history, plan, catalogs, results=initial_results)
                 if decision.sourceGroups:
-                    replaced = {key for group in decision.sourceGroups for key in group.sourceKeys}
-                    kept = [SourceGroup(label=group.label, sourceKeys=[key for key in group.sourceKeys if key not in replaced])
-                            for group in plan.sourceGroups if any(key not in replaced for key in group.sourceKeys)]
-                    plan.sourceGroups = (kept + decision.sourceGroups)[:30]
-                plan.analyses.extend(AnalysisRequest.model_validate(task.model_dump())
-                    for task in decision.additionalAnalyses[:max(0, 12 - len(plan.analyses))])
+                    plan.sourceGroups = merged_source_groups(plan.sourceGroups, decision.sourceGroups)
+                for task in decision.additionalAnalyses[:max(0, 12 - len(plan.analyses))]:
+                    supplemental = AnalysisRequest.model_validate(task.model_dump())
+                    supplemental._supplemental = True
+                    plan.analyses.append(supplemental)
                 # Reflection selects tools and source identities only. Its free-text
                 # guesses must never become authoritative amounts or instructions.
             analysis_results = collect_analysis_results(plan, datasets, today)
