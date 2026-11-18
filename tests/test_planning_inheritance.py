@@ -17,6 +17,58 @@ class PlanningInheritanceTests(unittest.IsolatedAsyncioTestCase):
             clock.now.return_value = datetime(2026, 11, 19)
             return await planner.create_plan(message, '', '个人版', previous)
 
+    async def test_semantic_review_corrects_tools_and_target_before_date_expansion(self):
+        from app.agent.plan_review import PlanReviewDecision
+        planner = QueryPlanner.__new__(QueryPlanner)
+        draft = {'understanding': {'objective': '预测2027年1月收入'},
+            'analyses': [{'tool': 'trends'}],
+            'analysisWindow': {'startDate': '2026-11-01', 'endDate': '2026-11-19'}}
+        planner.chain = SimpleNamespace(ainvoke=AsyncMock(return_value=SimpleNamespace(content=json.dumps(draft))))
+        decision = PlanReviewDecision.model_validate({'adequate': False, 'issues': ['趋势工具不能预测未来'],
+            'analyses': [{'tool': 'forecast', 'targetMonth': '2027-01'}],
+            'analysisWindow': None, 'answerInstruction': '解释目标月的条件估计和来源。'})
+        planner.reviewer = SimpleNamespace(review=AsyncMock(return_value=(decision, {'status': 'reviewed'})))
+        with patch('app.agent.planner.datetime', wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 11, 19)
+            plan = await planner.create_plan('预计2027年1月收入', '', '个人版', {})
+        self.assertEqual([t.targetMonth for t in plan.analyses if t.tool == 'forecast'], ['2027-01'])
+        self.assertIsNone(plan.analysisWindow)
+        self.assertEqual([q.args.month for q in plan.toolCalls], [5, 6, 7, 8, 9, 10, 11])
+        self.assertEqual(plan._semantic_review['status'], 'reviewed')
+
+    async def test_adequate_review_preserves_correct_native_and_composite_plans(self):
+        from app.agent.plan_review import PlanReviewDecision
+        for native in (True, False):
+            draft = ({'analysisType': 'highest_expense', 'toolCalls': [{'toolName': 'search_personal_orders',
+                'args': {'year': 2026, 'month': 11, 'day': 18}}]} if native else {
+                'analyses': [{'tool': 'forecast', 'targetMonth': '2027-01'}, {'tool': 'sources'}]})
+            planner = QueryPlanner.__new__(QueryPlanner)
+            planner.chain = SimpleNamespace(ainvoke=AsyncMock(return_value=SimpleNamespace(content=json.dumps(draft))))
+            decision = PlanReviewDecision.model_validate({'adequate': True, 'issues': [],
+                'analyses': [{'tool': 'cashflow' if native else 'sources'}],
+                'analysisWindow': None, 'answerInstruction': '原计划已足够'})
+            planner.reviewer = SimpleNamespace(review=AsyncMock(return_value=(decision, {'status': 'reviewed'})))
+            with patch('app.agent.planner.datetime', wraps=datetime) as clock:
+                clock.now.return_value = datetime(2026, 11, 19)
+                plan = await planner.create_plan('昨天最大一笔消费' if native else '预计2027年1月收入及来源', '', '个人版', {})
+            if native:
+                self.assertEqual(len(plan.toolCalls), 1)
+                self.assertEqual(plan.toolCalls[0].args.day, 18)
+                self.assertEqual(plan.analyses, [])
+            else:
+                self.assertIn('forecast', [task.tool for task in plan.analyses])
+
+    async def test_unproven_balance_does_not_execute_or_persist_when_review_unavailable(self):
+        planner = QueryPlanner.__new__(QueryPlanner)
+        draft = {'analyses': [{'tool': 'purchase', 'purchaseAmount': 700, 'startingBalance': 9999}]}
+        planner.chain = SimpleNamespace(ainvoke=AsyncMock(return_value=SimpleNamespace(content=json.dumps(draft))))
+        planner.reviewer = SimpleNamespace(review=AsyncMock(return_value=(None, {'status': 'unavailable', 'error': 'TimeoutError'})))
+        with patch('app.agent.planner.datetime', wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 11, 19)
+            plan = await planner.create_plan('我没有提供余额，能花700元买扫描仪吗？', '', '个人版', {})
+        self.assertIsNone(plan.analyses[0].startingBalance)
+        self.assertIsNone(plan._analysis_context.get('startingBalance'))
+
     async def test_direction_aliases_are_canonical_before_context_resolution(self):
         first = await self.planned({'toolCalls': [{'id': 'ledger', 'toolName': 'search_personal_orders',
             'args': {'cost_type': 'income'}}], 'analyses': [{'tool': 'forecast', 'targetMonth': '2027-01'}]}, {}, '预测明年一月收入')

@@ -106,7 +106,7 @@ class ScenarioChange(BaseModel):
 
 
 class AnalysisRequest(BaseModel):
-    model_config = ConfigDict(extra='forbid')
+    model_config = ConfigDict(extra='forbid', json_schema_extra={'required': ['tool', 'queryIds', 'metric', 'targetMonth']})
     @model_validator(mode="before")
     @classmethod
     def omit_unused_metric(cls, value):
@@ -123,7 +123,7 @@ class AnalysisRequest(BaseModel):
             value = {key: item for key, item in value.items() if key != 'changes'}
         return value
 
-    tool: str
+    tool: str = Field(json_schema_extra={'enum': list(ANALYSIS_TOOLS)})
     queryIds: list[str] = Field(default_factory=list, max_length=24)
     metric: Literal["income", "expense", "net", "all"] = "income"
     aggregate: AggregateSpec | None = Field(default=None,
@@ -219,6 +219,7 @@ class AgentPlan(BaseModel):
     _analysis_context: dict = PrivateAttr(default_factory=dict)
     _planning_issues: list = PrivateAttr(default_factory=list)
     _investigation: dict = PrivateAttr(default_factory=dict)
+    _semantic_review: dict = PrivateAttr(default_factory=dict)
     resetAnalysisContext: bool = False
 
     @model_validator(mode="before")

@@ -318,6 +318,7 @@ class BookAgent:
                       "analysisVersion": 4, "durationMs": duration_ms,
                       "artifacts": artifacts or [], "understanding": plan.understanding.model_dump(),
                       "investigation": plan._investigation,
+                      "planningReview": plan._semantic_review,
                       "analysisContext": plan._analysis_context, "validation": validation or {},
                       "planningIssues": plan._planning_issues,
                       "model": {"provider": settings.llm_provider, "name": settings.llm_model,

@@ -12,6 +12,16 @@ from app.core.llm import get_chat_model, get_planner_model
 
 
 class ModelConfigurationTests(unittest.IsolatedAsyncioTestCase):
+    def test_native_planner_schema_requires_execution_not_only_an_intent_description(self):
+        from app.tools.financial_analysis import ANALYSIS_TOOLS
+        from app.tools.registry import PLANNER_TOOL_BY_NAME
+        with patch.dict(os.environ, {'LLM_PROVIDER': 'ollama'}, clear=True):
+            schema = get_planner_model().format
+        self.assertTrue({'understanding', 'analyses', 'toolCalls', 'analysisWindow', 'finalInstruction'} <= set(schema.get('required', [])))
+        analysis = schema['$defs']['AnalysisRequest']
+        self.assertEqual(set(analysis['properties']['tool']['enum']), set(ANALYSIS_TOOLS))
+        self.assertTrue({'tool', 'queryIds', 'metric', 'targetMonth'} <= set(analysis['required']))
+        self.assertEqual(set(schema['$defs']['ToolCall']['properties']['toolName']['enum']), set(PLANNER_TOOL_BY_NAME))
     def setUp(self):
         for factory in (get_settings, get_chat_model, get_planner_model):
             factory.cache_clear()

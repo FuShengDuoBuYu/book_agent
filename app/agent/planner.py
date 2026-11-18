@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+from copy import deepcopy
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -12,6 +13,7 @@ from app.core.config import get_settings
 from app.core.llm import get_planner_model
 from app.agent.analysis_context import resolve_context
 from app.agent.plan_parsing import repair_descriptive_arrays
+from app.agent.plan_review import PlanReviewer, sanitize_user_conditions
 from app.agent.prompts import PLANNER_HUMAN_PROMPT, PLANNER_SYSTEM_PROMPT
 from app.schemas.plan import (
     AgentPlan,
@@ -102,6 +104,7 @@ class QueryPlanner:
             analysis_tools_text="\n".join(f"- {name}: {description}" for name, description in ANALYSIS_TOOLS.items()),
         )
         self.chain = self.prompt | get_planner_model()
+        self.reviewer = PlanReviewer()
 
     @traceable(name="query_planner", run_type="chain")
     async def create_plan(
@@ -109,7 +112,7 @@ class QueryPlanner:
     ) -> AgentPlan:
         # 这里的核心任务是：拿到 LLM 输出后，尽量把它收敛成一个可执行的 AgentPlan。
         now = datetime.now(ZoneInfo("Asia/Shanghai"))
-        previous_context = dict(previous_context or {})
+        previous_context = deepcopy(previous_context or {})
         if previous_context.get('scope'):
             previous_context['scope'] = [list(row) for row in sorted({
                 (tool, self._normalize_cost_type(category), remark or '')
@@ -140,6 +143,16 @@ class QueryPlanner:
                 plan = AgentPlan.model_validate(data)
                 self._normalize_query_scopes(plan)
                 self._materialize_requirements(plan)
+                self._sanitize_conditions(plan, message, book_mode, previous_context)
+                if (plan.intent == 'analyze_orders' and (plan.analyses or plan.analysisType == 'financial_analysis')
+                        and getattr(self, 'reviewer', None)):
+                    decision, plan._semantic_review = await self.reviewer.review(
+                        message, history, plan, now.date(), self._normalize_mode(book_mode), previous_context)
+                    plan._semantic_review['adopted'] = bool(decision is not None and not decision.adequate)
+                    if decision is not None and not decision.adequate:
+                        plan.analyses = decision.analyses
+                        plan.analysisWindow = decision.analysisWindow
+                        plan.finalInstruction = decision.answerInstruction
                 requested_window = explicit_complete_month_window(message, now.date())
                 if requested_window and requested_window != plan.analysisWindow:
                     plan.analysisWindow = requested_window
@@ -148,8 +161,10 @@ class QueryPlanner:
                 self._preserve_referent_window(plan, previous_context or {}, message, now)
                 context = self._inherit_conversation(plan, previous_context or {})
                 self._normalize_explicit_conditions(plan, message)
+                self._sanitize_conditions(plan, message, book_mode, context)
                 self._coalesce_forecasts(plan)
                 resolve_context(plan, context, self._normalize_mode(book_mode))
+                self._sanitize_conditions(plan, message, book_mode, plan._analysis_context)
                 if requested_window and plan.intent == 'analyze_orders' and not plan.analyses and plan.toolCalls:
                     self._prepare_analysis_queries(plan, now, book_mode)
                 plan._planning_issues.extend(issues)
@@ -331,6 +346,18 @@ class QueryPlanner:
             plan.finalInstruction = "根据所有工具结果回答用户问题。"
 
         return plan
+
+    def _sanitize_conditions(self, plan, message, book_mode, context):
+        issues = sanitize_user_conditions(plan, message, self._normalize_mode(book_mode), context)
+        for issue in issues:
+            if issue.get('retirePrevious'):
+                field = issue['field']
+                context.pop(field, None)
+                for state in context.get('scenarios', []):
+                    state.pop(field, None)
+                for task in context.get('activeAnalyses', []):
+                    task.pop(field, None)
+        plan._planning_issues.extend(issues)
 
     def _normalize_query_scopes(self, plan):
         for call in plan.toolCalls:

@@ -239,6 +239,7 @@ async def evaluate(selected, output_file, timeout):
                                "analysisVersion": metadata.get("analysisVersion"), "model": metadata.get("model")})
                 record.update(plan=metadata.get('plan'), investigation=metadata.get('investigation'),
                               analysisContext=metadata.get('analysisContext'),
+                              planningReview=metadata.get('planningReview'),
                               validation=metadata.get('validation'), planningIssues=metadata.get('planningIssues'))
             except Exception as exc:
                 record.update({"passed": False, "error": type(exc).__name__})

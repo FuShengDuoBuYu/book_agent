@@ -10,6 +10,16 @@ from app.core.config import Settings, get_settings
 from app.schemas.plan import AgentPlan
 
 
+def planner_schema():
+    from app.tools.registry import PLANNER_TOOL_BY_NAME
+    schema = AgentPlan.model_json_schema()
+    schema['required'] = ['understanding', 'output', 'intent', 'analysisType', 'needsTools',
+        'toolCalls', 'analyses', 'analysisWindow', 'finalInstruction', 'followUpOfPreviousQuestion']
+    schema['$defs']['ToolCall']['properties']['toolName']['enum'] = list(PLANNER_TOOL_BY_NAME)
+    schema['$defs']['IntentUnderstanding']['required'] = list(schema['$defs']['IntentUnderstanding']['properties'])
+    return schema
+
+
 @lru_cache
 def get_chat_model() -> BaseChatModel:
     settings = get_settings()
@@ -43,7 +53,7 @@ def _ollama(settings: Settings, planner: bool = False) -> ChatOllama:
         num_ctx=settings.ollama_num_ctx,
         keep_alive=settings.ollama_keep_alive,
         num_gpu=settings.ollama_num_gpu,
-        format=AgentPlan.model_json_schema() if planner else None,
+        format=planner_schema() if planner else None,
         num_predict=settings.planner_num_predict if planner else None,
         client_kwargs={"timeout": settings.request_timeout_seconds},
     )
