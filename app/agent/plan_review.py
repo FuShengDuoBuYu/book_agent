@@ -11,6 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError
 from pydantic_core import to_jsonable_python
 
 from app.agent.analysis_context import DECISION_TOOLS
+from app.agent.conversation_context import compact_user_context
+from app.agent.report_context import build_report_context
 from app.core.config import get_settings
 from app.core.llm import get_structured_model
 from app.schemas.plan import AgentPlan, AnalysisRequest, AnalysisWindow
@@ -472,45 +474,49 @@ class PlanReviewer:
         logical_ids = {call.id for call in plan.toolCalls if call.id} if plan.toolCalls else {"ledger"}
         previous = previous_context or {}
         payload = {"question": question, "history": history[-4000:], "bookMode": book_mode, "today": today.isoformat(),
-                   "calendarContext": calendar_context(today), "previousContext": to_jsonable_python(previous), "logicalQueryIds": sorted(logical_ids),
-                   "plan": plan.model_dump(mode="json")}
-        system = PROMPT + json.dumps(ANALYSIS_TOOLS, ensure_ascii=False) + "\nJSON schema：" + json.dumps(
-            PlanReviewDecision.model_json_schema(), ensure_ascii=False, separators=(",", ":"))
+                   "calendarContext": calendar_context(today), "previousContext": to_jsonable_python(compact_user_context(previous)),
+                   "logicalQueryIds": sorted(logical_ids),
+                   "plan": plan.model_dump(mode="json", exclude_none=True, exclude_defaults=True)}
+        system = PROMPT + json.dumps(ANALYSIS_TOOLS, ensure_ascii=False)
+        if get_settings().llm_provider != 'ollama':
+            system += "\nJSON schema：" + json.dumps(PlanReviewDecision.model_json_schema(), ensure_ascii=False, separators=(",", ":"))
         attempts = []
-        unresolved_conflict = False
         audit = {"status": "unavailable", "attempts": attempts}
         for attempt in range(2):
             started = perf_counter()
             call = {}
             attempts.append(call)
             try:
+                bounded, _, budget = build_report_context(payload, [], system, {},
+                    num_ctx=get_settings().ollama_num_ctx, num_predict=get_settings().planner_num_predict,
+                    include_values=False)
+                call['contextBudget'] = budget
                 response = await asyncio.wait_for(get_structured_model(PlanReviewDecision).ainvoke([
-                    ("system", system), ("human", json.dumps(payload, ensure_ascii=False))]),
+                    ("system", system), ("human", json.dumps(bounded, ensure_ascii=False, separators=(',', ':')))]),
                     timeout=get_settings().planner_timeout_seconds)
                 call.update(_call_metadata(response))
                 decision = _parse(response)
                 issue = _binding_issue(decision, plan, logical_ids, question, today, book_mode, previous)
                 if issue:
-                    return None, {**audit, "error": "inconsistent_adequacy" if unresolved_conflict else issue}
+                    return None, {**audit, "error": issue}
                 if decision.adequate and (decision.analysisWindow != plan.analysisWindow or
                         _execution_tasks(decision.analyses, plan, book_mode) != _execution_tasks(plan.analyses, plan, book_mode)):
-                    unresolved_conflict = True
-                    call["error"] = "inconsistent_adequacy"
-                    if attempt:
-                        return None, {**audit, "error": "inconsistent_adequacy"}
-                    payload["corrections"] = ["adequate=true 与 analyses 或 analysisWindow 的实质修改矛盾。"
-                        "原计划足够时返回相同的执行条件；确实需要修改时置 adequate=false 并给出完整修正计划。"]
-                    continue
+                    # The supplied execution diff has already passed all scope and
+                    # user-condition checks. Its existence proves a correction is
+                    # needed, regardless of the model's contradictory summary flag.
+                    decision.adequate = False
+                    audit['adequacyNormalized'] = True
+                    call['reportedAdequate'] = True
                 return decision, {**audit, "status": "reviewed", "decision": decision.model_dump(mode="json")}
             except ValidationError as exc:
                 call["error"] = "invalid_structure"
                 errors = exc.errors(include_input=False, include_context=False, include_url=False)
                 if attempt:
-                    return None, {**audit, "error": "inconsistent_adequacy" if unresolved_conflict else "invalid_structure"}
+                    return None, {**audit, "error": "invalid_structure"}
                 payload["corrections"] = [{"field": ".".join(map(str, e["loc"]))[:100], "type": e["type"][:60]}
                                           for e in errors[:5]]
             except Exception as exc:
                 call["error"] = type(exc).__name__
-                return None, {**audit, "error": "inconsistent_adequacy" if unresolved_conflict else type(exc).__name__}
+                return None, {**audit, "error": type(exc).__name__}
             finally:
                 call["durationMs"] = round((perf_counter() - started) * 1000)

@@ -22,6 +22,8 @@ class ModelConfigurationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(analysis['properties']['tool']['enum']), set(ANALYSIS_TOOLS))
         self.assertTrue({'tool', 'queryIds', 'metric', 'targetMonth'} <= set(analysis['required']))
         self.assertEqual(set(schema['$defs']['ToolCall']['properties']['toolName']['enum']), set(PLANNER_TOOL_BY_NAME))
+        evidence = schema['$defs']['IntentUnderstanding']['properties']['evidenceNeeds']['items']['enum']
+        self.assertTrue({'runway', 'savings', 'cashflow', 'data_quality', 'members', 'totals'} <= set(evidence))
 
     def test_planner_schema_requires_explicit_grouping_filters_and_horizon_fields(self):
         with patch.dict(os.environ, {'LLM_PROVIDER': 'ollama'}, clear=True):

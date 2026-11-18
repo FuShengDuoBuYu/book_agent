@@ -8,6 +8,25 @@ from app.agent.intent_resolution import IntentResolver
 
 
 class IntentResolutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resolved_conversation_relationship_controls_inheritance_within_scope(self):
+        from app.agent.planner import QueryPlanner
+        from app.agent.analysis_context import resolve_context
+        from app.schemas.plan import AgentPlan, IntentUnderstanding
+        original = AgentPlan(analyses=[{'tool': 'projection', 'months': 3, 'startingBalance': 10000,
+            'changes': [{'metric': 'income', 'source': '稿费', 'percent': -50}]}])
+        previous = resolve_context(original, {})
+        for relation, expected in [('follow_up', True), ('independent', False), ('reset', False)]:
+            with self.subTest(relation=relation):
+                planner = QueryPlanner.__new__(QueryPlanner)
+                raw = {'followUpOfPreviousQuestion': not expected, 'analyses': [{'tool': 'projection', 'months': 3}]}
+                planner.chain = SimpleNamespace(ainvoke=AsyncMock(return_value=SimpleNamespace(content=json.dumps(raw))))
+                goal = IntentUnderstanding(objective='重新核算收入条件', conversationRelation=relation)
+                planner.intent_resolver = SimpleNamespace(resolve=AsyncMock(return_value=(goal, {'status': 'resolved'})))
+                result = await planner.create_plan('按本轮要求重新核算', '', previous_context=previous)
+                self.assertEqual(result.followUpOfPreviousQuestion, expected)
+                self.assertEqual(bool(result.analyses[0].changes), expected)
+                self.assertEqual(result.analyses[0].startingBalance, 10000 if expected else None)
+
     async def test_execution_plan_uses_resolved_goal_with_bounded_history(self):
         from app.agent.planner import QueryPlanner
         from app.schemas.plan import IntentUnderstanding
@@ -37,7 +56,7 @@ class IntentResolutionTests(unittest.IsolatedAsyncioTestCase):
         with patch('app.agent.intent_resolution.get_structured_model', return_value=model) as factory:
             result, audit = await IntentResolver().resolve('上上月和上月排除房租交通按类别对照', '',
                 date(2026, 11, 19), '个人版', {})
-        self.assertEqual(result.model_dump(), understanding)
+        self.assertEqual(result.model_dump(), {**understanding, 'conversationRelation': 'unspecified'})
         self.assertEqual(audit['status'], 'resolved')
         self.assertNotIn('reasoning_content', str(audit))
         self.assertNotIn('private reasoning', str(audit))

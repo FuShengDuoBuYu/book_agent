@@ -65,7 +65,7 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(response)
             self.assertEqual(audit.get('error'), 'unsupported_changes')
 
-    async def test_inconsistent_adequacy_requires_explicit_corrected_plan(self):
+    async def test_validated_corrected_execution_is_adopted_despite_a_contradictory_summary_flag(self):
         original = AgentPlan(analyses=[{'tool': 'scenario'}])
         changed = {'adequate': True, 'issues': [], 'analysisWindow': None, 'answerInstruction': '',
             'analyses': [{'tool': 'projection', 'months': 3, 'changes': [
@@ -78,8 +78,9 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
                 original, date(2026, 11, 19), '个人版', {})
         self.assertIsNotNone(response)
         self.assertFalse(response.adequate)
-        self.assertEqual(model.ainvoke.await_count, 2)
+        self.assertEqual(model.ainvoke.await_count, 1)
         self.assertEqual(audit['status'], 'reviewed')
+        self.assertTrue(audit['adequacyNormalized'])
 
     async def test_default_driver_window_needs_two_complete_months_but_preserves_an_explicit_limit(self):
         draft = {'analyses': [{'tool': 'changes'}],
@@ -121,7 +122,7 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
             result, audit = await PlanReviewer().review('回顾过去半年账本', '', AgentPlan(analyses=[task]), date(2026,11,19), '个人版', {})
         self.assertIsNotNone(result, audit)
 
-    async def test_failed_review_retry_keeps_known_execution_conflict_visible(self):
+    async def test_validated_execution_diff_does_not_require_repeating_the_review_call(self):
         model = AsyncMock()
         inconsistent = {'adequate': True, 'issues': [], 'analysisWindow': None, 'answerInstruction': '',
                         'analyses': [{'tool': 'projection', 'months': 3}]}
@@ -129,8 +130,11 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
         with patch('app.agent.plan_review.get_structured_model', return_value=model):
             result, audit = await PlanReviewer().review('未来三个月的结余呢？', '', AgentPlan(analyses=[{'tool':'trends'}]),
                                                        date(2026,11,19), '个人版', {})
-        self.assertIsNone(result)
-        self.assertEqual(audit['error'], 'inconsistent_adequacy')
+        self.assertIsNotNone(result)
+        self.assertFalse(result.adequate)
+        self.assertEqual(result.analyses[0].tool, 'projection')
+        self.assertEqual(model.ainvoke.await_count, 1)
+        self.assertTrue(audit['adequacyNormalized'])
 
     async def test_named_percentage_never_becomes_a_currency_amount(self):
         raw = {'analyses': [{'tool': 'projection', 'changes': [
@@ -309,3 +313,90 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
                                                      date(2026,11,19),'个人版',{})
         self.assertIsNone(result)
         self.assertEqual(audit.get('error'),'unsupported_includeCategories')
+
+    async def test_independent_decisions_use_default_history_unless_user_bounds_the_sample(self):
+        made_up={'startDate':'2026-09-01','endDate':'2026-11-18'}
+        for tool, question in [
+            ('forecast','预计2027年1月能进账多少？'), ('forecast','预计明年一月收入多少？'),
+            ('forecast','按我的账本，估算今年12月的入账。'), ('forecast','预计本月收入多少？'),
+            ('scenario','未来收入有变时，结余会怎样？'), ('savings','我想三个月内攒到一万元。'),
+            ('projection','估算未来三个月收支。'), ('purchase','今天想买七百元的扫描仪，可行吗？'),
+            ('runway','可动用余额能支撑多久？'),('optimization','我最近想优化开销。'),
+        ]:
+            with self.subTest(tool=tool,question=question):
+                p=await self.plan(question,{'analysisWindow':made_up,'analyses':[{'tool':tool}]},{})
+                self.assertIsNone(p.analysisWindow)
+                self.assertEqual([q.args.month for q in p.toolCalls],[5,6,7,8,9,10,11])
+        for phrase, start,end in [
+            ('参考最近两个完整月','2026-09-01','2026-10-31'), ('仅参考今年的流水','2026-01-01','2026-11-19'),
+            ('只用去年记录','2025-01-01','2025-12-31'), ('只用2024年的账本','2024-01-01','2024-12-31'),
+            ('按2026-08-02至2026-09-28的记录','2026-08-02','2026-09-28')]:
+            with self.subTest(phrase=phrase):
+                defined={'startDate':start,'endDate':end}
+                plan=await self.plan(phrase+'，预计2027年1月收入多少？',
+                    {'analyses':[{'tool':'forecast'}],'analysisWindow':defined},{})
+                self.assertEqual(plan.analysisWindow.model_dump(mode='json'),defined)
+                prior=await self.save(plan)
+                follow=await self.plan('把刚才的预测改到明年三月，仍用原样本。',{'followUpOfPreviousQuestion':True,
+                    'analyses':[{'tool':'forecast'}],'analysisWindow':made_up},prior)
+                self.assertEqual(follow.analysisWindow.model_dump(mode='json'),defined)
+
+    async def test_recent_half_year_diagnosis_materializes_six_complete_month_averages(self):
+        draft={'understanding':{'evidenceNeeds':['totals','trends','changes']}, 'analysisType':'financial_analysis',
+               'analyses':[{'tool':'aggregate','metric':'all'},{'tool':'trends'},{'tool':'anomalies'}],
+               'analysisWindow':{'startDate':'2026-05-19','endDate':'2026-11-18'}}
+        rows=[{'year':2026,'month':m,'day':4,'money':m*100,'costType':'工资','orderRemark':'工资'} for m in range(5,12)]
+        for time in ('最近半年','近半年'):
+            plan=await self.plan('综合看看我'+time+'的财务情况，最值得注意什么？',draft,{})
+            self.assertEqual(plan.analysisWindow.model_dump(mode='json'),{'startDate':'2026-05-01','endDate':'2026-11-19'})
+            result=collect_analysis_results(plan,{'个人版':[(q,rows) for q in plan.toolCalls]},date(2026,11,19))
+            cash=next((r['evidence'] for r in result if r['tool']=='cashflow'),None)
+            self.assertIsNotNone(cash)
+            self.assertEqual(cash['completeMonthAverage']['months'],['2026-%02d'%m for m in range(5,11)])
+            self.assertEqual(cash['completeMonthAverage']['income'],750)
+        short=await self.plan('只看近半年的支出类别。',draft,{})
+        self.assertNotIn('cashflow',[t.tool for t in short.analyses])
+        future=await self.plan('未来半年能攒多少结余？',{**draft,'analyses':[{'tool':'projection','months':6}]},{})
+        self.assertNotIn('cashflow',[t.tool for t in future.analyses])
+        self.assertIsNone(future.analysisWindow)
+
+    async def test_canonical_runway_and_savings_compute_or_report_only_actual_inputs(self):
+        rows=[{'year':2026,'month':m,'day':2,'money':v,'costType':category,'orderRemark':category}
+              for m in (8,9,10) for v,category in [(6000,'工资'),(-2000,'开销')]]
+        for text, need, missing in [
+            ('如果主要收入来源出了问题，我能承受多久？','runway',{'startingBalance','changes'}),
+            ('请评估我的储蓄目标，还需要哪些条件？','savings',{'startingBalance','targetAmount'}),
+            ('假设现在有10000元，想三个月存到20000元，照目前收支能做到吗？','savings',set())]:
+            with self.subTest(need=need,text=text):
+                p=await self.plan(text,{'analyses':[{'tool':'trends'}],'understanding':{'evidenceNeeds':['totals',need]}},{})
+                t=next((t for t in p.analyses if t.tool==need),None)
+                self.assertIsNotNone(t)
+                self.assertFalse(t.changes)
+                self.assertNotIn('cashflow',[t.tool for t in p.analyses])
+                e=next(r['evidence'] for r in collect_analysis_results(p,{'个人版':[(q,rows) for q in p.toolCalls]},date(2026,11,19)) if r['tool']==need)
+                if missing:
+                    self.assertIsNone(t.startingBalance)
+                    self.assertEqual(set(e['missingInputs']),missing)
+                else:
+                    self.assertEqual((t.startingBalance,t.targetAmount,t.months,e['projectedBalance']),(10000,20000,3,22000))
+
+    async def test_canonical_need_mapping_deduplicates_and_never_invents_scope(self):
+        aliases={'projection':'projection','budget':'budget','purchase':'purchase','optimization':'optimization',
+                 'quality':'data_quality','data_quality':'data_quality','cashflow':'cashflow','income_stability':'income_stability','recurring':'recurring','anomalies':'anomalies',
+                 'aggregate':'aggregate','scenario':'scenario','members':'sources','remarks':'sources','forecast':'forecast','changes':'changes'}
+        for need,tool in aliases.items():
+            plan=await self.plan('核对已说明的需求',{'understanding':{'evidenceNeeds':[need,need]}},{})
+            self.assertEqual([t.tool for t in plan.analyses].count(tool),1,need)
+        modes=[{'id':'mine','toolName':'search_personal_orders'},{'id':'home','toolName':'search_family_orders'}]
+        plan=await self.plan('两个账本分开核对',{'toolCalls':modes,'understanding':{'evidenceNeeds':['runway','savings','forecast']},
+            'analyses':[{'tool':'savings','queryIds':['mine']}]},{})
+        self.assertEqual([(t.tool,t.queryIds) for t in plan.analyses],[('savings',['mine'])])
+
+    async def test_new_decision_tasks_do_not_treat_old_balances_or_pay_frequency_as_goal_conditions(self):
+        p=await self.plan('去年可用现金为10000元。每三个月领一次奖金，现在想了解存款目标还要什么信息？',
+            {'understanding':{'evidenceNeeds':['savings']}},{})
+        t=next(t for t in p.analyses if t.tool=='savings')
+        self.assertIsNone(t.startingBalance)
+        self.assertIsNone(t.months)
+        chat=await self.plan('你好',{'intent':'chat','needsTools':False,'understanding':{'evidenceNeeds':['runway']}},{})
+        self.assertFalse(chat.needsTools)

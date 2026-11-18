@@ -13,6 +13,7 @@ from app.core.config import get_settings
 from app.core.llm import get_planner_model
 from app.agent.analysis_context import remove_withdrawn_changes, resolve_context
 from app.agent.intent_resolution import IntentResolver
+from app.agent.conversation_context import compact_user_context
 from app.agent.plan_parsing import repair_descriptive_arrays
 from app.agent.report_context import build_report_context
 from app.agent.plan_review import NUMBER, PlanReviewer, calendar_context, explicit_month_delta, explicit_projection_start, named_percent_changes, sanitize_user_conditions
@@ -90,6 +91,46 @@ def explicit_complete_month_window(message, today):
         raise ValueError('完整自然月范围应为 1 至 24 个月')
     current_month = today.replace(day=1)
     return AnalysisWindow(startDate=shift_month(current_month, -count), endDate=current_month - timedelta(days=1))
+
+
+def _historical_half_year(message, today):
+    if not re.search(r"(?:最近|近)\s*半年", message):
+        return None
+    # An explicit endpoint or a separate comparison supplies different boundaries.
+    if re.search(r"截至|截止|同期|不含本月|不包括本月|去年|前年|以前的近半年", message):
+        return None
+    return AnalysisWindow(startDate=shift_month(today.replace(day=1), -6), endDate=today)
+
+
+def _explicit_history_sample(message, today):
+    """Separate a bounded lookback from the goal date or date of a purchase."""
+    if re.search(r"(?:最近|过去|近|前)\s*(?:半|数|几|" + NUMBER +
+                 r")\s*个?\s*(?:完整(?:自然)?)?(?:天|日|周|星期|月|季|年)|上(?:一|上)?个?(?:完整)?月|上周|上季度|去年|前年", message):
+        return True
+    stamp = re.compile(r"(?:(\d{4})\s*[-年/.]\s*(\d{1,2})\s*月?|"
+                       r"(明年|今年)?\s*(\d{1,2}|[一二三四五六七八九十]+)月份?|"
+                       r"(\d{4})年|(明年|今年|当年|本月|这个月|当月|本周|这周|本季度|今天|昨天|前天))")
+    for clause in re.split(r"[，。；！？,;\n]|(?:并且?|然后|再)(?=预测|预计|估算|推演)", message):
+        for match in stamp.finditer(clause):
+            year, month, relative_year, named_month, bare_year, token = match.groups()
+            if token == '明年' or relative_year == '明年':
+                continue
+            y = int(year or bare_year or today.year)
+            m = int(month or (explicit_goal_amount(named_month) if named_month else today.month))
+            if (y, m) > (today.year, today.month):
+                continue
+            before, after = clause[:match.start()], clause[match.end():]
+            # A bare month after "预测" names the estimation target, even if its
+            # next occurrence falls in the next calendar year.
+            if re.search(r"(?:参考|基于|根据|仅用|只用|使用|样本取|截至|回顾|分析|对照|从|按)\s*$", before):
+                if not re.match(r"(?:份)?(?:开始|起算|起)(?:预测|推演)", after):
+                    return True
+            if re.match(r"(?:的)?(?:已记|记录|数据|流水|账本|账单|历史|样本|至今|以来)", after):
+                return True
+            if (not re.search(r"预测|预计|估算|预估|推演|目标|改到|计划|购买|想买|要买|打算|能买|下单|余额|可动用", clause)
+                    and not re.search(r"未来|明年|下个?月", before)):
+                return True
+    return False
 
 
 def _future_month_count(message):
@@ -171,7 +212,7 @@ class QueryPlanner:
                     bounded, _, budget = build_report_context({
                         'question': prompt_values['message'], 'history': history,
                         'understanding': resolved_goal.model_dump() if resolved_goal else {},
-                        'userConditions': previous_context}, [], system, {},
+                        'userConditions': compact_user_context(previous_context)}, [], system, {},
                         num_ctx=get_settings().ollama_num_ctx, num_predict=get_settings().planner_num_predict)
                     prompt_values['history'] = bounded['history'] + '\n已解析的有范围条件：' + json.dumps(
                         bounded['userConditions'], ensure_ascii=False, separators=(',', ':'))
@@ -195,21 +236,27 @@ class QueryPlanner:
                 plan = AgentPlan.model_validate(data)
                 if resolved_goal and not plan.understanding.objective:
                     plan.understanding = resolved_goal.model_copy(deep=True)
+                if resolved_goal:
+                    relation = resolved_goal.conversationRelation
+                    if relation in {'follow_up', 'correction'}:
+                        plan.followUpOfPreviousQuestion = True
+                        plan.resetAnalysisContext = False
+                    elif relation in {'independent', 'reset'}:
+                        plan.followUpOfPreviousQuestion = False
+                        plan.resetAnalysisContext = relation == 'reset'
                 self._normalize_query_scopes(plan)
-                self._materialize_requirements(plan)
+                self._materialize_requirements(plan, message)
                 self._sanitize_conditions(plan, message, book_mode, previous_context)
                 if (plan.intent == 'analyze_orders' and (plan.analyses or plan.analysisType == 'financial_analysis')
                         and getattr(self, 'reviewer', None)):
                     decision, plan._semantic_review = await self.reviewer.review(
                         message, history, plan, now.date(), self._normalize_mode(book_mode), previous_context)
                     plan._semantic_review['adopted'] = bool(decision is not None and not decision.adequate)
-                    if plan._semantic_review.get('error') == 'inconsistent_adequacy':
-                        raise ValueError('审查未能确认可执行任务。请根据问题明确工具、预测期限和变化来源。')
                     if decision is not None and not decision.adequate:
                         plan.analyses = decision.analyses
                         plan.analysisWindow = decision.analysisWindow
                         plan.finalInstruction = decision.answerInstruction
-                requested_window = explicit_complete_month_window(message, now.date())
+                requested_window = explicit_complete_month_window(message, now.date()) or _historical_half_year(message, now.date())
                 if requested_window and requested_window != plan.analysisWindow:
                     plan.analysisWindow = requested_window
                     plan._planning_issues.append({'type': 'normalized_complete_month_window',
@@ -447,13 +494,19 @@ class QueryPlanner:
     ) -> AgentPlan:
         # normalize 的目的，是把“不稳定的 LLM 输出”整理成“稳定的程序输入”。
         self._coalesce_forecasts(plan)
-        self._materialize_requirements(plan)
+        self._materialize_requirements(plan, message)
         if plan.analysisType == "financial_analysis" and not plan.analyses:
             plan.analyses = [AnalysisRequest(tool=name) for name in ("cashflow", "trends", "changes", "anomalies", "recurring")]
         if plan.analyses:
             plan.intent = "analyze_orders"
             plan.needsTools = True
-            explicit_history = self._has_history_reference(message, now)
+            future = any(t.tool in HISTORY_BASED_TOOLS for t in plan.analyses)
+            inherited = (plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext
+                         and bool(plan._analysis_context.get('conversation')))
+            if plan.analysisWindow and future and not inherited and not _explicit_history_sample(message, now.date()):
+                plan._planning_issues.append({'type': 'normalized_implicit_history_window',
+                    'detail': '用户未限定历史样本，采用六个完整自然月及本月至今的默认查询范围。'})
+                plan.analysisWindow = None
             current_month = now.date().replace(day=1)
             vague_history = re.sub(r'最近(?!\s*(?:[\d零一二两三四五六七八九十半几]|一段|一周))', '', message)
             user_limited = self._has_history_reference(vague_history, now) or bool(re.search(
@@ -461,15 +514,8 @@ class QueryPlanner:
             if (plan.analysisWindow and not user_limited and not plan.followUpOfPreviousQuestion
                     and plan.analysisWindow.startDate > shift_month(current_month, -2)
                     and shift_month(current_month, -1) <= plan.analysisWindow.endDate <= now.date()):
-                if any(t.tool == 'projection' for t in plan.analyses) and _future_month_count(message):
-                    plan.analysisWindow = None
-                elif any(t.tool == 'changes' for t in plan.analyses):
+                if not future and any(t.tool == 'changes' for t in plan.analyses):
                     plan.analysisWindow = AnalysisWindow(startDate=shift_month(current_month, -2), endDate=now.date())
-            if (plan.analysisWindow and plan.analysisWindow.startDate >= now.date().replace(day=1)
-                    and any(task.tool in HISTORY_BASED_TOOLS for task in plan.analyses) and not explicit_history):
-                plan._planning_issues.append({'type': 'normalized_implicit_history_window',
-                    'detail': '用户未限定历史月份；当前余额或未来目标不将历史样本限制为本月。'})
-                plan.analysisWindow = None
             if plan.analysisWindow and plan.analysisWindow.startDate > now.date():
                 if not any(task.tool in HISTORY_BASED_TOOLS for task in plan.analyses):
                     raise ValueError('analysisWindow 不能用未来月份查询已发生的历史收支；未来估计需要预测工具。')
@@ -582,7 +628,7 @@ class QueryPlanner:
                             for call in plan.toolCalls})
             if [list(row) for row in scope] != previous.get('scope'):
                 return
-        if self._has_history_reference(message, now):
+        if _explicit_history_sample(message, now.date()):
             return
         window = previous.get('activeHistoryWindow', previous['conversation'].get('analysisWindow'))
         current = plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None
@@ -591,20 +637,66 @@ class QueryPlanner:
             plan._planning_issues.append({'type': 'preserved_referent_window',
                 'detail': '追问未修改历史时间范围，保留被追问分析的样本窗口。'})
 
-    def _materialize_requirements(self, plan):
+    def _materialize_requirements(self, plan, message=''):
+        from app.agent.plan_review import CLAUSES, HISTORY_WORDS, NEGATED, _amount_matches, _explicit_amount, _time_evidence
+
+        if plan.intent != 'analyze_orders':
+            return
         requirements = set(plan.understanding.evidenceNeeds)
-        tools = set()
-        future = any(task.tool in HISTORY_BASED_TOOLS for task in plan.analyses)
-        if ('trends' in requirements or (plan.output.chart != 'none' and not any(task.tool == 'aggregate' for task in plan.analyses))) and not future:
-            tools.add('trends')
+        existing = {task.tool for task in plan.analyses}
+        scoped = {(c.toolName, c.args.cost_type, c.args.remark) for c in plan.toolCalls}
+        bindings = {(c.toolName, c.args.cost_type, c.args.remark, c.args.year, c.args.month, c.args.day)
+                    for c in plan.toolCalls}
+        decisions = HISTORY_BASED_TOOLS | {'budget'}
+        requested = requirements & {'cashflow', 'data_quality', 'trends', 'changes', 'aggregate', 'income_stability', 'recurring', 'anomalies'}
+        if len(bindings) <= 1:
+            requested |= requirements & decisions
         if requirements & {'sources', 'members', 'remarks'}:
-            tools.add('sources')
-        if 'forecast' in requirements and not future:
-            tools.add('forecast')
-        if 'changes' in requirements:
-            tools.add('changes')
-        plan.analyses.extend(AnalysisRequest(tool=tool, metric=plan.output.metric if plan.output.metric != 'all' else 'income')
-                             for tool in sorted(tools) if not any(task.tool == tool for task in plan.analyses))
+            requested.add('sources')
+        if 'quality' in requirements:
+            requested.add('data_quality')
+
+        future = bool((existing | requirements) & decisions)
+        overall = re.search(r"财务|收支|现金流", message) or ("收入" in message and "支出" in message)
+        direction_only = re.search(r"(?:只|仅|单)(?:想|需|要)?(?:看|算|分析|统计|比较).{0,12}(?:收入|支出|开销)", message)
+        filtered = any(c.args.cost_type != '不限' or c.args.remark for c in plan.toolCalls) or any(
+            t.aggregate and t.aggregate.filters.model_dump(exclude_defaults=True) for t in plan.analyses)
+        if 'totals' in requirements and overall and not direction_only and not future and len(scoped) <= 1 and not filtered:
+            requested.add('cashflow')
+        if plan.output.chart != 'none' and 'aggregate' not in existing | requested and not future:
+            requested.add('trends')
+
+        amount_roles = {
+            'savings': ('startingBalance', 'targetAmount'),
+            'purchase': ('startingBalance', 'purchaseAmount', 'reserveAmount'),
+            'runway': ('startingBalance',),
+            'budget': ('budgetAmount',),
+            'optimization': ('monthlyImprovement',),
+        }
+        today = datetime.now(ZoneInfo('Asia/Shanghai')).date()
+        for tool in sorted(requested - existing, key=lambda name: (name not in decisions, name)):
+            if len(plan.analyses) >= 12:
+                raise ValueError('请求的证据超过十二项分析，请合并重复任务并保留必要的决策与查询绑定。')
+            args = {'metric': 'income' if tool == 'forecast' and plan.output.metric == 'all' else plan.output.metric}
+            # A missing calculation can use a literal, role-checked user input.
+            # Never derive balances, goals or shocks from the text of the plan.
+            for field in amount_roles.get(tool, ()):
+                candidates = {value for clause in CLAUSES.split(message)
+                              if not NEGATED.search(clause) and not HISTORY_WORDS.search(clause)
+                              and not _explicit_history_sample(clause, today)
+                              for value in _amount_matches(clause, field)}
+                if len(candidates) == 1:
+                    value = candidates.pop()
+                    if _explicit_amount(message, field, value):
+                        args[field] = value
+            if tool in {'savings', 'projection'}:
+                horizon_text = re.sub(rf"每(?:隔)?(?:{NUMBER}\s*个?月|半年|一年)", "", message)
+                _, durations = _time_evidence(horizon_text, today)
+                if len(durations) == 1:
+                    count = next(iter(durations))
+                    if count > 0:
+                        args['months'] = count
+            plan.analyses.append(AnalysisRequest(tool=tool, **args))
 
     def _inherit_conversation(self, plan, previous):
         """Only inherit a referent's range and grouping within its ledger/filter scope."""

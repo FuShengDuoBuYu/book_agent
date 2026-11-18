@@ -161,8 +161,10 @@ class EvidenceReviewTests(unittest.IsolatedAsyncioTestCase):
         rows = [{'source': name, 'activeMonths': 2, 'transactions': 2, 'typicalAmount': 100}
                 for name in ('租房开支', '交通定期充值')]
         await reporter.answer('列出重复支出', {}, [{'tool': 'recurring', 'evidence': {'expense': rows}}])
-        self.assertEqual(len(reporter._review.call_args.args[0]['facts']), 2)
-        self.assertIn('交通定期充值', str(reporter._review.call_args.args[0]))
+        review = reporter._review.call_args.args[0]
+        available = review['facts'] + [fact for section in review['report']['sections'] for fact in section['evidence']]
+        self.assertEqual({fact['id'] for fact in available}, {'f1', 'f2'})
+        self.assertIn('交通定期充值', str(review))
 
     async def test_fallback_preserves_every_required_fact(self):
         reporter = EvidenceReporter()

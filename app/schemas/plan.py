@@ -199,6 +199,8 @@ class IntentUnderstanding(BaseModel):
     evidenceNeeds: list[Annotated[str, Field(max_length=80)]] = Field(default_factory=list, max_length=10,
         description='推荐 totals/sources/members/remarks/trends/forecast/changes/scenario/quality；描述标签不具有工具调用权限')
     unknowns: list[str] = Field(default_factory=list, max_length=6, description='完成用户目标仍缺的具体信息，已有账本可查询的信息不要求用户重新提供')
+    conversationRelation: Literal['independent', 'follow_up', 'correction', 'reset', 'unspecified'] = Field(
+        default='unspecified', description='本轮是独立目标、承接、纠正还是明确重来；结合原目标和新条件判断')
 
 
 class OutputRequest(BaseModel):

@@ -25,6 +25,12 @@ def _execution_schema(schema):
     if schema.get('title') == 'IntentUnderstanding':
         schema['required'] = list(schema['properties'])
     definitions = schema.get('$defs', {})
+    from app.tools.financial_analysis import ANALYSIS_TOOLS
+    intent_nodes = [node for node in (schema if schema.get('title') == 'IntentUnderstanding' else None,
+                                      definitions.get('IntentUnderstanding')) if node is not None]
+    for node in intent_nodes:
+        node['properties']['evidenceNeeds']['items']['enum'] = list(dict.fromkeys(
+            ['totals', 'members', 'remarks', 'quality', *ANALYSIS_TOOLS]))
     if schema.get('title') == 'ReportDraft':
         section = definitions['ReportSection']['properties']
         for field in ('title', 'analysis'):

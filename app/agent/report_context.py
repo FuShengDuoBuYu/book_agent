@@ -83,7 +83,7 @@ def _with_evidence(payload, facts, *, include_values):
 def _ensure_fit(payload, estimate, limit):
     tokens = estimate(payload)
     if tokens > limit:
-        raise ValueError(f'报告必需上下文超出预算（估算 {tokens}，上限 {limit}）')
+        raise ValueError(f'模型必需上下文超出预算（估算 {tokens}，上限 {limit}）')
     return tokens
 
 
