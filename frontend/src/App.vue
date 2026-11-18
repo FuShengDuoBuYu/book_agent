@@ -62,7 +62,7 @@
         :key="message.id"
         :class="['message', message.role, { error: message.error }]"
       >
-        <div class="message-stack">
+        <div :class="['message-stack', { 'with-artifacts': message.done && message.artifacts?.length }]">
           <div v-if="message.steps?.length" class="thinking-drawer">
             <button
               class="thinking-toggle"
@@ -92,11 +92,16 @@
           <div
             v-if="message.role === 'agent'"
             :class="['bubble', 'markdown-body', { streaming: message.streaming }]"
-            v-html="renderMarkdown(message.content)"
+            v-html="renderMarkdown(message.content, message.done ? message.artifacts : [])"
           ></div>
           <div v-else :class="['bubble', { streaming: message.streaming }]">
             {{ message.content }}
           </div>
+          <AnalysisArtifacts
+            v-if="message.role === 'agent' && message.done && message.artifacts?.length"
+            :items="message.artifacts"
+            @download-error="showToast"
+          />
         </div>
       </article>
     </section>
@@ -150,6 +155,8 @@
 import DOMPurify from "dompurify";
 import MarkdownIt from "markdown-it";
 import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
+import AnalysisArtifacts from "./AnalysisArtifacts.vue";
+import { normalizeArtifacts, renderAnalysisMarkdown } from "./artifacts.js";
 
 // 这里维护的是整个聊天页的核心状态：用户身份、当前会话、消息列表和流式渲染队列。
 const chatRef = ref(null);
@@ -274,6 +281,7 @@ async function readConversation(id, cursor = "") {
     id: message.id,
     role: message.role === "assistant" ? "agent" : "user",
     content: message.content,
+    artifacts: message.role === "assistant" ? normalizeArtifacts(message.artifacts) : [],
     done: true,
     steps: [],
   }));
@@ -347,9 +355,9 @@ function formatHistoryTime(value) {
   return value ? new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(value)) : "";
 }
 
-function renderMarkdown(content) {
+function renderMarkdown(content, artifacts = []) {
   // 模型回复支持 Markdown，但必须先消毒，避免把 HTML 直接注入页面。
-  return DOMPurify.sanitize(markdown.render(content || ""), {
+  return DOMPurify.sanitize(renderAnalysisMarkdown(markdown, content || "", artifacts), {
     USE_PROFILES: { html: true },
   });
 }
@@ -368,6 +376,7 @@ function appendMessage(role, content, error = false) {
     role,
     content,
     error,
+    artifacts: [],
     steps: [],
     stepsOpen: false,
     done: false,
@@ -583,6 +592,12 @@ function handleStreamEvent(rawEvent, messageId) {
 
   if (payload.type === "thinking") {
     appendThinking(messageId, payload.content);
+    return;
+  }
+
+  if (payload.type === "artifacts") {
+    const target = messages.value.find((message) => message.id === messageId);
+    if (target) target.artifacts = normalizeArtifacts(payload.artifacts);
     return;
   }
 

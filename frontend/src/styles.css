@@ -243,6 +243,12 @@ h1 {
   max-width: min(82%, 620px);
 }
 
+.message-stack.with-artifacts {
+  width: 100%;
+  min-width: 0;
+  max-width: 680px;
+}
+
 .bubble {
   font-size: 15px;
   line-height: 1.65;
