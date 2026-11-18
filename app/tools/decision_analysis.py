@@ -6,51 +6,99 @@ from statistics import median
 
 from app.tools.financial_analysis import (
     _anomalies, _buckets, _date, _forecast, _nonrecurring_income,
-    _round_money, _series, _source, _totals, shift_month,
+    _round_money, _series, _source, _totals, forecast_scope, shift_month,
 )
+
+from app.tools.source_analysis import money, observed_source_key
+
+
+def _income_source_parts(orders, income, source):
+    rows = [r for r in income["sourceForecasts"] if not r["excluded"]]
+    exact = [r for r in rows if source in (r["sourceKey"], r["source"], r["member"],
+             r["member"] + "的" + r["source"], r["member"] + r["source"])]
+    matched = exact or [r for r in rows if source in r["source"]]
+    if matched:
+        return [(r, r["estimate"]) for r in matched]
+
+    # A category or original remark may identify only part of a semantic group.
+    # Calculate that subset within each member's component on the same baseline months.
+    components = {key: row for row in rows for key in row["observedSourceKeys"]}
+    months = income["baselineMonths"]
+    amounts = defaultdict(lambda: defaultdict(float))
+    for order in orders:
+        month = _date(order).strftime("%Y-%m")
+        if month not in months or float(order["money"]) <= 0:
+            continue
+        if source not in _source(order) and source not in str(order.get("orderRemark") or ""):
+            continue
+        component = components.get(observed_source_key(order))
+        if component:
+            amounts[component["sourceKey"]][month] += float(order["money"])
+    return [(row, money(median(monthly.get(month, 0) for month in months)))
+            for row in rows if (monthly := amounts.get(row["sourceKey"]))]
+
+
+def _raw_source_baseline(orders, months, metric, source):
+    amounts = defaultdict(float)
+    matched = set()
+    for order in orders:
+        month = _date(order).strftime("%Y-%m")
+        positive = float(order["money"]) > 0
+        if month not in months or positive != (metric == "income"):
+            continue
+        if positive and _nonrecurring_income(order):
+            continue
+        if source in _source(order) or source in str(order.get("orderRemark") or ""):
+            amounts[month] += abs(float(order["money"]))
+            matched.add(_source(order))
+    return money(median(amounts.get(month, 0) for month in months)), sorted(matched)
 
 
 def apply_changes(orders, income, expense, changes):
     totals = {"income": income["estimate"], "expense": expense["estimate"]}
     assumptions = []
+    used = defaultdict(float)
     months = income["baselineMonths"]
     for change in changes:
         metric, source = change["metric"], str(change.get("source") or "").strip()
         base = income['estimate'] if metric == 'income' else expense['estimate']
-        matched = []
+        matched, parts = [], []
         if source:
-            amounts = defaultdict(float)
-            for order in orders:
-                month = _date(order).strftime("%Y-%m")
-                positive = float(order["money"]) > 0
-                if month not in months or positive != (metric == "income"):
-                    continue
-                if positive and _nonrecurring_income(order):
-                    continue
-                if source in _source(order) or source in str(order.get("orderRemark") or ""):
-                    amounts[month] += abs(float(order["money"]))
-                    matched.append(_source(order))
+            if metric == "income" and "sourceForecasts" in income:
+                parts = _income_source_parts(orders, income, source)
+                base = money(sum(value for _, value in parts))
+                matched = sorted({row["source"] for row, _ in parts})
+            else:
+                base, matched = _raw_source_baseline(orders, months, metric, source)
             if not matched and (change.get("percent") is not None or (change.get("amount") or 0) < 0):
                 return {"sufficientData": False, "missingInputs": ["source"],
                         "reason": f"历史账单未能定位来源“{source}”，不能用全部收支代替该来源。"}
-            base = median(amounts.get(month, 0) for month in months)
         delta = (base * change["percent"] / 100 if change.get("percent") is not None
                  else change["amount"] * change.get("count", 1))
         delta = _round_money(delta)
         if source and delta < -base:
             return {"sufficientData": False, "reason": "所设减少额超过该来源的历史基准，请确认变化条件。"}
+        if delta < 0 and parts:
+            for row, amount in parts:
+                # For a shared label, distribute the reduction across its member baselines.
+                key = row["sourceKey"]
+                used[key] += -delta * amount / base
+                if money(used[key]) > row["estimate"]:
+                    return {"sufficientData": False, "reason": "多项减少条件重叠，累计减少额超过该来源的预测贡献。"}
         totals[metric] += delta
         assumptions.append({**change, "sourceBaseline": _round_money(base),
-                            "matchedSources": sorted(set(matched)), "totalChange": delta})
+                            "matchedSources": matched, "matchedSourceKeys": [row["sourceKey"] for row, _ in parts],
+                            "totalChange": delta})
     if min(totals.values()) < 0:
         return {"sufficientData": False, "reason": "变化会使收入或支出变成负数，请确认是否涉及退款或不同统计口径。"}
     return {"sufficientData": True, "totals": {key: _round_money(value) for key, value in totals.items()},
             "assumptions": assumptions}
 
 
-def baseline(orders, as_of, changes=None, target_month=None):
-    income = _forecast(orders, as_of=as_of, metric="income", target_month=target_month)
-    expense = _forecast(orders, as_of=as_of, metric="expense", target_month=target_month)
+def baseline(orders, as_of, changes=None, target_month=None, **kwargs):
+    scope = {"target_month": target_month, **forecast_scope(kwargs)}
+    income = _forecast(orders, as_of=as_of, metric="income", **scope)
+    expense = _forecast(orders, as_of=as_of, metric="expense", **scope)
     if not income["sufficientData"]:
         return {"sufficientData": False, "reason": "需要至少两个有记录的完整月份作为历史依据。"}
     adjusted = apply_changes(orders, income, expense, changes or [])
@@ -59,9 +107,10 @@ def baseline(orders, as_of, changes=None, target_month=None):
     totals = adjusted["totals"]
     net = _round_money(totals["income"] - totals["expense"])
     net_delta = net - (income["estimate"] - expense["estimate"])
-    observed = [row["net"] for row in income["monthlyEvidence"] if row["month"] in income["baselineMonths"]]
     return {"sufficientData": True, "income": totals["income"], "expense": totals["expense"], "net": net,
-            "lowerNet": _round_money(min(observed) + net_delta), "upperNet": _round_money(max(observed) + net_delta),
+            "lowerNet": money(income["lower"] - expense["upper"] + net_delta),
+            "upperNet": money(income["upper"] - expense["lower"] + net_delta),
+            "rangeMethod": "各收入来源情景界与支出上下界组合，按本次假设的净变动金额平移。",
             "assumptions": adjusted["assumptions"], "baselineMonths": income["baselineMonths"],
             "incomeRange": [income['lower'], income['upper']], "expenseRange": [expense['lower'], expense['upper']],
             "incomeSources": [row['source'] for row in income['sources']['income'] if not row['possibleNonrecurring']],
@@ -69,7 +118,7 @@ def baseline(orders, as_of, changes=None, target_month=None):
 
 
 def projection(orders, *, as_of, months=None, starting_balance=None, changes=None, target_month=None, **kwargs):
-    values = baseline(orders, as_of, changes, target_month)
+    values = baseline(orders, as_of, changes, target_month, **forecast_scope(kwargs))
     if not values["sufficientData"]:
         return values
     if months is None:
@@ -116,7 +165,7 @@ def optimization(orders, *, as_of, monthly_improvement=None, protected_categorie
     goal_details = {}
     starting, target, horizon = (kwargs.get(key) for key in ('starting_balance', 'target_amount', 'months'))
     if starting is not None and target is not None and horizon:
-        values = baseline(orders, as_of, kwargs.get('changes'))
+        values = baseline(orders, as_of, kwargs.get('changes'), **forecast_scope(kwargs))
         if not values['sufficientData']:
             return values
         required = max(0, (target - starting) / horizon)
@@ -152,7 +201,7 @@ def optimization(orders, *, as_of, monthly_improvement=None, protected_categorie
 
 def purchase(orders, *, as_of, purchase_amount=None, starting_balance=None, reserve_amount=None, **kwargs):
     missing = [key for key, value in (("purchaseAmount", purchase_amount), ("startingBalance", starting_balance)) if value is None]
-    values = baseline(orders, as_of, kwargs.get("changes"))
+    values = baseline(orders, as_of, kwargs.get("changes"), **forecast_scope(kwargs))
     if missing:
         return {"sufficientData": False, "missingInputs": missing, "purchaseAmount": purchase_amount, "baseline": values,
                 "reason": "月度结余不等于当前可用存款，不能据此判断买得起或买后生活困难。"}
@@ -166,7 +215,7 @@ def purchase(orders, *, as_of, purchase_amount=None, starting_balance=None, rese
 
 def runway(orders, *, as_of, starting_balance=None, changes=None, **kwargs):
     missing = (["startingBalance"] if starting_balance is None else []) + (["changes"] if not changes else [])
-    values = baseline(orders, as_of, changes)
+    values = baseline(orders, as_of, changes, **forecast_scope(kwargs))
     if missing or not values["sufficientData"]:
         return {"sufficientData": False, "missingInputs": missing, "baseline": values,
                 "reason": "需要当前可动用余额和收入减少的具体幅度，不能用每月结余代替资产。"}

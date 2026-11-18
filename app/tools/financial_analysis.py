@@ -22,7 +22,18 @@ from app.tools.order_calculations import (
 )
 
 
+from app.tools.source_analysis import (
+    income_source_forecasts,
+    money,
+    nonrecurring_income as _nonrecurring_income,
+    source_aliases,
+    source_catalog,
+    source_rows,
+)
+
+
 ANALYSIS_TOOLS = {
+    "sources": "按记账成员、原始备注归集收入和支出来源，给出分类、月度金额、剔除项和覆盖范围",
     "cashflow": "收入、支出、净现金流、笔数和分类结构",
     "trends": "按月和按日的趋势，区分本月未结束与完整月份",
     "changes": "最近两个完整月份收支变化及各类别贡献，解释变化来自哪里",
@@ -77,16 +88,6 @@ def _source(order: dict) -> str:
         remark = re.sub(r"\s+", " ", remark).strip()
         return remark[:48] or category
     return category
-
-
-def _nonrecurring_income(order: dict) -> bool:
-    text = f"{order.get('costType', '')} {order.get('orderRemark', '')}"
-    if any(word in text for word in ("退款", "退货", "报销", "借款", "借入", "归还借款", "出售", "卖车", "旧车", "二手", "一次性", "年终奖")):
-        return True
-    earned = ("工资", "薪", "家教", "课时", "授课", "劳务", "兼职", "稿费", "租金", "助研", "助教", "补贴")
-    if any(word in text for word in earned):
-        return False
-    return any(word in text for word in ("转入", "转账", "存款", "借还", "红包", "礼金", "报账"))
 
 
 def _totals(orders: list[dict]) -> dict:
@@ -228,82 +229,103 @@ def _anomalies(orders: list[dict], **kwargs) -> dict:
     }
 
 
-def _recurring(orders: list[dict], *, as_of: date, **kwargs) -> dict:
-    groups = defaultdict(list)
-    for order in orders:
-        direction = "income" if float(order["money"]) > 0 else "expense"
-        groups[(direction, _source(order))].append(order)
+def _recurring_summary(rows: list[dict], partial: set[str]) -> dict:
     result = {"income": [], "expense": []}
-    for (direction, source), items in groups.items():
-        month_totals = {month: sum(abs(float(row["money"])) for row in rows) for month, rows in _buckets(items).items()}
+    for row in rows:
+        month_totals = row["monthlyAmounts"]
         if len(month_totals) < 2:
             continue
-        dates = sorted({_date(item) for item in items})
-        gaps = [(later - earlier).days for earlier, later in zip(dates, dates[1:])]
-        partial = [row["month"] for row in _series(items, as_of, kwargs.get("window_start"), kwargs.get("window_end")) if row["partial"]]
-        full_month_amounts = [amount for month, amount in month_totals.items() if month not in partial]
-        result[direction].append({
-            "source": source, "months": month_totals,
-            "typicalAmount": _round_money(median(full_month_amounts)) if full_month_amounts else None,
-            "partialMonths": partial,
-            "activeMonths": len(month_totals), "transactions": len(items),
-            "medianGapDays": median(gaps) if gaps else None,
-            "possibleNonrecurring": direction == "income" and any(_nonrecurring_income(item) for item in items),
+        full = [amount for month, amount in month_totals.items() if month not in partial]
+        result[row["metric"]].append({
+            "source": row["source"], "sourceKey": row["sourceKey"], "member": row["member"],
+            "memberKey": row["memberKey"], "months": month_totals,
+            "typicalAmount": money(median(full)) if full else None,
+            "partialMonths": sorted(month_totals.keys() & partial),
+            "activeMonths": len(month_totals), "transactions": row["recordCount"],
+            "medianGapDays": row["medianGapDays"], "possibleNonrecurring": row["excluded"],
         })
-    for rows in result.values():
-        rows.sort(key=lambda row: row["typicalAmount"] or 0, reverse=True)
-        del rows[20:]
+    for items in result.values():
+        items.sort(key=lambda row: row["typicalAmount"] or 0, reverse=True)
+        del items[20:]
     return result
 
 
-def _forecast(orders: list[dict], *, as_of: date, metric: str = "income", target_month: str | None = None, **kwargs) -> dict:
+def _recurring(orders: list[dict], *, as_of: date, source_groups=None, **kwargs) -> dict:
+    partial = {row["month"] for row in _series(orders, as_of, kwargs.get("window_start"), kwargs.get("window_end"))
+               if row["partial"]}
+    return _recurring_summary(source_rows(orders, source_aliases(orders, source_groups)), partial)
+
+
+def _forecast(orders: list[dict], *, as_of: date, metric: str = "income", target_month: str | None = None,
+              source_groups=None, window_start=None, window_end=None, **kwargs) -> dict:
     target = date.fromisoformat(target_month + "-01") if target_month else shift_month(as_of, 1)
     cutoff = min(as_of.replace(day=1), target)
     start = shift_month(cutoff, -6)
-    history = [order for order in orders if start <= _date(order) < cutoff]
+    expected = [shift_month(start, offset) for offset in range(6)]
+    complete = {
+        month.strftime("%Y-%m") for month in expected
+        if (not window_start or month >= window_start)
+        and (not window_end or window_end >= month.replace(day=monthrange(month.year, month.month)[1]))
+    }
+    history = [order for order in orders if _date(order).strftime("%Y-%m") in complete]
     buckets = _buckets(history)
+    observed = list(buckets)
+    baseline = observed[-3:]
+    aliases = source_aliases(orders, source_groups)
+    rows = source_rows(history, aliases)
+    components = income_source_forecasts(rows, observed, baseline)
+
     values = []
-    excluded = 0.0
     for month, items in buckets.items():
         earned = [order for order in items if not (float(order["money"]) > 0 and _nonrecurring_income(order))]
         totals = _totals(earned)
-        excluded += sum(float(order["money"]) for order in items if float(order["money"]) > 0 and _nonrecurring_income(order))
-        values.append({"month": month, "income": totals["incomeTotal"], "expense": totals["expenseTotal"], "net": totals["netIncomeMinusExpense"]})
-    recent = values[-3:]
-    samples = [row[metric] for row in recent]
-    sufficient = len(samples) >= 2
-    estimate = None
+        values.append({"month": month, "income": totals["incomeTotal"], "expense": totals["expenseTotal"],
+                       "net": totals["netIncomeMinusExpense"]})
+    sufficient = len(baseline) >= 2
+    estimate = lower = upper = None
     if sufficient:
-        estimate = median(samples)
-        if metric == "net":
-            estimate = median(row["income"] for row in recent) - median(row["expense"] for row in recent)
-    expected = [shift_month(start, offset).strftime("%Y-%m") for offset in range(6)]
-    missing = [month for month in expected if month not in buckets]
+        expenses = [row["expense"] for row in values[-3:]]
+        expense = money(median(expenses))
+        income = money(sum(row["estimate"] for row in components))
+        lower_income = money(sum(row["lower"] for row in components))
+        upper_income = money(sum(row["upper"] for row in components))
+        if metric == "income":
+            estimate, lower, upper = income, lower_income, upper_income
+        elif metric == "expense":
+            estimate, lower, upper = expense, min(expenses), max(expenses)
+        else:
+            estimate = money(income - expense)
+            lower, upper = money(lower_income - max(expenses)), money(upper_income - min(expenses))
     return {
-        "metric": metric, "targetMonth": target.strftime("%Y-%m"),
-        "sufficientData": sufficient,
-        "estimate": _round_money(estimate) if sufficient else None,
-        "lower": min(samples) if sufficient else None,
-        "upper": max(samples) if sufficient else None,
-        "referenceValue": samples[-1] if samples else None,
-        "observedMonths": list(buckets), "missingMonths": missing,
-        "baselineMonths": [row["month"] for row in recent], "monthlyEvidence": values,
-        "excludedIncomeTotal": _round_money(excluded),
-        "sources": _recurring(history, as_of=as_of),
+        "metric": metric, "targetMonth": target.strftime("%Y-%m"), "sufficientData": sufficient,
+        "estimate": estimate, "lower": lower, "upper": upper,
+        "referenceValue": values[-1][metric] if values else None,
+        "observedMonths": observed, "missingMonths": sorted(complete.difference(observed)),
+        "baselineMonths": baseline, "monthlyEvidence": values,
+        "sourceForecasts": components if metric in {"income", "net"} else [],
+        "excludedIncomeTotal": money(sum(row["amount"] for row in rows if row["excluded"])),
+        "sources": _recurring_summary(rows, set()),
         "latestCompleteChange": _changes(history, as_of=as_of),
-        "method": "最近六个完整自然月内，取最近三个有账单月份的收入和支出中位数作为月度基准，结余为两者之差，最小值和最大值作为历史情景范围。",
+        "method": "最近六个完整自然月内取最近三个有账单的完整月份。每个成员的每个收入来源按月取中位数后加总；支出取月总额中位数，结余用两者相减。区间组合各来源的历史最低与最高贡献，支出区间取历史最小和最大月总额。",
         "limitations": [
-            "历史情景范围不表示统计置信区间或收入保证。",
-            "账单空白月份未按零处理，账本完整性需要用户确认。",
+            "同一月份各来源的极值未必同时发生。区间不表示统计置信区间或收入保证。",
+            "有其他账单但某来源无记录，该来源当月记作零贡献。全月没有账单则未知，不进入基准。",
+            "新出现、零星出现及基准期未出现仅描述记账记录，不能证明未来入账或就业变化。",
             "显式退款、报销、借款、资产出售、一次性入账与内部转入从预测收入剔除，备注识别可能有误。",
             "岗位、课时、季节、节假日及未来大额支出变化需要用户补充。",
         ],
     }
 
 
+def forecast_scope(options: dict) -> dict:
+    return {key: options[key] for key in ("source_groups", "target_month", "window_start", "window_end")
+            if key in options}
+
+
 def _scenario(orders: list[dict], *, as_of: date, target_month=None, changes=None, **kwargs) -> dict:
-    income = _forecast(orders, as_of=as_of, metric="income", target_month=target_month)
-    expense = _forecast(orders, as_of=as_of, metric="expense", target_month=target_month)
+    scope = {"target_month": target_month, **forecast_scope(kwargs)}
+    income = _forecast(orders, as_of=as_of, metric="income", **scope)
+    expense = _forecast(orders, as_of=as_of, metric="expense", **scope)
     changes = changes or []
     if not income["sufficientData"] or not changes:
         return {"sufficientData": False, "baseline": income, "reason": "需要历史月度基准和用户明确给出的变化金额或次数。"}
@@ -345,9 +367,10 @@ def _budget(orders: list[dict], *, as_of: date, target_month=None, budget_amount
 
 def _savings(orders: list[dict], *, as_of: date, starting_balance=None, target_amount=None, months=None, **kwargs) -> dict:
     missing = [name for name, value in (("startingBalance", starting_balance), ("targetAmount", target_amount)) if value is None]
-    baseline = _forecast(orders, as_of=as_of, metric="net")
+    scope = forecast_scope(kwargs)
+    baseline = _forecast(orders, as_of=as_of, metric="net", **scope)
     if kwargs.get("changes"):
-        changed = _scenario(orders, as_of=as_of, changes=kwargs["changes"])
+        changed = _scenario(orders, as_of=as_of, changes=kwargs["changes"], **scope)
         if not changed["sufficientData"]:
             return changed
         baseline = {**baseline, "estimate": changed["net"], "assumptions": changed["assumptions"]}
@@ -371,7 +394,7 @@ def _savings(orders: list[dict], *, as_of: date, starting_balance=None, target_a
 
 
 _IMPLEMENTATIONS = {
-    "cashflow": _cashflow, "trends": _trends, "changes": _changes,
+    "sources": source_catalog, "cashflow": _cashflow, "trends": _trends, "changes": _changes,
     "anomalies": _anomalies, "recurring": _recurring, "forecast": _forecast, "scenario": _scenario,
     "budget": _budget, "savings": _savings,
 }
