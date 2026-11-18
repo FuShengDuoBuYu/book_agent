@@ -1,6 +1,8 @@
+import json
 import unittest
-from datetime import datetime
-from unittest.mock import AsyncMock
+from datetime import date, datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from app.agent.book_agent import BookAgent
 from app.agent.analysis_context import resolve_context
@@ -38,8 +40,48 @@ class ConversationContextTests(unittest.TestCase):
 
 
 class InvestigationIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_supplemental_category_summary_keeps_primary_monthly_expense_chart(self):
+        from app.tools.financial_analysis import run_analysis
+        from tests.test_aggregate_analysis import row
+
+        plan = AgentPlan.model_validate({'intent': 'analyze_orders', 'needsTools': True,
+            'analyses': [{'tool': 'trends', 'metric': 'expense'}],
+            'toolCalls': [{'id': 'ledger', 'toolName': 'search_personal_orders'}],
+            'output': {'chart': 'line', 'metric': 'expense'},
+            'understanding': {'evidenceNeeds': ['trends']}})
+        today = date(2026, 11, 19)
+        records = [row('2026-09-02', -40, '餐饮'), row('2026-10-03', -100, '交通')]
+        results = [
+            {'tool': 'trends', 'mode': '个人版', 'supplemental': False,
+             'evidence': run_analysis('trends', records, as_of=today)},
+            {'tool': 'aggregate', 'mode': '个人版', 'supplemental': True,
+             'evidence': run_analysis('aggregate', records, as_of=today, metric='expense',
+                                      aggregate={'groupBy': ['category']})},
+        ]
+        agent = BookAgent.__new__(BookAgent)
+        agent.memory = AsyncMock()
+        agent.memory.ensure_session.return_value = 'synthetic'
+        agent.memory.get_recent_messages.return_value = []
+        agent._create_plan = AsyncMock(return_value=plan)
+        agent._execute_tool_calls = AsyncMock(return_value=json.dumps({'analysisResults': results}))
+        agent.reporter = SimpleNamespace(answer=AsyncMock(return_value=('核算完成。', {})))
+
+        async def immediate_progress(work, _):
+            yield {'type': 'result', 'value': await work}
+
+        with patch('app.agent.book_agent.with_progress', immediate_progress):
+            events = [event async for event in agent.stream_chat('synthetic', '近两个月支出折线图')]
+        self.assertEqual(events[-1]['type'], 'done')
+        artifacts = next(event['artifacts'] for event in events if event['type'] == 'artifacts')
+        charts = [item for item in artifacts if item['kind'] == 'line']
+        self.assertEqual([item['xKey'] for item in charts], ['month'])
+        self.assertEqual(charts[0]['series'], [{'key': 'expense', 'label': '支出'}])
+        self.assertEqual([(item['month'], item['expense']) for item in charts[0]['rows']],
+                         [('2026-09', 40), ('2026-10', 100)])
+        supplementary_tables = [item for item in artifacts if item['kind'] == 'table']
+        self.assertEqual({item['category'] for item in supplementary_tables[0]['rows']}, {'餐饮', '交通'})
+
     async def test_supplemental_income_reconciles_but_does_not_become_the_followup_goal(self):
-        import json
         from app.agent.investigation import EvidenceInvestigator, InvestigationDecision
         from app.schemas.plan import AnalysisRequest
         from tests.test_aggregate_analysis import row
@@ -73,7 +115,6 @@ class InvestigationIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(t.tool, t.targetMonth) for t in followup.analyses], [('forecast', '2027-01')])
 
     async def test_reflection_sees_initial_calculation_and_recomputes_grouped_forecast(self):
-        import json
         from zoneinfo import ZoneInfo
         from app.agent.investigation import InvestigationDecision
         from scripts.evaluate_intent import IntentLedger, STAGES

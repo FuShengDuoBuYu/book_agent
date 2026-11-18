@@ -38,7 +38,7 @@ class ModelConfigurationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reviewer.bound.num_predict, 512)
         self.assertFalse(reviewer.bound.reasoning)
         self.assertEqual(planner.num_predict, 4096)
-        self.assertTrue(planner.reasoning)
+        self.assertFalse(planner.reasoning)
 
     def setUp(self):
         for factory in (get_settings, get_chat_model, get_planner_model, get_structured_model):
@@ -107,7 +107,7 @@ class ModelConfigurationTests(unittest.IsolatedAsyncioTestCase):
             chat = get_chat_model()
             planner = get_planner_model()
         self.assertTrue(chat.reasoning)
-        self.assertTrue(planner.reasoning)
+        self.assertFalse(planner.reasoning)
         self.assertEqual(chat.num_ctx, 32768)
         self.assertEqual(chat.keep_alive, '60s')
 

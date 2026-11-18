@@ -199,9 +199,9 @@ class BookAgent:
             if plan.analyses:
                 results = self._safe_json_loads(orders_json).get('analysisResults', [])
                 needs = set(plan.understanding.evidenceNeeds)
-                chart_target = ('projection' if any(row['tool'] == 'projection' for row in results) else
-                                'forecast' if any(row['tool'] == 'forecast' for row in results) else
-                                'aggregate' if any(row['tool'] == 'aggregate' for row in results) else 'trends')
+                primary_tools = {row['tool'] for row in results if not row.get('supplemental')}
+                chart_target = next((tool for tool in ('projection', 'forecast', 'aggregate', 'trends')
+                                     if tool in primary_tools), None)
                 output = {**plan.output.model_dump(), 'chartTarget': chart_target,
                           'includeLineage': 'remarks' in needs,
                           'includeSources': bool(needs & {'sources', 'members', 'remarks'} or
@@ -325,6 +325,7 @@ class BookAgent:
                       "model": {"provider": settings.llm_provider, "name": settings.llm_model,
                                 "reasoning": settings.llm_reasoning,
                                 "planningReasoning": settings.planner_reasoning,
+                                "intentReasoning": settings.intent_reasoning,
                                 "reasoningEffort": settings.llm_reasoning_effort,
                                 "contextLength": settings.ollama_num_ctx,
                                 "gpuLayers": settings.ollama_num_gpu,

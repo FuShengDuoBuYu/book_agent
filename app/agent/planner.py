@@ -11,9 +11,11 @@ from pydantic import ValidationError
 
 from app.core.config import get_settings
 from app.core.llm import get_planner_model
-from app.agent.analysis_context import resolve_context
+from app.agent.analysis_context import remove_withdrawn_changes, resolve_context
+from app.agent.intent_resolution import IntentResolver
 from app.agent.plan_parsing import repair_descriptive_arrays
-from app.agent.plan_review import NUMBER, PlanReviewer, explicit_month_delta, named_percent_changes, sanitize_user_conditions
+from app.agent.report_context import build_report_context
+from app.agent.plan_review import NUMBER, PlanReviewer, explicit_month_delta, explicit_projection_start, named_percent_changes, sanitize_user_conditions
 from app.agent.prompts import PLANNER_HUMAN_PROMPT, PLANNER_SYSTEM_PROMPT
 from app.schemas.plan import (
     AgentPlan,
@@ -92,7 +94,8 @@ def explicit_complete_month_window(message, today):
 
 def _future_month_count(message):
     match = re.findall(rf"(?:未来|接下来|今后|往后)\s*({NUMBER})\s*个月(?!\s*后)", message)
-    if len(match) == 1:
+    match.extend(re.findall(rf"(?:按|改为|改成)\s*({NUMBER})\s*个月\s*(?=(?:来|重新|再|重)?(?:推演|预测|测算|估算|计算))", message))
+    if len(set(match)) == 1:
         value = explicit_goal_amount(match[0])
         if value is not None and value == int(value) and 1 < value <= 600:
             return int(value)
@@ -130,6 +133,7 @@ class QueryPlanner:
             analysis_tools_text="\n".join(f"- {name}: {description}" for name, description in ANALYSIS_TOOLS.items()),
         )
         self.chain = self.prompt | get_planner_model()
+        self.intent_resolver = IntentResolver()
         self.reviewer = PlanReviewer()
 
     @traceable(name="query_planner", run_type="chain")
@@ -151,8 +155,28 @@ class QueryPlanner:
         }
         plan = self._fallback_plan()
         issues = []
+        resolved_goal = None
+        if getattr(self, 'intent_resolver', None):
+            resolved_goal, audit = await self.intent_resolver.resolve(
+                message, history, now.date(), self._normalize_mode(book_mode), previous_context)
+            issues.append({'type': 'intent_resolution', **audit})
         for attempt in range(2):
             try:
+                if getattr(self, 'prompt', None):
+                    # Native JSON grammar is not chat text. Preserve the current
+                    # goal and scoped conditions before fitting conversation text.
+                    system = self.prompt.format_messages(**{**prompt_values, 'history': ''})[0].content
+                    bounded, _, budget = build_report_context({
+                        'question': prompt_values['message'], 'history': history,
+                        'understanding': resolved_goal.model_dump() if resolved_goal else {},
+                        'userConditions': previous_context}, [], system, {},
+                        num_ctx=get_settings().ollama_num_ctx, num_predict=get_settings().planner_num_predict)
+                    prompt_values['history'] = bounded['history'] + '\n已解析的有范围条件：' + json.dumps(
+                        bounded['userConditions'], ensure_ascii=False, separators=(',', ':'))
+                    if resolved_goal:
+                        prompt_values['history'] += '\n本轮意图理解（逐项落实到执行参数）：' + json.dumps(
+                            resolved_goal.model_dump(), ensure_ascii=False, separators=(',', ':'))
+                    issues.append({'type': 'planning_context', **budget})
                 response = await asyncio.wait_for(
                     self.chain.ainvoke(prompt_values),
                     timeout=get_settings().planner_timeout_seconds,
@@ -167,6 +191,8 @@ class QueryPlanner:
                 if not data:
                     raise ValueError("Missing plan")
                 plan = AgentPlan.model_validate(data)
+                if resolved_goal:
+                    plan.understanding = resolved_goal.model_copy(deep=True)
                 self._normalize_query_scopes(plan)
                 self._materialize_requirements(plan)
                 self._sanitize_conditions(plan, message, book_mode, previous_context)
@@ -194,12 +220,12 @@ class QueryPlanner:
                             task.aggregate.periods = relative_periods
                 self._preserve_referent_window(plan, previous_context or {}, message, now)
                 context = self._inherit_conversation(plan, previous_context or {})
-                self._normalize_projection(plan, message, context, book_mode)
+                self._normalize_projection(plan, message, context, book_mode, now.date())
                 self._normalize_explicit_conditions(plan, message)
                 self._sanitize_conditions(plan, message, book_mode, context)
                 self._coalesce_forecasts(plan)
                 resolve_context(plan, context, self._normalize_mode(book_mode))
-                self._sanitize_conditions(plan, message, book_mode, plan._analysis_context)
+                self._sanitize_conditions(plan, message, book_mode, plan._analysis_context, prune_prior=False)
                 if requested_window and plan.intent == 'analyze_orders' and not plan.analyses and plan.toolCalls:
                     self._prepare_analysis_queries(plan, now, book_mode)
                 plan._planning_issues.extend(issues)
@@ -237,7 +263,7 @@ class QueryPlanner:
             repaired, self._parse_repairs = repair_descriptive_arrays(content)
             return json.loads(repaired)
 
-    def _normalize_projection(self, plan, message, context, book_mode):
+    def _normalize_projection(self, plan, message, context, book_mode, today):
         if plan.intent != 'analyze_orders' or not plan.analyses:
             return
         scopes = {(c.toolName, c.args.cost_type, c.args.remark) for c in plan.toolCalls}
@@ -258,8 +284,9 @@ class QueryPlanner:
         delta = explicit_month_delta(message)
         other_goals = any(t.tool in {'purchase', 'runway', 'savings', 'budget', 'optimization'} for t in plan.analyses)
         cumulative = bool(re.search(r'累计.*?结余|多月推演|累计.*?存', intent))
+        withdrawn = any(issue['type'] == 'withdrawn_source_assumption' for issue in plan._planning_issues)
         amend = (len(active) == 1 and not re.search(r'只(?:看|算)|仅(?:看|算)|下下?个?月(?:的|会|能)', message)
-                 and ((not other_goals and bool(conditions)) or delta is not None or cumulative))
+                 and ((not other_goals and (conditions or withdrawn)) or delta is not None or cumulative))
         outlook = bool(scenarios or any(t.tool == 'forecast' for t in plan.analyses)
                        or re.search(r'收支|结余|能存|收入预测|支出预测', message))
         if not projections and ((horizon and outlook and not other_goals) or amend):
@@ -274,11 +301,15 @@ class QueryPlanner:
             projections = [task]
         if len(projections) == 1:
             projection = projections[0]
+            start = explicit_projection_start(message, today)
             if horizon:
                 projection.months = horizon
             elif amend:
-                projection.months = prior.get('months')
-                projection.targetMonth = prior.get('targetMonth')
+                projection.months = prior.get('months') or projection.months
+            if start:
+                projection.targetMonth = start
+            elif amend:
+                projection.targetMonth = prior.get('targetMonth') or projection.targetMonth
             if delta is not None and prior.get('months'):
                 projection.monthsDelta = delta
         adjustable = [t for t in plan.analyses if t.tool in {'projection', 'scenario', 'runway', 'savings', 'optimization'}]
@@ -464,8 +495,12 @@ class QueryPlanner:
 
         return plan
 
-    def _sanitize_conditions(self, plan, message, book_mode, context):
+    def _sanitize_conditions(self, plan, message, book_mode, context, *, prune_prior=True):
         issues = sanitize_user_conditions(plan, message, self._normalize_mode(book_mode), context)
+        withdrawn = {(issue['metric'], issue['source']) for issue in issues if issue['type'] == 'withdrawn_source_assumption'}
+        # On the final pass context already contains newly validated replacements.
+        if withdrawn and prune_prior:
+            remove_withdrawn_changes(context, withdrawn)
         for issue in issues:
             if issue.get('retirePrevious'):
                 field = issue['field']

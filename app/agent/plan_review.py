@@ -119,15 +119,59 @@ def _same_change(change, prior):
                for k, default in (("metric", None), ("source", ""), ("amount", None), ("percent", None), ("count", 1)))
 
 
+# Retractions describe the assumption to remove, not a new numerical condition.
+WITHDRAW = re.compile(r"不再(?:假设|假定|考虑|按)|(?:撤回|撤销|(?:取消|去掉|移除)(?=.{0,100}(?:假设|情景)))(?:之前|原来|原先|刚才|上次|上轮)?(?:的)?(?:关于)?")
+KEEP = re.compile(r"不(?:想|要|用|必|会)?(?:再)?(?:改变|调整|改动|取消|撤回|撤销|移除|去掉)")
+CORRECTION = re.compile(r"(?:不是|并非)([^，,。；！？;]+?)(?:[，,]\s*(?:而?是)|而是)")
+
+
+def _scenario_clauses(question):
+    # Isolate the replacement operand in “不是 A，是 B 减半” with or without a comma.
+    text = CORRECTION.sub(lambda m: f"不是{m[1]}，", question)
+    return [clause.strip() for clause in CLAUSES.split(text)]
+
+
+def _negated_change(clause):
+    return NEGATED.search(clause) or WITHDRAW.search(clause) or KEEP.search(clause)
+
+
+def _withdrawn_changes(question, previous):
+    """Find scoped (metric, source) keys explicitly excluded by the user."""
+    keys = {(c["metric"], c["source"]) for c in previous if c.get("source")}
+    withdrawn = set()
+    for clause in _scenario_clauses(question):
+        if KEEP.search(clause):
+            continue
+        cue = WITHDRAW.search(clause) or re.search(r"(?:按|用)正常(?:的)?", clause)
+        if not cue and CORRECTION.search(question):
+            cue = re.match(r"(?:不是|并非)", clause)
+        subject = clause[cue.end():].strip() if cue else clause
+        matches = set()
+        for metric, source in keys:
+            role = "收入" if metric == "income" else "支出"
+            name = source.removesuffix(role) or source
+            reference = re.match(rf"^[‘'“「]?{re.escape(name)}[’'”」]?(?:的)?(收入|支出)?", subject)
+            if not reference or reference[1] not in (None, role):
+                continue
+            tail = subject[reference.end():].strip()
+            normal = re.match(r"(?:恢复|回到)(?:原本|原先|正常|原状)", tail)
+            if normal or (cue and re.match(r"^(?:$|的?假设|的?情景|可能|会|将|减|增|多|少|上涨|下降|停|重新|再算|算|推演)", tail)):
+                matches.add((metric, source))
+        # “按正常培训算” cannot disambiguate income and spending of the same name.
+        if len(matches) == 1:
+            withdrawn.update(matches)
+    return withdrawn
+
+
 def named_percent_changes(question):
     """Read a literal subject and percentage from a single directed change clause."""
     result = []
-    for clause in CLAUSES.split(question):
-        if NEGATED.search(clause):
+    for clause in _scenario_clauses(question):
+        if _negated_change(clause):
             continue
         # A condition may follow an introductory phrase ("未来三个月如果…").
         clause = re.split(r"如果|假如|假设|假定|要是", clause)[-1].strip()
-        clause = re.sub(r"^(?:那么?|我的?|下个?月|未来\s*(?:" + NUMBER + r")\s*个月)+", "", clause)
+        clause = re.sub(r"^(?:那么?|改为|改成|我的?|下个?月|未来\s*(?:" + NUMBER + r")\s*个月)+", "", clause)
         match = re.match(
             rf"(?P<subject>[\w·'‘’「」“”]{{1,100}}?)(?:预计|可能|将会|将|会|大概|大约)*\s*"
             rf"(?P<verb>减少|降低|下降|缩减|少|减|增加|上涨|多)\s*"
@@ -158,13 +202,13 @@ def explicit_month_delta(question):
     return None
 
 
-def _change_supported(change, question, prior):
-    if any(_same_change(change, old) for old in prior.get("changes", [])):
+def _change_supported(change, question, prior, withdrawn):
+    if (change.metric, change.source) not in withdrawn and any(_same_change(change, old) for old in prior.get("changes", [])):
         return True
-    clauses = CLAUSES.split(question)
+    clauses = _scenario_clauses(question)
     for i, clause in enumerate(clauses):
         delta = change.amount if change.amount is not None else change.percent
-        if NEGATED.search(clause):
+        if _negated_change(clause):
             continue
         if not delta:
             if "不变" in clause or "保持原样" in clause:
@@ -222,9 +266,13 @@ def _check_conditions(analyses, plan, question, mode, previous, *, strip):
                                "field": field, **({"retirePrevious": True} if retire else {})})
                 if strip and unsupported:
                     setattr(task, field, None)
+        withdrawn = _withdrawn_changes(question, prior.get("changes", []))
+        if strip:
+            for metric, source in sorted(withdrawn):
+                issues.append({"type": "withdrawn_source_assumption", "field": "changes", "metric": metric, "source": source})
         if not task:
             continue
-        kept = [change for change in task.changes if _change_supported(change, question, prior)]
+        kept = [change for change in task.changes if _change_supported(change, question, prior, withdrawn)]
         if len(kept) != len(task.changes):
             issues.append({"type": "unsupported_user_condition", "tool": task.tool, "field": "changes"})
             if strip:
@@ -280,6 +328,18 @@ def _time_evidence(question, today):
                 if clause[match.end():].lstrip().startswith("后"):
                     targets.add(shift_month(today, int(count)).strftime("%Y-%m"))
     return targets, durations["future"] or durations["unspecified"]
+
+
+def explicit_projection_start(question, today):
+    months = rf"(?:\d{{4}}[-/.]\d{{1,2}}|(?:(?:\d{{4}}年|明年|今年)\s*)?{NUMBER}月|下下?个?月|本月|这个月)"
+    starts = set()
+    for clause in CLAUSES.split(question):
+        if NEGATED.search(clause) or HISTORY_WORDS.search(clause):
+            continue
+        for match in re.finditer(rf"(?:从)?({months})\s*(?:份)?\s*(?:开始|起算|起)", clause):
+            targets, _ = _time_evidence(match[1], today)
+            starts.update(t for t in targets if t >= today.strftime("%Y-%m"))
+    return next(iter(starts)) if len(starts) == 1 else None
 
 
 def _binding_issue(decision, plan, logical_ids, question, today, mode, previous):

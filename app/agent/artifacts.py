@@ -194,7 +194,7 @@ def build_artifacts(results, output=None, window=None):
     for result in results:
         tool, e = result['tool'], result.get('evidence', {})
         scope = result.get('mode', '当前账本')
-        kind = chart if tool == chart_target and chart in {'line', 'bar'} else 'table'
+        kind = chart if tool == chart_target and chart in {'line', 'bar'} and not result.get('supplemental') else 'table'
         if tool == 'aggregate':
             for suffix, columns, rows, notes in _aggregate_tables(e, chart_requested=kind != 'table'):
                 add(f'{scope} {suffix}', columns, rows, notes=notes)

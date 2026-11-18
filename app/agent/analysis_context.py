@@ -18,6 +18,15 @@ def latest_context(messages):
     return {}
 
 
+def remove_withdrawn_changes(context, keys):
+    # Cached tasks may supply a later source-only follow-up as well as the next decision.
+    states = [context, *context.get('scenarios', []), *context.get('activeAnalyses', []),
+              *context.get('conversation', {}).get('analyses', [])]
+    for state in states:
+        if 'changes' in state:
+            state['changes'] = [c for c in state['changes'] if (c['metric'], c.get('source') or '') not in keys]
+
+
 def merge_changes(previous, current):
     # Replace previous conditions for a source, preserving multiple changes
     # stated together (e.g. two independent additional income streams).

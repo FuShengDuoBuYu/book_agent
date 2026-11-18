@@ -149,3 +149,83 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
         other = await self.plan('个人账本，培训支出减半，重新算。',
             {'followUpOfPreviousQuestion': True, 'analyses': [{'tool': 'scenario'}]}, previous)
         self.assertEqual([t.tool for t in other.analyses], ['scenario'])
+
+    async def test_retracted_source_is_removed_before_merge_and_remains_removed_after_reload(self):
+        wage = {'metric': 'income', 'source': '工资', 'percent': -50}
+        other = {'metric': 'income', 'source': '稿费', 'percent': -20}
+        first = await self.plan('未来三个月假设工资收入减半，稿费收入减少20%，房租不动。',
+            {'analyses': [{'tool': 'projection', 'changes': [wage, other], 'protectedCategories': ['房租']}]}, {})
+        prior = await self.save(first)
+        self.assertEqual(len(prior['changes']), 2)
+        for supplied in ([], [wage, other]):
+            plan = await self.plan('不再假设工资收入减半，按正常工资重新推演。',
+                {'followUpOfPreviousQuestion': True, 'analyses': [{'tool': 'projection', 'changes': supplied}]}, prior)
+            self.assertEqual([(c.source,c.percent) for c in plan.analyses[0].changes], [('稿费',-20)])
+            saved = await self.save(plan)
+            self.assertEqual((saved['months'], saved['protectedCategories']), (3, ['房租']))
+            continued = await self.plan('把期限延长一个月。', {'followUpOfPreviousQuestion': True,
+                'analyses': [{'tool':'projection'}]}, saved)
+            self.assertEqual([(c.source,c.percent) for c in continued.analyses[0].changes], [('稿费',-20)])
+            rows = [{'year': 2026, 'month': m, 'day': 4, 'money': amount, 'costType': kind, 'orderRemark': name}
+                    for m in (8,9,10) for amount,kind,name in [(5000,'工资','工资'),(1000,'收入','稿费'),(-2000,'房租','房租')]]
+            results = collect_analysis_results(continued, {'个人版': [(q,rows) for q in continued.toolCalls]}, date(2026,11,19))
+            evidence = next(r['evidence'] for r in results if r['tool'] == 'projection')
+            self.assertEqual((evidence['monthlyNet'], evidence['totalNet']), (3800,15200))
+
+    async def test_correction_replaces_source_and_retention_does_not_retract(self):
+        wage = {'metric':'income', 'source':'工资', 'percent':-50}
+        previous = await self.save(await self.plan('如果工资收入减半，未来三个月结余多少？',
+            {'analyses':[{'tool':'projection', 'changes':[wage]}]}, {}))
+        for phrase in ('不是工资，是稿费减半。', '不是工资而是稿费减半。'):
+            plan = await self.plan(phrase, {'followUpOfPreviousQuestion':True,
+                'understanding':{'referents':['稿费收入']}, 'analyses':[{'tool':'scenario', 'changes':[wage]}]}, previous)
+            self.assertEqual([(c.source,c.metric,c.percent) for c in plan.analyses[0].changes], [('稿费','income',-50)])
+        for phrase in ('不想改变工资收入减半的假设，继续推演。', '不要撤回工资的假设，重新算。'):
+            plan = await self.plan(phrase, {'followUpOfPreviousQuestion':True, 'analyses':[{'tool':'projection'}]}, previous)
+            self.assertEqual([(c.source,c.percent) for c in plan.analyses[0].changes], [('工资',-50)])
+        new = await self.plan('换个问题，未来三个月的正常结余？', {'analyses':[{'tool':'projection'}]}, previous)
+        self.assertFalse(new.analyses[0].changes)
+
+    async def test_reviewer_cannot_restore_retracted_prior_change_even_with_same_source_on_other_metric(self):
+        income = {'metric':'income','source':'培训','percent':-50}
+        expense = {'metric':'expense','source':'培训','percent':-20}
+        prior = {'scope':[['search_personal_orders','不限','']], 'changes':[income, expense], 'months':3}
+        question = '不再假设培训收入减半，按正常培训收入算。'
+        draft = {'followUpOfPreviousQuestion': True, 'analyses':[{'tool':'projection'}]}
+        p = await self.plan(question, draft, prior)
+        self.assertEqual([(c.metric,c.percent) for c in p.analyses[0].changes], [('expense',-20)])
+        decision = {'adequate':False, 'issues':[], 'analysisWindow':None, 'answerInstruction':'',
+                    'analyses':[{'tool':'projection', 'changes':[income,expense]}]}
+        model = AsyncMock()
+        model.ainvoke.return_value = SimpleNamespace(content=json.dumps(decision))
+        with patch('app.agent.plan_review.get_structured_model', return_value=model):
+            result, audit = await PlanReviewer().review(question, '', AgentPlan.model_validate(draft), date(2026,11,19),'个人版',prior)
+        self.assertIsNone(result)
+        self.assertEqual(audit['error'],'unsupported_changes')
+
+    async def test_explicit_start_and_duration_override_only_the_requested_projection_condition(self):
+        original = await self.plan('未来三个月结余多少？', {'analyses': [{'tool':'projection','months':3}]}, {})
+        prior = await self.save(original)
+        wage = {'metric':'income','source':'工资','percent':-50}
+        for phrase, fields, expected in [
+            ('从2027年2月开始，工资收入减半，按同样期限重新推演。', {'targetMonth':'2027-02'}, (3,'2027-02')),
+            ('工资收入减半，按六个月重新推演。', {'months':6}, (6,'2026-12')),
+            ('参考过去六个月的样本，工资收入减半，按原期限推演。', {'months':6}, (3,'2026-12')),
+        ]:
+            with self.subTest(phrase=phrase):
+                draft = {'followUpOfPreviousQuestion':True, 'analyses':[{'tool':'projection','changes':[wage], **fields}]}
+                plan = await self.plan(phrase, draft, prior)
+                self.assertEqual((plan.analyses[0].months,plan.analyses[0].targetMonth), expected)
+                self.assertEqual((plan._analysis_context['months'],plan._analysis_context['targetMonth']), expected)
+
+    async def test_same_source_replacement_remains_the_next_turn_assumption(self):
+        original = await self.plan('工资收入减半，未来三个月能存多少？',
+            {'analyses': [{'tool':'projection','changes':[{'metric':'income','source':'工资','percent':-50}]}]}, {})
+        prior = await self.save(original)
+        replacement = {'metric':'income','source':'工资','percent':-20}
+        plan = await self.plan('不再假设工资收入减半，改为工资收入减少20%。',
+            {'followUpOfPreviousQuestion':True, 'analyses':[{'tool':'projection','changes':[replacement]}]},prior)
+        saved = await self.save(plan)
+        self.assertEqual([(c['source'],c['percent']) for c in saved['changes']], [('工资',-20)])
+        follow = await self.plan('按刚才的情景再算。', {'followUpOfPreviousQuestion':True, 'analyses':[{'tool':'projection'}]},saved)
+        self.assertEqual([(c.source,c.percent) for c in follow.analyses[0].changes], [('工资',-20)])

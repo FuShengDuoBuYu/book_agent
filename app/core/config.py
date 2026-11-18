@@ -26,12 +26,13 @@ class Settings(BaseModel):
     llm_temperature: float = Field(default=0.2, ge=0, le=2)
     llm_reasoning_effort: str | None = None
     llm_reasoning: bool = False
-    planner_reasoning: bool = True
+    planner_reasoning: bool = False
+    intent_reasoning: bool = True
     ollama_num_ctx: int = Field(default=8192, gt=0)
     ollama_keep_alive: str = '60s'
     ollama_num_gpu: int | None = Field(default=None, ge=0)
-    planner_timeout_seconds: float = Field(default=20.0, gt=0)
-    planner_num_predict: int = Field(default=4096, gt=0)
+    planner_timeout_seconds: float = Field(default=50.0, gt=0)
+    planner_num_predict: int = Field(default=2048, gt=0)
     request_timeout_seconds: float = Field(default=120.0, gt=0)
     frontend_dist: Path = BASE_DIR / "frontend" / "dist"
 
@@ -76,6 +77,7 @@ def get_settings() -> Settings:
         llm_reasoning_effort=os.getenv("LLM_REASONING_EFFORT") or None,
         llm_reasoning=os.getenv("LLM_REASONING", str(defaults.llm_reasoning)),
         planner_reasoning=os.getenv("LLM_PLANNING_REASONING", str(defaults.planner_reasoning)),
+        intent_reasoning=os.getenv("LLM_INTENT_REASONING", str(defaults.intent_reasoning)),
         ollama_num_ctx=os.getenv("OLLAMA_NUM_CTX", str(defaults.ollama_num_ctx)),
         ollama_keep_alive=os.getenv('OLLAMA_KEEP_ALIVE', defaults.ollama_keep_alive),
         ollama_num_gpu=os.getenv('OLLAMA_NUM_GPU') or None,

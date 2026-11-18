@@ -22,6 +22,8 @@ def planner_schema():
 
 def _execution_schema(schema):
     """Native generation must fill execution fields, rather than rely on API defaults."""
+    if schema.get('title') == 'IntentUnderstanding':
+        schema['required'] = list(schema['properties'])
     definitions = schema.get('$defs', {})
     for name, fields in {
         'AnalysisRequest': ['aggregate', 'changes', 'months'],
