@@ -40,6 +40,28 @@ class ConversationContextTests(unittest.TestCase):
 
 
 class InvestigationIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_evidence_inspection_keeps_the_parent_goal_for_a_later_method_followup(self):
+        from app.agent.analysis_context import latest_context
+        prior = {'scope': [['search_personal_orders', '不限', '']], 'targetMonth': '2027-01',
+            'activeAnalyses': [{'tool': 'forecast', 'queryIds': ['old'], 'metric': 'income', 'targetMonth': '2027-01'}],
+            'activeHistoryWindow': None}
+        plan = AgentPlan.model_validate({'followUpOfPreviousQuestion': True,
+            'toolCalls': [{'id': 'check', 'toolName': 'search_personal_orders'}],
+            'analyses': [{'tool': 'sources'}, {'tool': 'trends'}],
+            'understanding': {'objective': '核查原始备注，解释收入项目的归并依据'}})
+        plan._analysis_context = dict(prior)
+        agent = BookAgent.__new__(BookAgent)
+        agent.memory = AsyncMock()
+        await agent._save_assistant_reply('synthetic', 'synthetic', '核查依据。', plan)
+        saved = agent.memory.add_message.await_args.kwargs
+        context = latest_context([saved])
+        self.assertEqual(context['activeAnalyses'], prior['activeAnalyses'])
+        follow = AgentPlan.model_validate({'followUpOfPreviousQuestion': True,
+            'toolCalls': [{'id': 'derive', 'toolName': 'search_personal_orders'}],
+            'analyses': [{'tool': 'sources', 'targetMonth': '2027-01'}, {'tool': 'trends'}]})
+        QueryPlanner.__new__(QueryPlanner)._inherit_conversation(follow, context)
+        self.assertTrue(any(t.tool == 'forecast' and t.targetMonth == '2027-01' for t in follow.analyses))
+
     async def test_old_merged_alias_is_grounded_before_initial_forecast_is_sent_to_investigation(self):
         from app.agent.investigation import InvestigationDecision
         from app.tools.source_analysis import observed_source_key

@@ -21,6 +21,27 @@ MONTH_SERIES = re.compile(
 DATE_UNIT = re.compile(r'\s*(?!笔数|笔均|天数|次数|次月)(?:元|块|%|％|个月|笔|天|次)')
 ORDINAL = re.compile(r'(?m)^[ \t]*(?:#{1,6}[ \t]+)?(?:[（(]\d{1,2}[）)]|\d{1,2}[.)）、．])[ \t]*(?!元|块|个月|笔|天|次)(?=[A-Za-z\u3400-\u9fff*])')
 NUMBER_UNIT = re.compile(r'([-+]?\d+(?:,\d{3})*(?:\.\d+)?)\s*(元|块|%|％|个月|笔|天|次|个|项|组)')
+CHINESE_NUMBER = r'[负正+-]?[零〇一二两三四五六七八九十百千万亿点]+'
+CHINESE_UNIT = r'(元|块|%|％|个月)'
+
+
+def _chinese_value(raw):
+    from app.agent.planner import explicit_goal_amount
+    if len(raw) > 80:
+        return None
+    negative = raw.startswith(('负', '-'))
+    raw = raw.lstrip('负正+-').replace('〇', '零')
+    integer, dot, fraction = raw.partition('点')
+    whole = explicit_goal_amount(integer)
+    if whole is None:
+        return None
+    digits = {char: str(number) for number, char in enumerate('零一二三四五六七八九')}
+    if dot and (not fraction or any(char not in digits for char in fraction)):
+        return None
+    result = Decimal(str(whole))
+    if dot:
+        result += Decimal('0.' + ''.join(digits[char] for char in fraction))
+    return -result if negative else result
 
 
 def literal(value):
@@ -196,6 +217,19 @@ def numerical_issues(text, fact_ids, facts):
             return ''
         return match[0]
     remainder = NUMBER_UNIT.sub(quantity, remainder)
+    def known_chinese(raw, unit):
+        value = _chinese_value(raw)
+        unit = {'块': '元', '％': '%'}.get(unit, unit)
+        return value is not None and any(row['unit'] == unit and isinstance(row['value'], (int, float))
+            and Decimal(str(row['value'])) == value for row in allowed)
+    def chinese_range(match):
+        first, last, unit = match.groups()
+        if not (known_chinese(first, unit) and known_chinese(last, unit)):
+            issues.append('中文数量区间必须来自本段引用的相同指标与单位')
+        return ''
+    remainder = re.sub(rf'({CHINESE_NUMBER})\s*(?:～|~|至|到|—|–)\s*({CHINESE_NUMBER})\s*{CHINESE_UNIT}', chinese_range, remainder)
+    remainder = re.sub(rf'({CHINESE_NUMBER})\s*{CHINESE_UNIT}',
+        lambda match: '' if known_chinese(match[1], match[2]) else match[0], remainder)
     remainder = ORDINAL.sub('', remainder)
     if QUANTITY.search(remainder):
         issues.append('未核实的数量或日期：' + remainder[:240] + '；请引用本段计算事实的相同指标与单位，或使用 values 变量')

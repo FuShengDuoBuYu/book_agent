@@ -44,6 +44,16 @@ class EvidenceReportTests(unittest.TestCase):
         draft = self.draft(title='2027-01 分项收入', factIds=[child['id']], analysis='先确认这些来源后续是否继续。')
         self.assertFalse([issue for issue in validate_draft(draft, facts) if '日期' in issue])
 
+    def test_projection_calendar_includes_every_computed_month_across_year_boundary(self):
+        from datetime import date
+        from app.tools.financial_analysis import run_analysis
+        from tests.test_decision_analysis import ledger
+        evidence = run_analysis('projection', ledger(), as_of=date(2026, 11, 19), months=3, target_month='2026-12')
+        facts = build_facts([{'tool': 'projection', 'evidence': evidence}])
+        draft = self.draft(title='未来三个月', factIds=[row['id'] for row in facts if row['required']],
+                           analysis='2026-12 至 2027-02 这三个月的结果以所列假设为前提。')
+        self.assertEqual(validate_draft(draft, facts), [])
+
     def test_supplemental_investigation_does_not_add_mandatory_answer_objectives(self):
         facts = build_facts([{'tool': 'purchase', 'supplemental': True, 'evidence': {
             'sufficientData': False, 'missingInputs': ['startingBalance']}}])

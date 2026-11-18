@@ -260,19 +260,52 @@ def calendar_context(today):
             for label, offset in (("本月", 0), ("上个月", -1), ("上上个月", -2))}
 
 
-def _aggregate_constraints(task, plan, question, prior, mode, *, strip, single_aggregate):
-    if not task.aggregate or len({s[:3] for s in _scope_for(None, plan, mode)}) != 1:
+DIRECTION_LABELS = {'收入': 'income', '进账': 'income', '入账': 'income',
+                    '支出': 'expense', '开销': 'expense', '开支': 'expense', '花费': 'expense', '花销': 'expense'}
+_DIRECTION = '|'.join(DIRECTION_LABELS)
+_CATEGORY_LITERAL = re.compile(
+    rf"(?:分类|类别)(?:名称|名)?\s*(?:(?:为|是|叫做?|叫作|等于|[:：=])\s*[‘“'\"「]?|[‘“'\"「])"
+    rf"({_DIRECTION})(?=$|[’”'\"」的账类，。；！？,;？\s])"
+    rf"|[‘“'\"「]({_DIRECTION})[’”'\"」]\s*(?:这个|这一)?(?:分类|类别)")
+_EXCLUDED_DIRECTION = re.compile(rf"(?:排除|剔除|不含|不包括|不计入)\s*({_DIRECTION})(?=$|[后外，。；！？，,;\s])")
+
+
+def _direction_request(question):
+    # A literal category name provides no evidence about the sign of its entries.
+    literal = {a or b for a, b in _CATEGORY_LITERAL.findall(question)}
+    text = _CATEGORY_LITERAL.sub('', question)
+    if re.search(r'收支|净额|净现金流|净收入|净支出|净流[入出]|结余|收与支', text):
+        return literal, None
+    excluded = {DIRECTION_LABELS[m] for m in _EXCLUDED_DIRECTION.findall(text)}
+    text = _EXCLUDED_DIRECTION.sub('', text)
+    positive = {direction for word, direction in DIRECTION_LABELS.items() if word in text}
+    choices = (positive or {'income', 'expense'}) - excluded
+    return literal, next(iter(choices)) if len(choices) == 1 else None
+
+
+def _aggregate_constraints(task, plan, question, prior, mode, *, strip, single_aggregate, literal_categories, direction):
+    if not task.aggregate:
         return []
     issues = []
     filters = task.aggregate.filters
+    for field in ("includeCategories", "excludeCategories"):
+        values = getattr(filters, field)
+        allowed = [v for v in values if v not in DIRECTION_LABELS or v in literal_categories]
+        if values != allowed:
+            issues.append({"type": "unsupported_user_condition", "tool": "aggregate", "field": field})
+            if strip:
+                setattr(filters, field, allowed)
+    if len({s[:3] for s in _scope_for(None, plan, mode)}) != 1:
+        return issues
     exclude = re.compile(r"(?:排除|剔除|不含|不包括|不计入)[^，。；！？,;\n]*?(?:后|以外|之外|(?=[，。；！？,;\n]|$))")
     # Recover a literal category list only when its boundary and dimension are
     # explicit. Other selectors (members, sources or remarks) keep their own meaning.
     literal = re.search(r"(?:排除|剔除|不含|不包括|不计入)([^，。；！？,;\n]{1,120}?)(?:后|以外|之外)", question)
-    if literal and ("category" in task.aggregate.groupBy or filters.excludeCategories):
+    if literal and not re.search(r"分类|类别", literal[1]) and ("category" in task.aggregate.groupBy or filters.excludeCategories):
         names = [v.strip(" ‘“「」”’") for v in re.split(r"[、和与及]", literal[1])]
         if (all(re.fullmatch(r"[\w·-]{1,30}", v) for v in names)
                 and not re.search(r"备注|成员|来源|金额|用户|包含|所有|大于|小于|超过|以下|以上", literal[1])):
+            names = [v for v in names if v not in DIRECTION_LABELS or v in literal_categories]
             if not re.search(r"沿用|仍按|还是按", question) and set(names) != set(filters.excludeCategories):
                 issues.append({"type": "unsupported_user_condition", "tool": "aggregate", "field": "excludeCategories"})
                 if strip:
@@ -293,24 +326,26 @@ def _aggregate_constraints(task, plan, question, prior, mode, *, strip, single_a
 
     # A directional aggregate ignores opposite-signed entries, including them in
     # neither its transaction count nor its average. Mixed requests keep each task's metric.
-    if single_aggregate and not re.search(r"收支|净额|净现金流|结余|收与支", question):
-        directions = {key for key, words in (("income", r"收入|进账|入账"), ("expense", r"支出|开销|花费"))
-                      if re.search(words, question)}
-        if len(directions) == 1 and task.metric not in directions:
-            issues.append({"type": "unsupported_user_condition", "tool": "aggregate", "field": "metric"})
-            if strip:
-                task.metric = next(iter(directions))
-        if strip and len(plan.analyses) == 1 and len(directions) == 1:
-            plan.output.metric = task.metric
+    if single_aggregate and direction and task.metric != direction:
+        issues.append({"type": "unsupported_user_condition", "tool": "aggregate", "field": "metric"})
+        if strip:
+            task.metric = direction
     return issues
 
 
 def _check_conditions(analyses, plan, question, mode, previous, *, strip):
     issues = []
+    literal_categories, direction = _direction_request(question)
+    scope = {key[:3] for key in _scope_for(None, plan, mode)}
+    structured = [t.tool for t in plan.analyses if t.tool in DECISION_TOOLS or t.tool == 'aggregate']
+    if (strip and direction and len(scope) == 1 and len(structured) == len(set(structured))
+            and not plan._analysis_context.get('ambiguous')):
+        plan.output.metric = direction
     for task in analyses or [None]:
         prior = _prior_for(task, plan, mode, previous)
         if task and task.tool == "aggregate":
             issues.extend(_aggregate_constraints(task, plan, question, prior, mode, strip=strip,
+                literal_categories=literal_categories, direction=direction,
                 single_aggregate=sum(t.tool == "aggregate" for t in plan.analyses) <= 1
                 and sum(t.tool == "aggregate" for t in analyses) <= 1))
         for field in ROLES:

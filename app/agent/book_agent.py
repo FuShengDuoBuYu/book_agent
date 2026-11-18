@@ -1,4 +1,5 @@
 import json
+import re
 import logging
 from collections import defaultdict
 from collections.abc import AsyncIterator
@@ -10,7 +11,7 @@ from zoneinfo import ZoneInfo
 from langchain_core.prompts import ChatPromptTemplate
 from langsmith import traceable
 
-from app.agent.planner import QueryPlanner
+from app.agent.planner import HISTORY_BASED_TOOLS, QueryPlanner
 from app.agent.analysis_context import latest_context, logical_queries
 from app.agent.evidence_report import EvidenceReporter
 from app.agent.artifacts import build_artifacts
@@ -303,9 +304,17 @@ class BookAgent:
         settings = get_settings()
         primary = [task.model_dump(mode='json', exclude_none=True) for task in plan.analyses if not task._supplemental]
         active = [task for task in primary if task['tool'] != 'sources']
-        if active:
+        prior_active = plan._analysis_context.get('activeAnalyses', [])
+        current_window = plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None
+        intent = ' '.join([plan.understanding.objective, *plan.understanding.requestedAnswers])
+        tracing_parent = (plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext
+            and any(row['tool'] in HISTORY_BASED_TOOLS | {'budget'} for row in prior_active)
+            and not any(row['tool'] in HISTORY_BASED_TOOLS | {'budget'} for row in primary)
+            and current_window == plan._analysis_context.get('activeHistoryWindow')
+            and bool(re.search(r'备注|归并|归组|归类|依据|参照|怎么.*(?:算|来)|计算方法', intent)))
+        if active and not tracing_parent:
             plan._analysis_context['activeAnalyses'] = active
-            plan._analysis_context['activeHistoryWindow'] = plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None
+            plan._analysis_context['activeHistoryWindow'] = current_window
         plan._analysis_context['conversation'] = {
             'objective': plan.understanding.objective,
             'analyses': primary,

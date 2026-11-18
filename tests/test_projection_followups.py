@@ -400,3 +400,51 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(t.months)
         chat=await self.plan('你好',{'intent':'chat','needsTools':False,'understanding':{'evidenceNeeds':['runway']}},{})
         self.assertFalse(chat.needsTools)
+
+    async def test_family_income_direction_spans_raw_categories_and_limits_the_source_catalog(self):
+        query={'id':'home','toolName':'search_family_orders'}
+        aggregate={'tool':'aggregate','queryIds':['home'],'metric':'income','aggregate':{
+            'groupBy':['member','source'],'filters':{'includeCategories':['收入']}}}
+        draft={'toolCalls':[query],'output':{'metric':'all'},'analyses':[aggregate,{'tool':'sources','queryIds':['home']}]}
+        plan=await self.plan('在我们家上一个完整月的收入里，谁从哪些地方收到了钱？请按人分清楚。',draft,{})
+        task=plan.analyses[0]
+        self.assertEqual((task.aggregate.filters.includeCategories,task.queryIds,task.metric,plan.output.metric),([],['home'],'income','income'))
+        rows=[{'year':2026,'month':10,'day':3,'money':amount,'costType':category,'orderRemark':remark,'memberKey':member,'memberName':member}
+              for amount,category,remark,member in [(5300,'收入','工资','甲'),(6000,'项目','项目进度','甲'),(2950,'配送','项目进度','乙'),(-600,'采购','配件','乙')]]
+        result=collect_analysis_results(plan,{'家庭版':[(c,rows) for c in plan.toolCalls]},date(2026,11,19))
+        data=next(r['evidence'] for r in result if r['tool']=='aggregate')
+        self.assertEqual(data['totals']['income'],14250)
+        self.assertEqual({r['member'] for r in data['rows']},{'甲','乙'})
+        catalog=next(r['evidence'] for r in result if r['tool']=='sources')
+        self.assertEqual(catalog['catalogMetric'],'income')
+        self.assertEqual({r['metric'] for r in catalog['sources']},{'income'})
+
+    async def test_literal_direction_named_category_and_real_category_survive_with_their_independent_metric(self):
+        examples=[
+            ('只看分类名称为“收入”的所有账单。','includeCategories',['收入'],'all'),
+            ('排除类别叫支出的账单后，统计收入。','excludeCategories',['支出'],'income'),
+            ('只看工资类别的进账。','includeCategories',['工资'],'income'),
+            ('排除支出后统计所有进账。','excludeCategories',[],'income'),
+            ('比较收入和支出。','includeCategories',[],'all'),
+        ]
+        for question,field,expected,metric in examples:
+            with self.subTest(question=question):
+                values=expected if expected else (['支出'] if field=='excludeCategories' else ['收入'])
+                draft={'analyses':[{'tool':'aggregate','metric':'all','aggregate':{'groupBy':['category'],'filters':{field:values}}},{'tool':'sources'}]}
+                plan=await self.plan(question,draft,{})
+                t=plan.analyses[0]
+                self.assertEqual((getattr(t.aggregate.filters,field), t.metric,plan.output.metric),(expected,metric,metric))
+        only_sources=await self.plan('请按人列出家庭进账的来源。',{'analyses':[{'tool':'sources'}]}, {})
+        self.assertEqual(only_sources.output.metric,'income')
+
+    async def test_reviewer_cannot_add_direction_as_an_unrequested_literal_category(self):
+        for key,value in [('includeCategories','进账'),('excludeCategories','开销')]:
+            t={'tool':'aggregate','metric':'income','aggregate':{'filters':{key:[value]}}}
+            decision={'adequate':False,'issues':[],'answerInstruction':'','analysisWindow':None,'analyses':[t]}
+            model=AsyncMock()
+            model.ainvoke.return_value=SimpleNamespace(content=json.dumps(decision))
+            with patch('app.agent.plan_review.get_structured_model',return_value=model):
+                result,audit=await PlanReviewer().review('核算进账来源。','',AgentPlan(analyses=[{'tool':'aggregate','metric':'income'}]),
+                                                        date(2026,11,19),'家庭版',{})
+            self.assertIsNone(result)
+            self.assertEqual(audit['error'],'unsupported_'+key)

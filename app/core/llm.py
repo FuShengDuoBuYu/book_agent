@@ -33,9 +33,7 @@ def _execution_schema(schema):
             ['totals', 'members', 'remarks', 'quality', *ANALYSIS_TOOLS]))
     if schema.get('title') == 'ReportDraft':
         section = definitions['ReportSection']['properties']
-        for field in ('title', 'analysis'):
-            section[field]['pattern'] = '^[^0-9]*$'
-        section['analysis']['description'] = '解释所引事实的含义、条件与下一步；金额、日期、笔数和期限由事实句自动显示，不复述数字或变量。'
+        section['analysis']['description'] = '解释所引事实的含义、条件与下一步；金额、日期、笔数和期限以事实句为准，不另算或近似。'
     for name, fields in {
         'AnalysisRequest': ['aggregate', 'changes', 'months'],
         'AggregateSpec': ['groupBy', 'periods', 'filters', 'limit'],

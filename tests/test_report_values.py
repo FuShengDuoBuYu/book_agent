@@ -22,6 +22,14 @@ class CalendarProvenanceTests(unittest.TestCase):
         self.assertTrue(self.issues("参考2026年8月、9月、10月这四个月。"))
         self.assertTrue(self.issues("参考2026年8月、8月、8月这三个月。"))
 
+    def test_chinese_money_and_shared_unit_ranges_require_exact_cited_values(self):
+        facts = [{'id': 'f', 'values': [quantity('总额', 3700), quantity('下界', 3200), quantity('项目', 500)]}]
+        self.assertEqual(numerical_issues('总额三千七百元，其中项目五百元。', ['f'], facts), [])
+        self.assertEqual(numerical_issues('范围三千二百至三千七百元。', ['f'], facts), [])
+        self.assertTrue(numerical_issues('范围三千至三千七百元。', ['f'], facts))
+        self.assertTrue(numerical_issues('总额负三千七百元。', ['f'], facts))
+        self.assertTrue(numerical_issues('总额三千七百元。', [], facts))
+
     def test_unqualified_range_needs_a_concrete_year_in_cited_evidence(self):
         self.assertEqual(self.issues("依据历史记录（8-10 月）。"), [])
         self.assertTrue(self.issues("依据历史记录（8-10 月）。", ("f1", "f2")))
