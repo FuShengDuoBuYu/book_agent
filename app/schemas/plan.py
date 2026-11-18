@@ -1,7 +1,7 @@
 from datetime import date
 from typing import Literal, get_args
 
-from pydantic import AliasChoices, BaseModel, Field, FiniteFloat, PrivateAttr, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, FiniteFloat, PrivateAttr, field_validator, model_validator
 
 from app.tools.financial_analysis import ANALYSIS_TOOLS
 
@@ -173,6 +173,7 @@ class OutputRequest(BaseModel):
 
 
 class SourceGroup(BaseModel):
+    model_config = ConfigDict(extra='forbid')
     label: str = Field(min_length=1, max_length=100)
     sourceKeys: list[str] = Field(min_length=1, max_length=60)
 

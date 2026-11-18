@@ -60,7 +60,7 @@ def build_artifacts(results, output=None, window=None):
                 [('member', '成员', ''), ('source', '来源', ''), ('estimate', '条件估计', '元'),
                  ('lower', '历史下界', '元'), ('upper', '历史上界', '元'), ('basis', '备注依据', ''), ('status', '说明', '')],
                 rows, notes=[e.get('method', ''), '历史账本不能证明未来工作安排，缺失月份不按零处理。'])
-        elif tool == 'sources' and not any(row['tool'] == 'forecast' for row in results):
+        elif tool == 'sources' and output.get('includeSources', True) and not any(row['tool'] == 'forecast' for row in results):
             rows = [{'member': row.get('member', '归属未知'), 'source': row['source'],
                      'direction': '收入' if row['metric'] == 'income' else '支出',
                      'amount': row['amount'], 'count': row.get('recordCount'), 'remark': '；'.join(row.get('remarks', [])[:3])}
@@ -68,7 +68,7 @@ def build_artifacts(results, output=None, window=None):
             add(f'{scope} 来源与备注依据', [('member', '成员', ''), ('source', '来源', ''), ('direction', '方向', ''),
                 ('amount', '已记录合计', '元'), ('count', '笔数', '笔'), ('remark', '备注证据', '')], rows,
                 notes=['仅据账本记录归类；备注是记录内容，不足以证明现实原因。'])
-        elif tool == 'trends':
+        elif tool == 'trends' and output.get('includeTrends', True):
             fields = [('income', 'incomeTotal', '收入'), ('expense', 'expenseTotal', '支出'),
                       ('net', 'netIncomeMinusExpense', '结余')]
             fields = [row for row in fields if metric == 'all' or row[0] == metric]

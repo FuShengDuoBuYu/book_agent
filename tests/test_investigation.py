@@ -5,6 +5,15 @@ from app.schemas.plan import AgentPlan
 
 
 class InvestigationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_model_structure_is_repaired_once_using_the_same_evidence(self):
+        from app.agent.investigation import EvidenceInvestigator, InvestigationDecision
+        investigator = EvidenceInvestigator()
+        investigator._invoke = AsyncMock(side_effect=[ValueError('sourceGroups 必须是数组'),
+            InvestigationDecision(sourceGroups=[])])
+        decision, audit = await investigator.refine('核对收入来源', '', AgentPlan(), [])
+        self.assertEqual(audit['status'], 'refined')
+        self.assertTrue(audit['issues'])
+
     async def test_observed_remarks_can_be_grouped_without_inventing_sources(self):
         from app.agent.investigation import EvidenceInvestigator, InvestigationDecision
         investigator = EvidenceInvestigator()

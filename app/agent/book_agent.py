@@ -1,4 +1,3 @@
-import asyncio
 import json
 import logging
 from collections import defaultdict
@@ -16,6 +15,7 @@ from app.agent.analysis_context import latest_context
 from app.agent.evidence_report import EvidenceReporter
 from app.agent.artifacts import build_artifacts
 from app.agent.investigation import EvidenceInvestigator
+from app.agent.progress import with_progress
 from app.agent.prompts import BOOK_AGENT_ANALYSIS_PROMPT, BOOK_AGENT_SYSTEM_PROMPT
 from app.clients.bookkeeping_api import BookkeepingApiClient
 from app.core.llm import get_chat_model
@@ -131,10 +131,14 @@ class BookAgent:
             )
 
             yield {"type": "status", "content": "正在规划账单查询"}
-            plan = await self._create_plan(
+            async for progress in with_progress(self._create_plan(
                 message=message, history=history_text, book_mode=book_mode,
                 previous_context=latest_context(history_messages),
-            )
+            ), '正在理解问题与已有会话'):
+                if progress['type'] == 'result':
+                    plan = progress['value']
+                else:
+                    yield progress
             yield {
                 "type": "status",
                 "content": f"查询计划：{plan.summary}",
@@ -150,12 +154,16 @@ class BookAgent:
                             f"分类={tool_call.args.cost_type or '不限'}"
                         ),
                     }
-                orders_json = await self._execute_tool_calls(
+                async for progress in with_progress(self._execute_tool_calls(
                     mode=book_mode,
                     family_id=family_id,
                     plan=plan,
                     question=message, history=history_text,
-                )
+                ), '正在查证备注、来源与分析依据'):
+                    if progress['type'] == 'result':
+                        orders_json = progress['value']
+                    else:
+                        yield progress
                 yield {"type": "status", "content": self._query_status(orders_json)}
             else:
                 # 不需要查账单时，也统一给后续模型一个结构稳定的空结果。
@@ -190,22 +198,19 @@ class BookAgent:
 
             if plan.analyses:
                 results = self._safe_json_loads(orders_json).get('analysisResults', [])
-                artifacts = build_artifacts(results, plan.output.model_dump(),
+                needs = set(plan.understanding.evidenceNeeds)
+                output = {**plan.output.model_dump(), 'includeSources': bool(needs & {'sources', 'members', 'remarks'} or plan.output.table),
+                          'includeTrends': plan.output.chart != 'none' or (plan.output.table and 'trends' in needs)}
+                artifacts = build_artifacts(results, output,
                     window=plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None)
-                report_task = asyncio.create_task(self.reporter.answer(
+                async for progress in with_progress(self.reporter.answer(
                     message, plan._analysis_context, results, history=history_text,
                     instruction=plan.finalInstruction, artifacts=artifacts,
-                    understanding=plan.understanding.model_dump()))
-                try:
-                    while not report_task.done():
-                        done, _ = await asyncio.wait({report_task}, timeout=12)
-                        if not done:
-                            yield {'type': 'status', 'content': '正在核对分析结论与账单依据'}
-                    reply, validation = await report_task
-                finally:
-                    if not report_task.done():
-                        report_task.cancel()
-                        await asyncio.gather(report_task, return_exceptions=True)
+                    understanding=plan.understanding.model_dump()), '正在核对分析结论与问题要求'):
+                    if progress['type'] == 'result':
+                        reply, validation = progress['value']
+                    else:
+                        yield progress
                 assistant_chunks.append(reply)
                 yield {'type': 'delta', 'content': reply}
                 if artifacts:
@@ -397,11 +402,10 @@ class BookAgent:
                     kept = [SourceGroup(label=group.label, sourceKeys=[key for key in group.sourceKeys if key not in replaced])
                             for group in plan.sourceGroups if any(key not in replaced for key in group.sourceKeys)]
                     plan.sourceGroups = (kept + decision.sourceGroups)[:30]
-                plan.analyses.extend(decision.additionalAnalyses[:max(0, 12 - len(plan.analyses))])
-                if decision.answerFocus:
-                    plan.finalInstruction += '\n基于现有证据的回答重点：' + decision.answerFocus
-                if decision.informationGaps:
-                    plan.finalInstruction += '\n需明确的真实信息缺口：' + '；'.join(decision.informationGaps)
+                plan.analyses.extend(AnalysisRequest.model_validate(task.model_dump())
+                    for task in decision.additionalAnalyses[:max(0, 12 - len(plan.analyses))])
+                # Reflection selects tools and source identities only. Its free-text
+                # guesses must never become authoritative amounts or instructions.
             analysis_results = collect_analysis_results(plan, datasets, today)
 
         return json.dumps(

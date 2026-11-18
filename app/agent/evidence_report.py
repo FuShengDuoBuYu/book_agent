@@ -299,7 +299,8 @@ REVIEW_PROMPT = '''/no_think
 class EvidenceReporter:
     async def _invoke(self, schema, system, payload):
         response = await asyncio.wait_for(get_structured_model(schema).ainvoke([
-            ('system', system), ('human', json.dumps(payload, ensure_ascii=False))]),
+            ('system', system + '\n必须遵守的 JSON schema：' + json.dumps(schema.model_json_schema(), ensure_ascii=False)),
+            ('human', json.dumps(payload, ensure_ascii=False))]),
             timeout=get_settings().request_timeout_seconds if schema is ReportReview else get_settings().planner_timeout_seconds)
         content = str(response.content)
         content = re.sub(r'<think>.*?</think>', '', content, flags=re.S)

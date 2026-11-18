@@ -114,7 +114,9 @@ def check_turn(kind, today, reply, metadata, lookups):
     forecast = next((a["evidence"] for a in analyses if a["tool"] == "forecast"
                      and a["evidence"].get("metric") == "income"), {})
     target = shift_month(today, 2).strftime("%Y-%m")
-    checks = {"answered": bool(reply.strip()), "noPrivateIdentifiers": all(
+    checks = {"answered": bool(reply.strip()),
+              "explanationReviewed": metadata.get('validation', {}).get('status') == 'reviewed',
+              "noPrivateIdentifiers": all(
         value not in visible for value in (OWNER, PARTNER, FAMILY))}
     if kind in {"forecast", "table", "method"}:
         components = [r for r in forecast.get("sourceForecasts", []) if not r.get("excluded")]
@@ -202,6 +204,8 @@ async def evaluate(selected, output_file, timeout):
                                "investigationStatus": (metadata.get("investigation") or {}).get("status"),
                                "artifactKinds": [a.get("kind") for a in metadata.get("artifacts", [])],
                                "analysisVersion": metadata.get("analysisVersion"), "model": metadata.get("model")})
+                record.update(plan=metadata.get('plan'), investigation=metadata.get('investigation'),
+                              validation=metadata.get('validation'))
             except Exception as exc:
                 record.update({"passed": False, "error": type(exc).__name__})
             record["durationMs"] = round((perf_counter() - start) * 1000)
