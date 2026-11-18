@@ -17,6 +17,25 @@ class PlanningInheritanceTests(unittest.IsolatedAsyncioTestCase):
             clock.now.return_value = datetime(2026, 11, 19)
             return await planner.create_plan(message, '', '个人版', previous)
 
+    async def test_direction_aliases_are_canonical_before_context_resolution(self):
+        first = await self.planned({'toolCalls': [{'id': 'ledger', 'toolName': 'search_personal_orders',
+            'args': {'cost_type': 'income'}}], 'analyses': [{'tool': 'forecast', 'targetMonth': '2027-01'}]}, {}, '预测明年一月收入')
+        self.assertEqual(first._analysis_context['scope'], [['search_personal_orders', '不限', '']])
+
+    async def test_method_explanation_restores_primary_calculation_before_support_tools(self):
+        previous = {'scope': [['search_personal_orders', '不限', '']], 'targetMonth': '2027-01',
+            'activeHistoryWindow': None, 'activeAnalyses': [{'tool': 'forecast', 'targetMonth': '2027-01'}],
+            'conversation': {'queries': [{'id': 'ledger', 'toolName': 'search_personal_orders'}],
+                'analyses': [{'tool': 'sources'}], 'analysisWindow': None}}
+        plan = await self.planned({'followUpOfPreviousQuestion': True,
+            'understanding': {'objective': '解释刚才预测的参照月份与计算过程', 'evidenceNeeds': ['sources', 'trends']},
+            'toolCalls': [{'id': 'ledger', 'toolName': 'search_personal_orders', 'args': {'cost_type': 'income'}}],
+            'analyses': [{'tool': 'cashflow', 'targetMonth': '2027-01'}],
+            'analysisWindow': {'startDate': '2026-10-01', 'endDate': '2026-10-31'}}, previous,
+            '刚才预测那个月拿哪几个月作参照，怎么从分项算到总数？')
+        self.assertIsNone(plan.analysisWindow)
+        self.assertEqual([a.targetMonth for a in plan.analyses if a.tool == 'forecast'], ['2027-01'])
+
     async def test_required_forecast_materializes_before_target_inheritance(self):
         previous = {'targetMonth': '2027-01', 'scope': [['search_personal_orders', '不限', '']]}
         plan = await self.planned({'followUpOfPreviousQuestion': True,

@@ -109,6 +109,11 @@ class QueryPlanner:
     ) -> AgentPlan:
         # 这里的核心任务是：拿到 LLM 输出后，尽量把它收敛成一个可执行的 AgentPlan。
         now = datetime.now(ZoneInfo("Asia/Shanghai"))
+        previous_context = dict(previous_context or {})
+        if previous_context.get('scope'):
+            previous_context['scope'] = [list(row) for row in sorted({
+                (tool, self._normalize_cost_type(category), remark or '')
+                for tool, category, remark in previous_context['scope']})]
         prompt_values = {
             "current_date": now.strftime("%Y-%m-%d"),
             "book_mode": self._normalize_mode(book_mode),
@@ -133,6 +138,7 @@ class QueryPlanner:
                 if not data:
                     raise ValueError("Missing plan")
                 plan = AgentPlan.model_validate(data)
+                self._normalize_query_scopes(plan)
                 self._materialize_requirements(plan)
                 requested_window = explicit_complete_month_window(message, now.date())
                 if requested_window and requested_window != plan.analysisWindow:
@@ -326,6 +332,11 @@ class QueryPlanner:
 
         return plan
 
+    def _normalize_query_scopes(self, plan):
+        for call in plan.toolCalls:
+            call.args.cost_type = self._normalize_cost_type(call.args.cost_type)
+            call.args.remark = call.args.remark or ''
+
     @staticmethod
     def _has_history_reference(message, now):
         def historical_date(match):
@@ -379,6 +390,8 @@ class QueryPlanner:
                 templates = [{'id': key, 'toolName': tool, 'args': {'cost_type': category, 'remark': remark}}
                              for key in sorted(identifiers)]
             restored = [ToolCall.model_validate(row) for row in templates]
+            for call in restored:
+                call.args.cost_type = self._normalize_cost_type(call.args.cost_type)
             restored_scope = sorted({(call.toolName, call.args.cost_type, call.args.remark) for call in restored})
             if [list(row) for row in restored_scope] != previous.get('scope'):
                 return {}
@@ -399,7 +412,12 @@ class QueryPlanner:
             # The explicit historical range establishes a new referent for future turns.
             # Preserve the restored query scope, but drop the superseded decision conditions.
             return {}
-        if plan.intent == 'analyze_orders' and sources_only and active:
+        targets = {row.get('targetMonth') for row in active} - {None}
+        intent_text = ' '.join([plan.understanding.objective, *plan.understanding.requestedAnswers])
+        explains_active = (any(task.targetMonth in targets for task in plan.analyses if task.targetMonth)
+                           or bool(re.search(r'预测|预估|测算|推演', intent_text)))
+        support_only = not any(task.tool in HISTORY_BASED_TOOLS or task.tool == 'budget' for task in plan.analyses)
+        if plan.intent == 'analyze_orders' and active and same_window and (sources_only or (explains_active and support_only)):
             # Inspecting records is a subtask of the referenced analysis. Keep the
             # active calculation available when a later question asks how it worked.
             restored_tasks = [AnalysisRequest.model_validate(row) for row in active]
