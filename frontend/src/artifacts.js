@@ -192,28 +192,35 @@ export function buildChart(artifact) {
   };
 }
 
-function markdownCell(value) {
+function markdownCell(value, literal = false) {
   if (value === null) return "未知";
   if (typeof value === "number") return MARKDOWN_NUMBER.format(value);
   if (typeof value === "boolean") return value ? "是" : "否";
-  return value.replaceAll("\\", "\\\\").replaceAll("|", "\\|")
-    .replace(/[\r\n]/g, " ").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+  const text = value.replace(/[\r\n]/g, " ");
+  if (literal) {
+    if (!text.trim()) return "";
+    const runs = text.match(/`+/g) ?? [];
+    const fence = "`".repeat(1 + Math.max(0, ...runs.map((run) => run.length)));
+    return fence + " " + text.replaceAll("|", "\\|") + " " + fence;
+  }
+  return text.replaceAll("\\", "\\\\").replaceAll("|", "\\|").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
 function markdownPreview(markdown, item) {
   const tableRow = (cells) => "| " + cells.join(" | ") + " |";
-  const table = [
+  const header = [
     "### " + markdownCell(item.title), "",
     tableRow(item.columns.map((column) => markdownCell(columnLabel(column)))),
     tableRow(item.columns.map(() => "---")),
-    ...item.rows.slice(0, MARKDOWN_PREVIEW_ROWS).map((row) =>
-      tableRow(item.columns.map(({ key }) => markdownCell(row[key]))),
-    ),
   ];
+  const rows = item.rows.slice(0, MARKDOWN_PREVIEW_ROWS);
+  const tables = [true, false].map((literal) => markdown.parse([
+    ...header, ...rows.map((row) => tableRow(item.columns.map(({ key }) => markdownCell(row[key], literal)))),
+  ].join("\n"), {}));
   const overflow = item.rows.length > MARKDOWN_PREVIEW_ROWS ? "其余记录见完整数据表下载。" : "";
-  const notes = (item.notes ?? []).map(markdownCell).join("\n");
+  const notes = (item.notes ?? []).map((note) => markdownCell(note)).join("\n");
   return {
-    table: markdown.parse(table.join("\n"), {}),
+    tables,
     overflow: markdown.parse(overflow, {}),
     notes: markdown.parse(notes, {}),
   };
@@ -237,11 +244,11 @@ export function renderAnalysisMarkdown(markdown, text, artifacts) {
     const token = tokens[index];
     if (token.type !== "heading_open" || token.tag !== "h3" || token.level !== 0 ||
         tokens[index + 3]?.type !== "table_open") continue;
-    const match = previews.findIndex(({ table }) => table.some((part) => part.type === "table_close") &&
-      tokensMatch(tokens, index, table));
+    const matches = (table) => table.some((part) => part.type === "table_close") && tokensMatch(tokens, index, table);
+    const match = previews.findIndex(({ tables }) => tables.some(matches));
     if (match < 0) continue;
-    const [{ table, overflow, notes }] = previews.splice(match, 1);
-    let end = index + table.length;
+    const [{ tables, overflow, notes }] = previews.splice(match, 1);
+    let end = index + tables.find(matches).length;
     if (tokensMatch(tokens, end, overflow)) end += overflow.length;
     if (tokensMatch(tokens, end, notes)) end += notes.length;
     tokens.splice(index, end - index);

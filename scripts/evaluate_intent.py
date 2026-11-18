@@ -135,7 +135,7 @@ def check_turn(kind, today, reply, metadata, lookups):
         checks.update({"queriedLedger": any(entry["matches"] for entry in lookups),
                        "sourceOrForecastExecuted": bool({"sources", "forecast"} & tools),
                        "stagesAvailable": set(STAGES) <= remarks,
-                       "observedRemarksCommunicated": sum(word in visible for word in STAGES) >= 2})
+                       "observedRemarksCommunicated": all(word in visible for word in STAGES)})
     if kind == "method":
         expected = [shift_month(today, offset).strftime("%Y-%m") for offset in (-3, -2, -1)]
         checks.update({"referenceMonths": forecast.get("baselineMonths") == expected,
@@ -205,7 +205,7 @@ async def evaluate(selected, output_file, timeout):
                                "artifactKinds": [a.get("kind") for a in metadata.get("artifacts", [])],
                                "analysisVersion": metadata.get("analysisVersion"), "model": metadata.get("model")})
                 record.update(plan=metadata.get('plan'), investigation=metadata.get('investigation'),
-                              validation=metadata.get('validation'))
+                              validation=metadata.get('validation'), planningIssues=metadata.get('planningIssues'))
             except Exception as exc:
                 record.update({"passed": False, "error": type(exc).__name__})
             record["durationMs"] = round((perf_counter() - start) * 1000)

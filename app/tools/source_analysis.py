@@ -4,9 +4,10 @@ import hashlib
 import json
 import re
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict, deque
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
+from itertools import islice
 from statistics import median
 
 
@@ -133,12 +134,37 @@ def source_rows(orders: list[dict], aliases: dict) -> list[dict]:
     return sorted(groups.values(), key=lambda r: (-r["amount"], r["sourceKey"]))
 
 
-def source_catalog(orders: list[dict], *, source_groups=None, **kwargs) -> dict:
+def _interleave(sequences):
+    pending = deque(iter(sequence) for sequence in sequences)
+    while pending:
+        sequence = pending.popleft()
+        row = next(sequence, None)
+        if row is not None:
+            yield row
+            pending.append(sequence)
+
+
+def source_catalog(orders: list[dict], *, source_groups=None, catalog_metric="all", **kwargs) -> dict:
     rows = source_rows(orders, source_aliases(orders, source_groups))
-    return {"sources": rows[:CATALOG_LIMIT], "sourceCount": len(rows),
-            "omittedSourceCount": max(0, len(rows) - CATALOG_LIMIT),
-            "excludedIncomeTotal": money(sum(r["amount"] for r in rows if r["excluded"])),
-            "coverageNote": "目录按累计金额排序；超出展示上限的来源仍计入预测。备注仅为原始账单描述，来源实际含义可能需要确认。"}
+    directions = (catalog_metric,) if catalog_metric in {"income", "expense"} else ("income", "expense")
+    members_by_metric = defaultdict(lambda: defaultdict(list))
+    counts = Counter()
+    for row in rows:
+        metric = row["metric"]
+        if metric in directions:
+            members_by_metric[metric][row["memberKey"]].append(row)
+            counts[metric] += 1
+    # Every prefix, including the investigator's smaller view, samples directions and members.
+    # Within each member and direction, the cumulative amount determines the order.
+    scoped = _interleave(_interleave(members.values()) for members in members_by_metric.values())
+    visible = list(islice(scoped, CATALOG_LIMIT))
+    shown = Counter(row["metric"] for row in visible)
+    return {"sources": visible, "catalogMetric": catalog_metric or "all", "sourceCount": sum(counts.values()),
+            "omittedSourceCount": sum(counts.values()) - len(visible),
+            "sourceCountByMetric": {metric: counts[metric] for metric in directions},
+            "omittedSourceCountByMetric": {metric: counts[metric] - shown[metric] for metric in directions},
+            "excludedIncomeTotal": money(sum(r["amount"] for r in rows if r["excluded"] and "income" in directions)),
+            "coverageNote": "先按所需收支方向筛选，再轮流展示各方向和成员，每组内按累计金额排序。展示上限仅影响目录，全部来源仍计入预测或单列剔除。备注仅为账单原始描述。"}
 
 
 def income_source_forecasts(rows: list[dict], observed: list[str], baseline: list[str]) -> list[dict]:

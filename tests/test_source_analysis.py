@@ -140,12 +140,56 @@ class SourceAnalysisTests(unittest.TestCase):
         self.assertEqual(result["excludedIncomeTotal"], 900)
         self.assertNotIn("本月待结", rows)
 
+    def test_explicit_old_reference_window_excludes_edges_and_validates_aliases_against_snapshot(self):
+        records = [order(12, 9000, "不完整月", year=2024), order(1, 100, "甲阶段", year=2025),
+                   order(2, 200, "乙阶段", year=2025), order(4, 300, "丙阶段", year=2025),
+                   order(5, 9000, "不完整月", year=2025), order(10, 6000, "后来阶段"),
+                   order(11, 7000, "本月")]
+        catalog = self.tool("sources", records)["sources"]
+        groups = [{"label": "项目", "sourceKeys": [row["sourceKey"] for row in catalog if "阶段" in row["source"]]}]
+        scope = {"source_groups": groups, "window_start": date(2024, 12, 15), "window_end": date(2025, 5, 10)}
+        forecast = self.tool("forecast", records, **scope)
+        self.assertEqual(forecast["observedMonths"], ["2025-01", "2025-02", "2025-04"])
+        self.assertEqual(forecast["missingMonths"], ["2025-03"])
+        self.assertEqual(forecast["baselineMonths"], forecast["observedMonths"])
+        self.assertEqual(forecast["estimate"], 200)
+        self.assertNotIn("最近六个", forecast["method"])
+        self.assertEqual(self.tool("projection", records, months=2, **scope)["totalIncome"], 400)
+        self.assertEqual(self.tool("forecast", records)["observedMonths"], ["2026-10"])
+
+    def test_explicit_reference_window_stops_before_target_and_current_month(self):
+        records = [order(1, 100, "甲", year=2025), order(2, 200, "甲", year=2025),
+                   order(3, 10000, "甲", year=2025), order(10, 300, "甲"), order(11, 6000, "甲")]
+        scope = {"window_start": date(2025, 1, 1), "window_end": date(2026, 11, 30)}
+        historic = self.tool("forecast", records, target_month="2025-03", **scope)
+        self.assertEqual(historic["baselineMonths"], ["2025-01", "2025-02"])
+        future = self.tool("forecast", records, target_month="2027-03", **scope)
+        self.assertEqual(future["baselineMonths"], ["2025-02", "2025-03", "2026-10"])
+        self.assertNotIn("2026-11", future["observedMonths"])
+
     def test_partial_query_months_never_enter_baseline(self):
         result = self.tool("forecast", [order(8, 800, "甲"), order(9, 900, "甲"), order(10, 1000, "甲")],
                            window_start=date(2026, 8, 2), window_end=date(2026, 10, 29))
         self.assertFalse(result["sufficientData"])
         self.assertEqual(result["baselineMonths"], ["2026-09"])
         self.assertIsNone(result["sourceForecasts"][0]["estimate"])
+
+    def test_catalog_filters_metric_before_limit_and_represents_small_members_in_early_rows(self):
+        many = [order(10, -(300+i), f"展览{chr(0x4e00+i)}") for i in range(75)]
+        records = many + [order(10, 2, "小额项目", member="two"), order(10, -1, "小额票券", member="three")]
+        all_rows = self.tool("sources", records)
+        self.assertEqual({(r["memberKey"], r["metric"]) for r in all_rows["sources"][:3]},
+                         {("one", "expense"), ("two", "income"), ("three", "expense")})
+        self.assertEqual(all_rows["sourceCount"], 77)
+        self.assertEqual(all_rows["omittedSourceCountByMetric"], {"income": 0, "expense": 17})
+        income = self.tool("sources", records, catalog_metric="income")
+        self.assertEqual([r["source"] for r in income["sources"]], ["小额项目"])
+        self.assertEqual(income["sourceCount"], 1)
+        self.assertEqual(income["omittedSourceCount"], 0)
+        expense = self.tool("sources", records, catalog_metric="expense")
+        self.assertEqual(expense["sourceCount"], 76)
+        self.assertEqual(expense["omittedSourceCount"], 16)
+        self.assertTrue(all(r["metric"] == "expense" for r in expense["sources"]))
 
     def test_forecast_includes_contributions_beyond_model_catalog_limit(self):
         records = [order(month, 3, f"项目{chr(0x4e00+i)}") for i in range(110) for month in (9, 10)]
@@ -203,3 +247,34 @@ class SourceScenarioTests(unittest.TestCase):
         result = run_analysis("scenario", self.records, as_of=TODAY, source_groups=self.groups, changes=changes)
         self.assertFalse(result["sufficientData"])
         self.assertNotIn("missingInputs", result, "Both aliases exist but the reductions overlap")
+
+
+    def test_expense_aliases_resolve_globally_or_by_member_and_dedupe_reductions(self):
+        records = [row for month in (8, 9, 10) for row in (
+            order(month, -20, "春展门票", memberName="阿甲"),
+            order(month, -30, "园区体验", member="two", memberName="阿乙"),
+            order(month, -800, "房租", memberName="阿甲"))]
+        catalog = run_analysis("sources", records, as_of=TODAY)["sources"]
+        groups = [{"label": "outing", "sourceKeys": [r["sourceKey"] for r in catalog if r["source"] != "房租"]}]
+
+        def scenario(*reductions):
+            return run_analysis("scenario", records, as_of=TODAY, source_groups=groups,
+                                changes=[{"metric": "expense", "source": source, "percent": percent}
+                                         for source, percent in reductions])
+
+        combined = scenario(("outing", -50))
+        self.assertTrue(combined["sufficientData"])
+        self.assertEqual(combined["expense"], 825)
+        self.assertEqual(combined["assumptions"][0]["sourceBaseline"], 50)
+        self.assertEqual(len(combined["assumptions"][0]["matchedSourceKeys"]), 2)
+        self.assertEqual(scenario(("阿乙的outing", -50))["expense"], 835)
+        overlap = scenario(("outing", -100), ("阿甲的outing", -50))
+        self.assertFalse(overlap["sufficientData"])
+        self.assertNotIn("missingInputs", overlap)
+
+    def test_aliasing_expense_keeps_total_month_median_even_if_source_medians_disagree(self):
+        records = [order(month, -amount, source) for month, amount, source in
+                   [(8, 101, "甲"), (9, 100, "乙"), (9, 30, "丙"),
+                    (10, 1, "甲"), (10, 1, "乙"), (10, 100, "丙")]]
+        result = run_analysis("forecast", records, as_of=TODAY, metric="expense")
+        self.assertEqual(result["estimate"], 102)

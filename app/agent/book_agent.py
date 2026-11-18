@@ -11,7 +11,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langsmith import traceable
 
 from app.agent.planner import QueryPlanner
-from app.agent.analysis_context import latest_context
+from app.agent.analysis_context import latest_context, logical_queries
 from app.agent.evidence_report import EvidenceReporter
 from app.agent.artifacts import build_artifacts
 from app.agent.investigation import EvidenceInvestigator
@@ -199,8 +199,14 @@ class BookAgent:
             if plan.analyses:
                 results = self._safe_json_loads(orders_json).get('analysisResults', [])
                 needs = set(plan.understanding.evidenceNeeds)
-                output = {**plan.output.model_dump(), 'includeSources': bool(needs & {'sources', 'members', 'remarks'} or plan.output.table),
-                          'includeTrends': plan.output.chart != 'none' or (plan.output.table and 'trends' in needs)}
+                chart_target = ('projection' if any(row['tool'] == 'projection' for row in results) else
+                                'forecast' if any(row['tool'] == 'forecast' for row in results) else 'trends')
+                output = {**plan.output.model_dump(), 'chartTarget': chart_target,
+                          'includeLineage': 'remarks' in needs,
+                          'includeSources': bool(needs & {'sources', 'members', 'remarks'} or
+                             ((plan.output.table or plan.output.export) and not needs & {'trends', 'changes', 'forecast'})),
+                          'includeTrends': (plan.output.chart != 'none' and chart_target == 'trends') or
+                             ((plan.output.table or plan.output.export) and 'trends' in needs)}
                 artifacts = build_artifacts(results, output,
                     window=plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None)
                 async for progress in with_progress(self.reporter.answer(
@@ -290,9 +296,14 @@ class BookAgent:
         if not reply or not session_id:
             return
         settings = get_settings()
+        active = [task.model_dump(mode='json', exclude_none=True) for task in plan.analyses if task.tool != 'sources']
+        if active:
+            plan._analysis_context['activeAnalyses'] = active
+            plan._analysis_context['activeHistoryWindow'] = plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None
         plan._analysis_context['conversation'] = {
             'objective': plan.understanding.objective,
             'analyses': [task.model_dump(mode='json', exclude_none=True) for task in plan.analyses],
+            'queries': logical_queries(plan),
             'analysisWindow': plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None,
             'output': plan.output.model_dump(),
             'sourceGroups': [group.model_dump() for group in plan.sourceGroups],
@@ -393,7 +404,7 @@ class BookAgent:
             for scope, queries in datasets.items():
                 records = merge_orders([rows for _, rows in queries])
                 # Reflection sees actual observed labels/remarks, never the raw account IDs.
-                catalogs.append({'mode': scope, **run_analysis('sources', records, as_of=today)})
+                catalogs.append({'mode': scope, **run_analysis('sources', records, as_of=today, catalog_metric=plan.output.metric)})
             initial_results = collect_analysis_results(plan, datasets, today)
             if question and getattr(self, 'investigator', None):
                 decision, plan._investigation = await self.investigator.refine(question, history, plan, catalogs, results=initial_results)

@@ -154,7 +154,7 @@ class AnalysisPlannerTests(unittest.TestCase):
             "analyses": [{"tool": "cashflow"}, {"tool": "forecast"}]})
         normalized = QueryPlanner.__new__(QueryPlanner)._normalize_plan(plan, datetime(2026, 11, 12), "分析9月并预测下月")
         self.assertEqual(normalized.analysisWindow.startDate.isoformat(), "2026-09-01")
-        self.assertEqual([call.args.month for call in normalized.toolCalls], list(range(5, 12)))
+        self.assertEqual([call.args.month for call in normalized.toolCalls], [9])
 
     def test_deduplicated_queries_keep_all_analysis_bindings(self):
         plan = AgentPlan.model_validate({"toolCalls": [

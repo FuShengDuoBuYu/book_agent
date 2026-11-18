@@ -7,12 +7,66 @@ from tests.test_analysis_artifacts import forecast_result
 
 
 class ReportContractTests(unittest.TestCase):
+    def test_ledger_links_in_analysis_are_literal_while_emphasis_is_retained(self):
+        facts = [{'id': 'f1', 'text': '记录仅提供备注，不能证明现实原因。', 'required': True}]
+        draft = ReportDraft.model_validate({'sections': [{'title': '备注核查', 'factIds': ['f1'],
+            'analysis': '**建议核查**：备注中的 [结算地址](https://ledger.example.test/pay) 和 https://ledger.example.test/info 仅作为记录内容。'}]})
+        reply = render_report(draft, facts)
+        self.assertIn('**建议核查**', reply)
+        self.assertIn('` [结算地址](https://ledger.example.test/pay) `', reply)
+        self.assertIn('` https://ledger.example.test/info `', reply)
+
+    def test_remark_numbers_cannot_be_promoted_to_income_values(self):
+        facts = [{'id': 'f1', 'text': '收入 100 元，票据编号 777。', 'required': True,
+                  'values': [{'label': '收入', 'value': 100, 'unit': '元'}]}]
+        from app.agent.evidence_report import value_catalog
+        self.assertFalse(any('777' in row['display'] for row in value_catalog(facts)))
+
+    def test_value_reference_requires_its_own_fact_and_its_own_unit(self):
+        facts = [{'id': 'f1', 'text': '收入 100 元。', 'required': False,
+                  'values': [{'label': '收入', 'value': 100, 'unit': '元'}]},
+                 {'id': 'f2', 'text': '支出 50 元。', 'required': False,
+                  'values': [{'label': '支出', 'value': 50, 'unit': '元'}]}]
+        for prose in ('收入为{{v2}}。', '收入为{{v1}}天。'):
+            draft = ReportDraft.model_validate({'sections': [{'title': '核算', 'factIds': ['f1'], 'analysis': prose}]})
+            self.assertTrue(validate_draft(draft, facts))
+
+    def test_completion_verdict_is_required_from_the_reviewer(self):
+        from pydantic import ValidationError
+        from app.schemas.report import ReportReview
+        with self.assertRaises(ValidationError):
+            ReportReview.model_validate({'supported': True, 'issues': []})
+
     def test_evidence_reference_can_be_used_inside_a_numeric_explanation(self):
-        facts = [{'id': 'f1', 'text': '在相同条件下，预计收入 5,000 元。', 'required': True}]
+        facts = [{'id': 'f1', 'text': '在相同条件下，预计收入 5,000 元。', 'required': True,
+                  'values': [{'label': '预计收入', 'value': 5000, 'unit': '元'}]}]
         draft = ReportDraft.model_validate({'sections': [{'title': '来源与条件', 'factIds': ['f1'],
-            'analysis': '这个来源的基准是{{v1}}元，后续工作安排变化时需要重算。'}]})
+            'analysis': '这个来源的基准是{{v1}}，后续工作安排变化时需要重算。'}]})
         self.assertEqual(validate_draft(draft, facts), [])
-        self.assertIn('基准是5,000元', render_report(draft, facts))
+        self.assertIn('基准是5,000 元', render_report(draft, facts))
+
+    def test_verified_amount_and_calendar_can_be_quoted_naturally(self):
+        facts = [{'id': 'f1', 'text': '2027-01 条件预测收入 100 元。', 'required': True,
+                  'values': [{'label': '目标月份', 'value': '2027-01', 'unit': 'month'},
+                             {'label': '预测收入', 'value': 100, 'unit': '元'}]}]
+        draft = ReportDraft.model_validate({'sections': [{'title': '2027年1月收入预测', 'factIds': ['f1'],
+            'analysis': '2027-01 的条件估计是100元，后续项目安排变化时应重新计算。'}]})
+        self.assertEqual(validate_draft(draft, facts), [])
+
+    def test_natural_month_range_uses_the_typed_calendar_endpoints(self):
+        facts = [{'id': 'f1', 'text': '参考月份 2026-08、2026-09、2026-10。', 'required': True,
+            'values': [{'label': '参考月份', 'value': month, 'unit': 'month'}
+                       for month in ('2026-08', '2026-09', '2026-10')]}]
+        draft = ReportDraft.model_validate({'sections': [{'title': '参考区间', 'factIds': ['f1'],
+            'analysis': '参考2026年8月至10月的已记账数据，需要确认后续工作安排。'}]})
+        self.assertEqual(validate_draft(draft, facts), [])
+
+    def test_known_money_range_can_share_its_unit(self):
+        facts = [{'id': 'f1', 'text': '历史情景 3000～3700 元。', 'required': True,
+            'values': [{'label': '下界', 'value': 3000, 'unit': '元'}, {'label': '上界', 'value': 3700, 'unit': '元'}]}]
+        draft = ReportDraft.model_validate({'sections': [{'title': '条件范围', 'factIds': ['f1'],
+            'analysis': '历史情景范围是3,000～3,700元，这不是置信区间。'}]})
+        self.assertEqual(validate_draft(draft, facts), [])
 
     def test_unsupported_number_triggers_retry_instead_of_silently_deleting_text(self):
         facts = [{'id': 'f1', 'text': '可动用余额未知。', 'required': True}]

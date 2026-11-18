@@ -22,15 +22,16 @@ def collect_analysis_results(plan, datasets, today):
                     "sufficientData": False, "reason": "该分析尚未明确关联哪个分类或备注范围，需要确认查询范围。"}})
                 continue
             records = merge_orders([rows for _, rows in bound])
-            window = plan.analysisWindow if task.tool not in {"forecast", "scenario", "savings", "budget", "projection", "purchase", "runway", "optimization"} else None
+            window = plan.analysisWindow
             selected = records
-            if window:
+            if window and task.tool != 'budget':
                 selected = [order for order in records if _date(order) and window.startDate <= _date(order) <= window.endDate]
             known_keys = {observed_source_key(row) for row in selected if float(row['money']) != 0}
             groups = [{'label': group.label, 'sourceKeys': [key for key in group.sourceKeys if key in known_keys]}
                       for group in plan.sourceGroups if any(key in known_keys for key in group.sourceKeys)]
             result = run_analysis(
                 task.tool, selected, as_of=today, metric=task.metric,
+                catalog_metric=plan.output.metric,
                 source_groups=groups,
                 target_month=task.targetMonth,
                 changes=[change.model_dump() for change in task.changes],

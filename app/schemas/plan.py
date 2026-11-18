@@ -1,5 +1,5 @@
 from datetime import date
-from typing import Literal, get_args
+from typing import Annotated, Literal, get_args
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, FiniteFloat, PrivateAttr, field_validator, model_validator
 
@@ -161,7 +161,8 @@ class IntentUnderstanding(BaseModel):
     objective: str = Field(default='', max_length=600, description='当前真正要解决的问题，追问须解析它指向上轮哪项结论')
     referents: list[str] = Field(default_factory=list, max_length=8, description='这、它、刚才的金额等在当前对话中的明确含义；未确定就标记待确认')
     requestedAnswers: list[str] = Field(default_factory=list, max_length=8, description='回答必须完成的具体事项，不是工具名称')
-    evidenceNeeds: list[Literal['totals', 'sources', 'members', 'remarks', 'trends', 'forecast', 'changes', 'scenario', 'quality']] = Field(default_factory=list, max_length=10)
+    evidenceNeeds: list[Annotated[str, Field(max_length=80)]] = Field(default_factory=list, max_length=10,
+        description='推荐 totals/sources/members/remarks/trends/forecast/changes/scenario/quality；描述标签不具有工具调用权限')
     unknowns: list[str] = Field(default_factory=list, max_length=6, description='完成用户目标仍缺的具体信息，已有账本可查询的信息不要求用户重新提供')
 
 

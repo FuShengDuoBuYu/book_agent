@@ -22,6 +22,7 @@ from app.schemas.plan import (
     render_intents_for_prompt,
 )
 from app.tools.registry import PLANNER_TOOL_BY_NAME, format_tool_call, render_planner_tools_for_prompt
+from app.tools.order_search import normalize_cost_type
 from app.tools.financial_analysis import ANALYSIS_TOOLS, shift_month
 
 HISTORY_BASED_TOOLS = {'forecast', 'scenario', 'savings', 'projection', 'purchase', 'runway', 'optimization'}
@@ -64,20 +65,26 @@ class QueryPlanner:
                     timeout=get_settings().planner_timeout_seconds,
                 )
                 raw_content = str(getattr(response, "content", "")).strip()
+                metadata = getattr(response, 'response_metadata', {})
+                issues.append({'type': 'model_call', 'phase': 'planning',
+                               'promptTokens': metadata.get('prompt_eval_count'),
+                               'outputTokens': metadata.get('eval_count'), 'doneReason': metadata.get('done_reason')})
                 data = self._extract_json(raw_content)
                 if not data:
                     raise ValueError("Missing plan")
                 plan = AgentPlan.model_validate(data)
+                self._materialize_requirements(plan)
                 self._inherit_conversation(plan, previous_context or {})
                 self._normalize_explicit_conditions(plan, message)
                 self._coalesce_forecasts(plan)
                 resolve_context(plan, previous_context or {}, self._normalize_mode(book_mode))
+                plan._planning_issues.extend(issues)
                 return self._normalize_plan(plan, now, message, book_mode)
             except (asyncio.TimeoutError, json.JSONDecodeError, ValidationError, ValueError) as exc:
                 detail = "; ".join(f"{error['loc']}: {error['msg']}" for error in exc.errors()) if isinstance(exc, ValidationError) else str(exc)
                 issues.append({'type': type(exc).__name__, 'detail': detail[:800]})
                 if attempt == 0:
-                    prompt_values["message"] = message + "\n上次计划校验失败：" + detail[:800] + "\n请重新生成符合 JSON schema 的计划。用户的情景金额与次数必须填入 scenario.changes，预算和储蓄条件也要填写，不能只写在 finalInstruction。"
+                    prompt_values["message"] = message + "\n上次计划校验失败：" + detail[:800] + "\n仅修正这些结构或参数错误，保留当前用户目标、已选工具与已提供条件。不要为了修复结构而新增情景、金额、变化或无关字段。"
 
         plan = self._fallback_plan()
         plan._planning_issues = issues
@@ -141,19 +148,7 @@ class QueryPlanner:
     ) -> AgentPlan:
         # normalize 的目的，是把“不稳定的 LLM 输出”整理成“稳定的程序输入”。
         self._coalesce_forecasts(plan)
-        requirements = set(plan.understanding.evidenceNeeds)
-        required_tools = set()
-        if plan.output.chart != 'none' or 'trends' in requirements:
-            required_tools.add('trends')
-        if requirements & {'sources', 'members', 'remarks'}:
-            required_tools.add('sources')
-        if 'forecast' in requirements and not any(task.tool in HISTORY_BASED_TOOLS for task in plan.analyses):
-            required_tools.add('forecast')
-        if 'changes' in requirements:
-            required_tools.add('changes')
-        if required_tools:
-            plan.analyses.extend(AnalysisRequest(tool=tool, metric=plan.output.metric if plan.output.metric != 'all' else 'income')
-                                 for tool in sorted(required_tools) if not any(task.tool == tool for task in plan.analyses))
+        self._materialize_requirements(plan)
         if plan.analysisType == "financial_analysis" and not plan.analyses:
             plan.analyses = [AnalysisRequest(tool=name) for name in ("cashflow", "trends", "changes", "anomalies", "recurring")]
         if plan.analyses:
@@ -197,6 +192,13 @@ class QueryPlanner:
                         if task.tool in {"forecast", "scenario"}:
                             task.targetMonth = target
             self._prepare_analysis_queries(plan, now, book_mode)
+            if not plan._analysis_context.get('ambiguous'):
+                future = {task.targetMonth for task in plan.analyses if task.tool in HISTORY_BASED_TOOLS}
+                if len(future) == 1:
+                    plan._analysis_context['targetMonth'] = next(iter(future))
+                for task in plan.analyses:
+                    if task.tool == 'budget':
+                        plan._analysis_context['budgetTargetMonth'] = task.targetMonth
         if plan.intent != "analyze_orders":
             plan.needsTools = False
             plan.toolCalls = []
@@ -233,17 +235,57 @@ class QueryPlanner:
 
         return plan
 
+    def _materialize_requirements(self, plan):
+        requirements = set(plan.understanding.evidenceNeeds)
+        tools = set()
+        future = any(task.tool in HISTORY_BASED_TOOLS for task in plan.analyses)
+        if ('trends' in requirements or plan.output.chart != 'none') and not future:
+            tools.add('trends')
+        if requirements & {'sources', 'members', 'remarks'}:
+            tools.add('sources')
+        if 'forecast' in requirements and not future:
+            tools.add('forecast')
+        if 'changes' in requirements:
+            tools.add('changes')
+        plan.analyses.extend(AnalysisRequest(tool=tool, metric=plan.output.metric if plan.output.metric != 'all' else 'income')
+                             for tool in sorted(tools) if not any(task.tool == tool for task in plan.analyses))
+
     def _inherit_conversation(self, plan, previous):
         """Only inherit a referent's range and grouping within its ledger/filter scope."""
         conversation = previous.get('conversation', {})
         if not (plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext and conversation):
             return
+        if not plan.toolCalls:
+            templates = conversation.get('queries') or []
+            if not templates and len(previous.get('scope', [])) == 1:
+                tool, category, remark = previous['scope'][0]
+                identifiers = {key for row in conversation.get('analyses', []) for key in row.get('queryIds', [])} or {'ledger'}
+                templates = [{'id': key, 'toolName': tool, 'args': {'cost_type': category, 'remark': remark}}
+                             for key in sorted(identifiers)]
+            restored = [ToolCall.model_validate(row) for row in templates]
+            restored_scope = sorted({(call.toolName, call.args.cost_type, call.args.remark) for call in restored})
+            if [list(row) for row in restored_scope] != previous.get('scope'):
+                return
+            plan.toolCalls = restored
         scopes = sorted({(call.toolName, call.args.cost_type, call.args.remark) for call in plan.toolCalls})
-        if scopes and [list(row) for row in scopes] != previous.get('scope'):
+        if [list(row) for row in scopes] != previous.get('scope'):
             return
         if not plan.analyses and plan.intent == 'analyze_orders':
             plan.analyses = [AnalysisRequest.model_validate(row) for row in conversation.get('analyses', [])]
-        if not plan.analysisWindow and conversation.get('analysisWindow') and not any(task.tool in HISTORY_BASED_TOOLS for task in plan.analyses):
+        active = previous.get('activeAnalyses') or [row for row in conversation.get('analyses', []) if row.get('tool') != 'sources']
+        previous_window = previous.get('activeHistoryWindow', conversation.get('analysisWindow'))
+        same_window = not plan.analysisWindow or plan.analysisWindow.model_dump(mode='json') == previous_window
+        if (plan.intent == 'analyze_orders' and plan.analyses and all(task.tool == 'sources' for task in plan.analyses)
+                and active and same_window):
+            # Inspecting records is a subtask of the referenced analysis. Keep the
+            # active calculation available when a later question asks how it worked.
+            restored_tasks = [AnalysisRequest.model_validate(row) for row in active]
+            known_ids = {call.id for call in plan.toolCalls}
+            for task in restored_tasks:
+                if set(task.queryIds) - known_ids and len(scopes) == 1:
+                    task.queryIds = sorted(known_ids)
+            plan.analyses.extend(restored_tasks)
+        if not plan.analysisWindow and conversation.get('analysisWindow'):
             from app.schemas.plan import AnalysisWindow
             plan.analysisWindow = AnalysisWindow.model_validate(conversation['analysisWindow'])
         if not plan.sourceGroups:
@@ -272,6 +314,9 @@ class QueryPlanner:
         for task in forecasting:
             if task.targetMonth is None:
                 task.targetMonth = shift_month(now.date(), 1).strftime("%Y-%m")
+        for task in plan.analyses:
+            if task.tool == 'budget' and task.targetMonth is None:
+                task.targetMonth = now.strftime('%Y-%m')
         # Expand date windows in code instead of asking a model to enumerate months.
         sources = {}
         source_scopes = {}
@@ -299,7 +344,7 @@ class QueryPlanner:
             end = plan.analysisWindow.endDate.replace(day=1)
             length = (end.year - start.year) * 12 + end.month - start.month + 1
             requested_periods = [shift_month(start, offset) for offset in range(length)]
-            periods = sorted(set(periods + requested_periods)) if forecasting else requested_periods
+            periods = requested_periods
         for task in plan.analyses:
             if task.tool == "budget":
                 target = datetime.strptime(task.targetMonth, "%Y-%m").date() if task.targetMonth else now.date().replace(day=1)
@@ -404,28 +449,7 @@ class QueryPlanner:
         return re.sub(r"</?think>", "", without_blocks, flags=re.IGNORECASE)
 
     def _normalize_cost_type(self, value: str | None) -> str:
-        cost_type = str(value or "").strip()
-        if not cost_type:
-            return "不限"
-
-        broad_words = {
-            "不限",
-            "全部",
-            "所有",
-            "支出",
-            "花费",
-            "消费",
-            "开销",
-            "费用",
-            "明细",
-            "支出明细",
-            "消费明细",
-            "花费明细",
-            "开销明细",
-            "各分类",
-            "分类",
-        }
-        return "不限" if cost_type in broad_words else cost_type
+        return normalize_cost_type(value)
 
     def _should_use_month_without_year(self, message: str) -> bool:
         text = message.strip()

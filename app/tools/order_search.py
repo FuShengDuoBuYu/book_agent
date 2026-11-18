@@ -127,6 +127,7 @@ def normalize_cost_type(value: str | None) -> str:
         "不限",
         "全部",
         "所有",
+        "收入", "收支", "进账", "收入明细", "income", "incomes", "expense", "expenses", "all",
         "支出",
         "花费",
         "消费",
@@ -140,7 +141,7 @@ def normalize_cost_type(value: str | None) -> str:
         "各分类",
         "分类",
     }
-    return "不限" if cost_type in broad_words else cost_type
+    return "不限" if cost_type.lower() in broad_words else cost_type
 
 
 def filter_orders_locally(

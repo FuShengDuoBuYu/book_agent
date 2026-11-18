@@ -119,14 +119,32 @@ test("the matching Markdown preview and its notes appear only once in an artifac
     id: "ledger", kind: "table", title: "带 | 符号的明细",
     columns: [{ key: "note", label: "备注" }],
     rows: Array.from({ length: 61 }, () => ({ note: "<原文>|测试" })),
-    notes: ["依据原始备注。"],
+    notes: ["依据原始备注。", "共展示六十行。"],
   }]);
   const fallback = [
     "### 带 \\| 符号的明细", "", "| 备注 |", "| --- |",
     ...Array.from({ length: 60 }, () => "| &lt;原文&gt;\\|测试 |"),
-    "", "其余记录见完整数据表下载。", "", "依据原始备注。", "", "其他说明。",
+    "", "其余记录见完整数据表下载。", "", "依据原始备注。", "共展示六十行。", "", "其他说明。",
   ].join("\n");
   assert.equal(renderAnalysisMarkdown(markdown, fallback, artifacts), "<p>其他说明。</p>\n");
+});
+
+test("literal ledger links and their code fences stay inert and deduplicate in the chat", () => {
+  const markdown = new MarkdownIt({ html: false, linkify: true });
+  const note = "[账户](https://example.invalid/a) ![图](https://example.invalid/b) https://example.invalid/c `内` | 末\n下一行";
+  const artifacts = normalizeArtifacts([{
+    id: "ledger", kind: "table", title: "备注表",
+    columns: [{ key: "note", label: "备注" }, { key: "amount", label: "金额", unit: "元" }],
+    rows: [{ note, amount: 42.25 }],
+  }]);
+  const fallback = [
+    "账单备注如下。", "", "### 备注表", "", "| 备注 | 金额（元） |", "| --- | --- |",
+    "| `` [账户](https://example.invalid/a) ![图](https://example.invalid/b) https://example.invalid/c `内` \\| 末 下一行 `` | 42.25 |",
+  ].join("\n");
+  const fallbackHtml = renderAnalysisMarkdown(markdown, fallback, []);
+  assert.doesNotMatch(fallbackHtml, /<(?:a|img)\b/);
+  assert.match(fallbackHtml, /<code>\[账户\]\(https:\/\/example\.invalid\/a\)/);
+  assert.equal(renderAnalysisMarkdown(markdown, fallback, artifacts), "<p>账单备注如下。</p>\n");
 });
 
 test("CSV quotes delimiters, newlines and embedded quotes while preserving numbers", () => {

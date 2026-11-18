@@ -9,33 +9,40 @@ from app.tools.financial_analysis import (
     _round_money, _series, _source, _totals, forecast_scope, shift_month,
 )
 
-from app.tools.source_analysis import money, observed_source_key
+from app.tools.source_analysis import money, observed_source_key, source_aliases, source_rows
 
 
-def _income_source_parts(orders, income, source):
-    rows = [r for r in income["sourceForecasts"] if not r["excluded"]]
+def _source_parts(orders, rows, months, metric, source):
     exact = [r for r in rows if source in (r["sourceKey"], r["source"], r["member"],
              r["member"] + "的" + r["source"], r["member"] + r["source"])]
     matched = exact or [r for r in rows if source in r["source"]]
     if matched:
-        return [(r, r["estimate"]) for r in matched]
+        return [(row, row["monthlyAmounts"]) for row in matched]
 
-    # A category or original remark may identify only part of a semantic group.
-    # Calculate that subset within each member's component on the same baseline months.
+    # Restrict original remark/category matches to their contribution inside each semantic group.
     components = {key: row for row in rows for key in row["observedSourceKeys"]}
-    months = income["baselineMonths"]
     amounts = defaultdict(lambda: defaultdict(float))
     for order in orders:
         month = _date(order).strftime("%Y-%m")
-        if month not in months or float(order["money"]) <= 0:
+        amount = float(order["money"])
+        if month not in months or amount == 0 or (amount > 0) != (metric == "income"):
             continue
         if source not in _source(order) and source not in str(order.get("orderRemark") or ""):
             continue
         component = components.get(observed_source_key(order))
         if component:
-            amounts[component["sourceKey"]][month] += float(order["money"])
-    return [(row, money(median(monthly.get(month, 0) for month in months)))
-            for row in rows if (monthly := amounts.get(row["sourceKey"]))]
+            amounts[component["sourceKey"]][month] += abs(amount)
+    return [(row, monthly) for row in rows if (monthly := amounts.get(row["sourceKey"]))]
+
+
+def _parts_baseline(parts, months, metric):
+    if metric == "expense":
+        # Keep the expense estimator: take the median of the selected monthly totals.
+        return money(median(sum(values.get(month, 0) for _, values in parts) for month in months))
+    estimates = [row["estimate"] if values is row["monthlyAmounts"]
+                 else money(median(values.get(month, 0) for month in months))
+                 for row, values in parts]
+    return money(sum(estimates))
 
 
 def _raw_source_baseline(orders, months, metric, source):
@@ -54,19 +61,26 @@ def _raw_source_baseline(orders, months, metric, source):
     return money(median(amounts.get(month, 0) for month in months)), sorted(matched)
 
 
-def apply_changes(orders, income, expense, changes):
+def apply_changes(orders, income, expense, changes, *, source_groups=None):
     totals = {"income": income["estimate"], "expense": expense["estimate"]}
     assumptions = []
     used = defaultdict(float)
     months = income["baselineMonths"]
+    rows_by_metric = {}
+    if "sourceForecasts" in income:
+        rows_by_metric["income"] = [r for r in income["sourceForecasts"] if not r["excluded"]]
+    if any(change["metric"] == "expense" and change.get("source") for change in changes):
+        expenses = [order for order in orders if float(order["money"]) < 0
+                    and _date(order).strftime("%Y-%m") in months]
+        rows_by_metric["expense"] = source_rows(expenses, source_aliases(orders, source_groups))
     for change in changes:
         metric, source = change["metric"], str(change.get("source") or "").strip()
         base = income['estimate'] if metric == 'income' else expense['estimate']
         matched, parts = [], []
         if source:
-            if metric == "income" and "sourceForecasts" in income:
-                parts = _income_source_parts(orders, income, source)
-                base = money(sum(value for _, value in parts))
+            if metric in rows_by_metric:
+                parts = _source_parts(orders, rows_by_metric[metric], months, metric, source)
+                base = _parts_baseline(parts, months, metric)
                 matched = sorted({row["source"] for row, _ in parts})
             else:
                 base, matched = _raw_source_baseline(orders, months, metric, source)
@@ -79,12 +93,15 @@ def apply_changes(orders, income, expense, changes):
         if source and delta < -base:
             return {"sufficientData": False, "reason": "所设减少额超过该来源的历史基准，请确认变化条件。"}
         if delta < 0 and parts:
-            for row, amount in parts:
-                # For a shared label, distribute the reduction across its member baselines.
-                key = row["sourceKey"]
-                used[key] += -delta * amount / base
-                if money(used[key]) > row["estimate"]:
-                    return {"sufficientData": False, "reason": "多项减少条件重叠，累计减少额超过该来源的预测贡献。"}
+            # Apply the requested fraction to the matching records in each baseline month.
+            # A household alias and a qualified member alias can refer to the same spend.
+            fraction = -delta / base
+            for row, amounts in parts:
+                for month in months:
+                    key = (row["sourceKey"], month)
+                    used[key] += fraction * amounts.get(month, 0)
+                    if money(used[key]) > row["monthlyAmounts"].get(month, 0):
+                        return {"sufficientData": False, "reason": "多项减少条件重叠，累计减少额超过该来源的历史贡献。"}
         totals[metric] += delta
         assumptions.append({**change, "sourceBaseline": _round_money(base),
                             "matchedSources": matched, "matchedSourceKeys": [row["sourceKey"] for row, _ in parts],
@@ -101,7 +118,7 @@ def baseline(orders, as_of, changes=None, target_month=None, **kwargs):
     expense = _forecast(orders, as_of=as_of, metric="expense", **scope)
     if not income["sufficientData"]:
         return {"sufficientData": False, "reason": "需要至少两个有记录的完整月份作为历史依据。"}
-    adjusted = apply_changes(orders, income, expense, changes or [])
+    adjusted = apply_changes(orders, income, expense, changes or [], source_groups=scope.get("source_groups"))
     if not adjusted["sufficientData"]:
         return adjusted
     totals = adjusted["totals"]

@@ -6,7 +6,7 @@ class ReportSection(BaseModel):
     model_config = ConfigDict(extra='forbid')
     title: str = Field(max_length=120, description='简洁标题；判断必须符合所引用证据')
     factIds: list[str] = Field(min_length=1, max_length=8, description='引用证据编号，程序会显示完整证据句和其中的数量')
-    analysis: str = Field(max_length=1600, description='直接回答本轮目标，解释证据与条件，需要数量时使用 values 提供的 {{v1}} 引用，由程序填入真实值。表格由 artifacts 渲染，不在此手抄表格。')
+    analysis: str = Field(max_length=1600, description='直接回答本轮目标，数量仅引用本段 factIds 的相同指标和单位；或用已含单位的 {{v1}} 变量。不得换算或手抄表格，表格由 artifacts 渲染。')
 
 
 class ReportDraft(BaseModel):
@@ -17,7 +17,7 @@ class ReportDraft(BaseModel):
 class ReportReview(BaseModel):
     model_config = ConfigDict(extra='forbid')
     supported: bool
-    completed: bool = True
+    completed: bool
     issues: list[str] = Field(default_factory=list, max_length=8)
 
     @field_validator('issues', mode='before')

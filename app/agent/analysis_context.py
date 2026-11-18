@@ -7,7 +7,7 @@ import json
 from app.schemas.plan import AgentPlan, ScenarioChange, ToolCall
 
 FIELDS = ('months', 'startingBalance', 'targetAmount', 'monthlyImprovement',
-          'purchaseAmount', 'reserveAmount', 'targetMonth', 'budgetAmount')
+          'purchaseAmount', 'reserveAmount')
 DECISION_TOOLS = {'forecast', 'projection', 'scenario', 'savings', 'optimization', 'purchase', 'runway', 'budget'}
 
 
@@ -28,6 +28,21 @@ def merge_changes(previous, current):
 def resolve_group(tasks, previous, scope):
     state = deepcopy(previous)
     state.pop('previousMonths', None)
+    for task in tasks:
+        if task.targetMonth is None:
+            task.targetMonth = state.get('budgetTargetMonth' if task.tool == 'budget' else 'targetMonth')
+        if task.tool == 'budget':
+            if task.budgetAmount is None:
+                task.budgetAmount = state.get('budgetAmount')
+            if task.budgetAmount is not None:
+                state['budgetAmount'] = task.budgetAmount
+            if task.targetMonth:
+                state['budgetTargetMonth'] = task.targetMonth
+    future_targets = {task.targetMonth for task in tasks if task.tool != 'budget' and task.targetMonth}
+    if len(future_targets) == 1:
+        state['targetMonth'] = next(iter(future_targets))
+    elif len(future_targets) > 1:
+        state.pop('targetMonth', None)
     delta = {task.monthsDelta for task in tasks if task.monthsDelta is not None}
     if len(delta) > 1:
         raise ValueError('Multiple incompatible deadline changes')
@@ -96,6 +111,9 @@ def resolve_context(plan: AgentPlan, previous: dict, book_mode='个人版') -> d
         state = states[0]
     elif states:
         state = {'ambiguous': True, 'scenarios': states}
+        scopes = {json.dumps(row['scope'], ensure_ascii=False) for row in states}
+        if len(scopes) == 1:
+            state['scope'] = json.loads(next(iter(scopes)))
     else:
         current_scope = [list(row) for row in sorted(set(sources.values()))]
         inherit = (plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext
@@ -104,3 +122,14 @@ def resolve_context(plan: AgentPlan, previous: dict, book_mode='个人版') -> d
         state['scope'] = current_scope
     plan._analysis_context = state
     return state
+
+
+def logical_queries(plan):
+    queries = {}
+    for call in plan.toolCalls:
+        for identifier in call.sourceIds or [call.id]:
+            args = call.args.model_dump()
+            if plan.analyses:
+                args.update(year=None, month=None, day=None)
+            queries[identifier] = {'id': identifier, 'toolName': call.toolName, 'args': args}
+    return list(queries.values())

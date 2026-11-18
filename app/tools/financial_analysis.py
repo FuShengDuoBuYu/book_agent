@@ -260,13 +260,21 @@ def _forecast(orders: list[dict], *, as_of: date, metric: str = "income", target
               source_groups=None, window_start=None, window_end=None, **kwargs) -> dict:
     target = date.fromisoformat(target_month + "-01") if target_month else shift_month(as_of, 1)
     cutoff = min(as_of.replace(day=1), target)
-    start = shift_month(cutoff, -6)
-    expected = [shift_month(start, offset) for offset in range(6)]
+    if window_start:
+        start = window_start.replace(day=1)
+    elif window_end:
+        start = min((_date(order) for order in orders), default=cutoff).replace(day=1)
+    else:
+        start = shift_month(cutoff, -6)
+    last = min(window_end or cutoff, cutoff)
+    month_count = (last.year - start.year) * 12 + last.month - start.month + 1
+    expected = (shift_month(start, offset) for offset in range(month_count))
     complete = {
         month.strftime("%Y-%m") for month in expected
-        if (not window_start or month >= window_start)
+        if month < cutoff and (not window_start or month >= window_start)
         and (not window_end or window_end >= month.replace(day=monthrange(month.year, month.month)[1]))
     }
+    window_description = "用户指定的历史区间内，仅纳入目标月和本月之前的完整自然月" if window_start or window_end else "最近六个完整自然月内"
     history = [order for order in orders if _date(order).strftime("%Y-%m") in complete]
     buckets = _buckets(history)
     observed = list(buckets)
@@ -306,7 +314,7 @@ def _forecast(orders: list[dict], *, as_of: date, metric: str = "income", target
         "excludedIncomeTotal": money(sum(row["amount"] for row in rows if row["excluded"])),
         "sources": _recurring_summary(rows, set()),
         "latestCompleteChange": _changes(history, as_of=as_of),
-        "method": "最近六个完整自然月内取最近三个有账单的完整月份。每个成员的每个收入来源按月取中位数后加总；支出取月总额中位数，结余用两者相减。区间组合各来源的历史最低与最高贡献，支出区间取历史最小和最大月总额。",
+        "method": window_description + "，取最近三个有账单的完整月份。每个成员的每个收入来源按月取中位数后加总；支出取月总额中位数，结余用两者相减。区间组合各来源的历史最低与最高贡献，支出区间取历史最小和最大月总额。",
         "limitations": [
             "同一月份各来源的极值未必同时发生。区间不表示统计置信区间或收入保证。",
             "有其他账单但某来源无记录，该来源当月记作零贡献。全月没有账单则未知，不进入基准。",
@@ -330,7 +338,7 @@ def _scenario(orders: list[dict], *, as_of: date, target_month=None, changes=Non
     if not income["sufficientData"] or not changes:
         return {"sufficientData": False, "baseline": income, "reason": "需要历史月度基准和用户明确给出的变化金额或次数。"}
     from app.tools.decision_analysis import apply_changes
-    adjusted = apply_changes(orders, income, expense, changes)
+    adjusted = apply_changes(orders, income, expense, changes, source_groups=scope.get("source_groups"))
     if not adjusted["sufficientData"]:
         return adjusted
     totals, assumptions = adjusted["totals"], adjusted["assumptions"]
