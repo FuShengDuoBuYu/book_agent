@@ -77,6 +77,7 @@ PLANNER_SYSTEM_PROMPT = """
 - 只有 forecast 需要按 metric 分别生成任务；cashflow、trends、changes、recurring 已同时包含收支，同一范围不要重复生成。
 - aggregate 比较区间时用 periods 表示前后时段，groupBy 只放要跨期对齐的类别、成员等维度；按月作对比时不把不同月份同时作为对齐维度。金额、笔数、每笔均额和中位数由工具计算。每笔均额不能解释为商品单价。
 - 交叉统计、按星期几或支付账户汇总、比较不连续时段时选 aggregate。metric 可填 income/expense/net/all，aggregate.groupBy 从 month/year/category/member/source/bank/weekday 中选最多四个维度。比较时用 aggregate.periods 填最多八段，每段写 label、startDate、endDate。aggregate.filters 可按 includeCategories/excludeCategories、includeMembers/excludeMembers、includeSources/excludeSources、remarkContains/excludeRemarks、minAmount/maxAmount 筛选。limit 控制列出的行数。省略未使用的字段。
+- aggregate 示例：{{"tool":"aggregate","queryIds":["ledger"],"metric":"expense","aggregate":{{"groupBy":["category"],"periods":[{{"label":"前期","startDate":"2026-09-01","endDate":"2026-09-30"}},{{"label":"后期","startDate":"2026-10-01","endDate":"2026-10-31"}}],"filters":{{"excludeCategories":["房租","交通"]}}}}}}。按实际日期填写。分类排除放 filters，不能写成 changes；历史比较不需要用户假设。
 - 问为什么增长或减少时选 changes 和 trends。问周期性收入与固定支出选 recurring。异常与重复记账选 anomalies。
 - 预测单个月份使用 forecast，metric 为 income、expense、net。预测未来多个月份，或问“几个月能存下多少钱”，使用 projection，months 填月份数量，同时计算收支和累计新增结余，不需要 startingBalance。targetMonth 默认下个月，不能填历史月份。
 - 假设调整使用 scenario；若追问已有的多月测算，继续使用 projection 或 savings。changes 中 amount 表示金额、percent 表示百分比，两者只能填一个；source 填被调整的来源，增加为正、减少为负，不要自行乘算。

@@ -106,6 +106,7 @@ class ScenarioChange(BaseModel):
 
 
 class AnalysisRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
     @model_validator(mode="before")
     @classmethod
     def omit_unused_metric(cls, value):
@@ -125,7 +126,8 @@ class AnalysisRequest(BaseModel):
     tool: str
     queryIds: list[str] = Field(default_factory=list, max_length=24)
     metric: Literal["income", "expense", "net", "all"] = "income"
-    aggregate: AggregateSpec | None = None
+    aggregate: AggregateSpec | None = Field(default=None,
+        description='aggregate工具的全部分组/区间/筛选参数放在这个对象内，不是放在changes或分析任务根部。')
     targetMonth: str | None = Field(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
     changes: list[ScenarioChange] = Field(default_factory=list, max_length=20, description='用户给定的收支变化；全部收入中断对应 income、percent=-100、source为空')
     budgetAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False)

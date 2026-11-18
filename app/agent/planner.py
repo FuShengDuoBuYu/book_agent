@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from app.core.config import get_settings
 from app.core.llm import get_planner_model
 from app.agent.analysis_context import resolve_context
+from app.agent.plan_parsing import repair_descriptive_arrays
 from app.agent.prompts import PLANNER_HUMAN_PROMPT, PLANNER_SYSTEM_PROMPT
 from app.schemas.plan import (
     AgentPlan,
@@ -128,6 +129,7 @@ class QueryPlanner:
                                'promptTokens': metadata.get('prompt_eval_count'),
                                'outputTokens': metadata.get('eval_count'), 'doneReason': metadata.get('done_reason')})
                 data = self._extract_json(raw_content)
+                issues.extend(self._parse_repairs)
                 if not data:
                     raise ValueError("Missing plan")
                 plan = AgentPlan.model_validate(data)
@@ -159,6 +161,7 @@ class QueryPlanner:
         return plan
 
     def _extract_json(self, content: str) -> dict:
+        self._parse_repairs = []
         # 模型有时会包一层 markdown code fence，或带 <think> 标签，这里先做清洗再取 JSON。
         content = self._strip_think_tags(content).strip()
         if content.startswith("```"):
@@ -171,7 +174,12 @@ class QueryPlanner:
         if start == -1 or end == -1 or end <= start:
             return {}
 
-        return json.loads(content[start : end + 1])
+        content = content[start:end + 1]
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            repaired, self._parse_repairs = repair_descriptive_arrays(content)
+            return json.loads(repaired)
 
     def _normalize_explicit_conditions(self, plan, message):
         """Recover narrow, unambiguous user inputs before resolving context.

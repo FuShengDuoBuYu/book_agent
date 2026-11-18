@@ -184,6 +184,17 @@ class HistoricalWindowTests(unittest.TestCase):
 
 
 class ForecastSampleProvenanceTests(unittest.TestCase):
+    def test_referent_map_in_array_is_recovered_without_changing_executable_args(self):
+        planner = QueryPlanner.__new__(QueryPlanner)
+        raw = '''{"understanding":{"referents":["上个月":"2026-10","按人":"保留成员"]},
+          "toolCalls":[{"id":"family","toolName":"search_family_orders"}],
+          "analyses":[{"tool":"sources","queryIds":["family"]}]}'''
+        data = planner._extract_json(raw)
+        self.assertEqual(data['understanding']['referents'], ['上个月：2026-10', '按人：保留成员'])
+        self.assertEqual(data['toolCalls'][0]['toolName'], 'search_family_orders')
+        with self.assertRaises(json.JSONDecodeError):
+            planner._extract_json('{"analyses":[{"tool":"scenario","changes":["expense":300]}]}')
+
     def test_explicit_monthly_improvement_is_a_goal_not_an_assumed_cut(self):
         planner = QueryPlanner.__new__(QueryPlanner)
         for raw in ('三百', '300', '一千二百', '两千五百元'):

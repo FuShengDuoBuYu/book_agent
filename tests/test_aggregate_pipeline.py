@@ -27,6 +27,8 @@ class AggregatePipelineTests(unittest.TestCase):
         self.assertEqual(task.changes, [])
         with self.assertRaises(ValidationError):
             AnalysisRequest.model_validate({'tool': 'scenario', 'changes': [{'metric': 'expense', 'source': '房租'}]})
+        with self.assertRaises(ValidationError):
+            AnalysisRequest.model_validate({'tool': 'aggregate', 'groupBy': ['category']})
 
     def test_descriptive_referent_overflow_is_bounded_without_discarding_tools(self):
         plan = AgentPlan.model_validate({'understanding': {'referents': ['记录范围'] * 9},
