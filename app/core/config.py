@@ -27,7 +27,7 @@ class Settings(BaseModel):
     llm_reasoning_effort: str | None = None
     llm_reasoning: bool = False
     planner_reasoning: bool = False
-    intent_reasoning: bool = True
+    intent_reasoning: bool = False
     ollama_num_ctx: int = Field(default=8192, gt=0)
     ollama_keep_alive: str = '60s'
     ollama_num_gpu: int | None = Field(default=None, ge=0)

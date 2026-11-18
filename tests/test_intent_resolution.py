@@ -41,7 +41,7 @@ class IntentResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(audit['status'], 'resolved')
         self.assertNotIn('reasoning_content', str(audit))
         self.assertNotIn('private reasoning', str(audit))
-        self.assertEqual(factory.call_args.kwargs, {'reasoning': True, 'num_predict': 2048})
+        self.assertEqual(factory.call_args.kwargs, {'reasoning': False, 'num_predict': 2048})
         payload = json.loads(model.ainvoke.call_args.args[0][1][1])
         self.assertEqual(payload['today'], '2026-11-19')
 

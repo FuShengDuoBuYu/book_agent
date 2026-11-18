@@ -159,7 +159,8 @@ class QueryPlanner:
         if getattr(self, 'intent_resolver', None):
             resolved_goal, audit = await self.intent_resolver.resolve(
                 message, history, now.date(), self._normalize_mode(book_mode), previous_context)
-            issues.append({'type': 'intent_resolution', **audit})
+            issues.append({'type': 'intent_resolution', **audit,
+                           'understanding': resolved_goal.model_dump() if resolved_goal else None})
         for attempt in range(2):
             try:
                 if getattr(self, 'prompt', None):
@@ -191,7 +192,7 @@ class QueryPlanner:
                 if not data:
                     raise ValueError("Missing plan")
                 plan = AgentPlan.model_validate(data)
-                if resolved_goal:
+                if resolved_goal and not plan.understanding.objective:
                     plan.understanding = resolved_goal.model_copy(deep=True)
                 self._normalize_query_scopes(plan)
                 self._materialize_requirements(plan)
