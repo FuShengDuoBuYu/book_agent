@@ -77,6 +77,12 @@ class EvidenceReportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             prepare_draft(draft, facts)
 
+    def test_report_must_answer_the_user_instead_of_describing_internal_fields(self):
+        for text in ['根据用户指令，我需要解释 section.answerGoal 与 computedFacts 的关系。',
+                     'answerGoal 是本报告的目标，factIds 是计算事实的来源。']:
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                prepare_draft(self.draft(analysis=text), self.facts)
+
     def test_cashflow_average_and_month_total_keep_distinct_typed_bindings(self):
         from datetime import date
         from app.tools.financial_analysis import run_analysis
@@ -282,7 +288,7 @@ class EvidenceReviewTests(unittest.IsolatedAsyncioTestCase):
                 for name in ('租房开支', '交通定期充值')]
         await reporter.answer('列出重复支出', {}, [{'tool': 'recurring', 'evidence': {'expense': rows}}])
         review = reporter._review.call_args.args[0]
-        available = review['facts'] + [fact for section in review['report']['sections'] for fact in section['evidence']]
+        available = review['facts'] + review['report']['displayedFacts']
         self.assertEqual({fact['id'] for fact in available}, {'f1', 'f2'})
         self.assertIn('交通定期充值', str(review))
 

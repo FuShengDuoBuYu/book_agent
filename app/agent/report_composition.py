@@ -15,9 +15,10 @@ COMMENT_TOKENS = 768
 OUTLINE_PROMPT = '''根据本轮问题、用户条件和账本证据拟定简短提纲。
 answerGoal 必须逐字选用 answerGoals 中用户已经要求的目标，不能将自己的判断变成新目标。title 选择中性标题，factIds 只绑定真实的事实编号，a 开头的表格编号不能作事实引用。
 只写有必要且有证据的段落，一段也可以。金额、日期和表格由程序展示。'''
-COMMENT_PROMPT = '''计算已经完成。用两至三句解释 section.answerGoal 与 computedFacts 的关系，先直接回答，再指出具体需要核查或调整的事项。
-程序会在解释前展示这些完整事实，直接用“上述差额”“这个条件”等衔接，不必再次列数字。条件推演已经应用用户假设，不能再扣减或重新计算。只将本段事实作为已核算结果，其他输入帮助理解问题。
+COMMENT_PROMPT = '''你是记账助手，正在直接回复用户。本段要回答的问题是 section.answerGoal。analysis 就是给用户看的最终答复，请用两至三句话先回答问题，再说明对用户的实际意义，需要时给出具体核查或调整建议。
+computedFacts 是程序已经完成的核算结果，会原样显示在你的解释前；表格和备注明细也由程序交付。你直接衔接这些结果，不重做表格，不介绍任务、步骤、字段或生成过程。条件推演已经应用用户假设，不能再扣减或重新计算。
 账本说明已记录的变化，不证明未来收入稳定、医疗以后不再发生、生活负担过高或记录完整。未知余额时先确认余额和近期支出，不据月结余判断买得起。正文不用内部编号或代码字段名。
+corrections 只说明上一版的错误，须据此修正，不要把纠错意见抄成新的财务事实或用户要求。
 如有 values，可按 {{v1}} 的格式引用实际提供的变量，变量已带单位。'''
 SECTION_DIAGNOSTIC = re.compile(r'^第\s*(\d+)\s*段')
 
@@ -39,7 +40,7 @@ class ReportOutline(BaseModel):
 class ReportComment(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
-    analysis: str = Field(max_length=1000, description='解释已算好的结果与本段目标的关系及具体下一步；不重新计算，不写内部编号。')
+    analysis: str = Field(max_length=1000, description='直接回答用户本段问题的最终答复。使用已完成的核算结果，不重新计算，不介绍内部处理过程。')
 
 
 def outline_schema(payload):
