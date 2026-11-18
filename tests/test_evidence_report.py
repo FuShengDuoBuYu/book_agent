@@ -68,6 +68,31 @@ class EvidenceReportTests(unittest.TestCase):
         result = render_report(self.draft(), self.facts)
         self.assertIn(self.facts[0]['text'], result)
 
+    def test_required_omission_cannot_make_an_unrelated_amount_claim_valid(self):
+        facts = [{'id': 'f1', 'text': '房租查询期小计6000元。', 'required': False,
+                  'values': [{'label': '房租小计', 'value': 6000, 'unit': '元'}]},
+                 {'id': 'f2', 'text': '查询期结余3100元。', 'required': True,
+                  'values': [{'label': '查询期结余', 'value': 3100, 'unit': '元'}]}]
+        draft = self.draft(title='房租安排', factIds=['f1'], analysis='房租每月3100元。')
+        with self.assertRaises(ValueError):
+            prepare_draft(draft, facts)
+
+    def test_cashflow_average_and_month_total_keep_distinct_typed_bindings(self):
+        from datetime import date
+        from app.tools.financial_analysis import run_analysis
+        from tests.test_decision_analysis import ledger
+        results = [{'tool': tool, 'mode': '个人版', 'metric': 'all',
+                    'historyWindow': {'startDate': '2026-08-01', 'endDate': '2026-10-31'},
+                    'evidence': run_analysis(tool, ledger(), as_of=date(2026, 11, 19))}
+                   for tool in ('cashflow', 'trends')]
+        facts = build_facts(results)
+        average = next(f for f in facts if f['text'].startswith('【个人版】完整月份'))
+        monthly = next(f for f in facts if '已记收入' in f['text'])
+        self.assertEqual(average['binding']['aggregation'], 'complete_month_average')
+        self.assertEqual(monthly['binding']['aggregation'], 'recorded_month_total')
+        self.assertEqual(monthly['binding']['scope'], '个人版')
+        self.assertIn('month', monthly['binding'])
+
     def test_missing_liquidity_is_a_mandatory_fact(self):
         facts = build_facts([{'tool': 'purchase', 'mode': '个人版', 'evidence': {
             'sufficientData': False, 'missingInputs': ['startingBalance'], 'purchaseAmount': 6000}}])
@@ -213,6 +238,22 @@ class EvidenceReportTests(unittest.TestCase):
 
 
 class EvidenceReviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_report_runs_outline_bound_comment_and_global_review(self):
+        from app.agent.report_composition import ReportOutline, ReportComment
+        from app.schemas.report import ReportReview
+        reporter = EvidenceReporter()
+        reporter._invoke = AsyncMock(side_effect=[
+            ReportOutline(sections=[{'title': '购买条件', 'answerGoal': '缺少什么才能判断购买影响', 'factIds': ['f1']}]),
+            ReportComment(analysis='需先确认当前可动用余额和近期必付账单，再判断购买影响。'),
+            ReportReview(supported=True, completed=True, issues=[])])
+        reply, result = await reporter.answer('购买会影响生活吗？', {}, [{'tool': 'purchase', 'evidence': {
+            'sufficientData': False, 'missingInputs': ['startingBalance']}}])
+        self.assertEqual(result['status'], 'reviewed')
+        self.assertIn('需先确认当前可动用余额', reply)
+        self.assertEqual([c.args[0].__name__ for c in reporter._invoke.call_args_list],
+                         ['ReportOutline', 'ReportComment', 'ReportReview'])
+        self.assertEqual(len(result['attempts'][0]['calls']['composition']), 2)
+
     async def test_each_rejected_section_has_its_own_complete_repair_diagnostic(self):
         reporter = EvidenceReporter()
         bad = ReportDraft.model_validate({'sections': [

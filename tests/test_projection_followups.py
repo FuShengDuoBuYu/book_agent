@@ -384,8 +384,11 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
         aliases={'projection':'projection','budget':'budget','purchase':'purchase','optimization':'optimization',
                  'quality':'data_quality','data_quality':'data_quality','cashflow':'cashflow','income_stability':'income_stability','recurring':'recurring','anomalies':'anomalies',
                  'aggregate':'aggregate','scenario':'scenario','members':'sources','remarks':'sources','forecast':'forecast','changes':'changes'}
+        questions={'projection':'未来三个月按当前收支能攒下多少？','budget':'本月预算还剩多少？',
+                   'purchase':'现在买这台相机合适吗？','optimization':'怎样调整开支才能多留一些？',
+                   'forecast':'下个月预计能进账多少？','scenario':'假设所有收入都中断，结余会怎样？'}
         for need,tool in aliases.items():
-            plan=await self.plan('核对已说明的需求',{'understanding':{'evidenceNeeds':[need,need]}},{})
+            plan=await self.plan(questions.get(need,'核对已说明的历史数据'),{'understanding':{'evidenceNeeds':[need,need]}},{})
             self.assertEqual([t.tool for t in plan.analyses].count(tool),1,need)
         modes=[{'id':'mine','toolName':'search_personal_orders'},{'id':'home','toolName':'search_family_orders'}]
         plan=await self.plan('两个账本分开核对',{'toolCalls':modes,'understanding':{'evidenceNeeds':['runway','savings','forecast']},
@@ -501,3 +504,27 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
             p=await self.plan('去年余额为10000元。今年想了解存款目标，还需要哪些信息？',{'analyses':[draft]},{})
             self.assertEqual([t.tool for t in p.analyses],['savings'])
             self.assertIsNone(p.analyses[0].startingBalance)
+
+    async def test_history_goals_do_not_create_any_tag_only_decisions(self):
+        decisions={'forecast','scenario','projection','purchase','budget','savings','runway','optimization'}
+        for question in ('这个月收入主要从哪里来？','我这个月买过哪些东西？','上个月我买过扫描仪吗？','只列出本月收入，不用预测下个月。'):
+            draft={'understanding':{'objective':'解释本月收入来源','requestedAnswers':['说明收入构成'],
+                                    'evidenceNeeds':['sources',*sorted(decisions)]},'analyses':[{'tool':'sources'}]}
+            with self.subTest(question=question):
+                p=await self.plan(question,draft,{})
+                self.assertFalse(decisions & {t.tool for t in p.analyses})
+                self.assertFalse(decisions & set(p.understanding.evidenceNeeds))
+        totals=await self.plan('回顾整体财务情况和收支合计。',
+            {'understanding':{'evidenceNeeds':['totals','purchase']},'analyses':[{'tool':'trends'}]}, {})
+        self.assertIn('cashflow',[t.tool for t in totals.analyses])
+        self.assertNotIn('purchase',[t.tool for t in totals.analyses])
+
+    async def test_a_referenced_scoped_decision_can_be_recovered_but_not_transferred_to_another_ledger(self):
+        first=await self.plan('下个月预算还剩多少？',{'analyses':[{'tool':'budget','budgetAmount':300}]},{})
+        saved=await self.save(first)
+        draft={'followUpOfPreviousQuestion':True,'understanding':{'objective':'展开刚才的核算','evidenceNeeds':['budget','purchase']},
+               'analyses':[{'tool':'trends'}]}
+        follow=await self.plan('把上次的结果再算一遍。',draft,saved)
+        self.assertEqual([t.tool for t in follow.analyses if t.tool in {'budget','purchase'}],['budget'])
+        other=await self.plan('家庭账本也按同样方式展开。',{**draft,'toolCalls':[{'id':'home','toolName':'search_family_orders'}]},saved)
+        self.assertFalse({t.tool for t in other.analyses} & {'budget','purchase'})

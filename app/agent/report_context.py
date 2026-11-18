@@ -68,7 +68,7 @@ def _with_evidence(payload, facts, *, include_values):
     projected = {
         **payload,
         'facts': [{'id': row['id'], 'text': row.get('modelText') or row['text'],
-                   'required': bool(row.get('required'))} for row in facts],
+                   'required': bool(row.get('required')), **({'binding': row['binding']} if row.get('binding') else {})} for row in facts],
     }
     if include_values:
         projected['values'] = {row['id']: f"{row['factId']} {row['label']} = {row['display']}"

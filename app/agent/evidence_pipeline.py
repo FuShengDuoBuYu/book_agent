@@ -66,6 +66,7 @@ def collect_analysis_results(plan, datasets, today):
             )
             analysis_results.append({"mode": scope, "tool": task.tool, "queryIds": task.queryIds,
                                      "supplemental": task._supplemental, "metric": task.metric,
+                                     "historyWindow": window.model_dump(mode='json') if window else None,
                                      "filters": [{"category": category, "remark": remark} for category, remark in sorted(filters)],
                                      "evidence": result})
 

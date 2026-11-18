@@ -31,3 +31,11 @@ No new Android native implementation or ledger schema migration is needed. No le
 ## Acceptance
 
 Replay the real failure shapes using synthetic equivalent records: per-source forecast table with reconciled total; remark follow-up with an actual query; family member/source attribution; six-month income line chart with missing months represented as unknown; cross-turn breakdown preserving target month. Cover spending, changes, anomalies, savings, purchase, protected expenses and scenarios as held-out questions. Test prompt-like remarks, unknown members, invalid source aliases, missing data, model timeouts and chart/CSV injection. Run all backend tests, frontend tests/build, an independent code review, local model acceptance and authenticated deployed readiness/history checks before reporting release success.
+
+## Evidence-bound report composition (2026-11-19 refinement)
+
+Actual-model replay exposed two distinct failures: unrelated evidence labels became primary decisions, and a monolithic writer mixed the meanings of correct amounts across facts. Evidence labels may add read-only observations; a new decision requires a recognizable current user goal or an explicit referent to an existing decision in the same scope.
+
+Compose a report through an outline and sequential bounded comments. Freeze each section's answer goal, title and at most eight fact IDs before the comment call. The comment model sees only those facts, their scope/aggregation bindings and relevant corrections. It cannot replace the title or citations. Keep exact global value-reference IDs for compatible providers. Omitted required facts become independent code-rendered sections, never additional citations in unrelated prose.
+
+Review the assembled visible report for task completion and semantic mistakes. At most one correction round is allowed. Persist the explicit composition plan, call budgets, timing and diagnostics with private metadata; public history continues to expose only messages and validated artifacts. This separation improves auditability, but it does not prove free-text interpretations correct. Validate with the configured local model as well as deterministic regressions.

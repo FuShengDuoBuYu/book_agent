@@ -248,7 +248,7 @@ class QueryPlanner:
                         plan.followUpOfPreviousQuestion = False
                         plan.resetAnalysisContext = relation == 'reset'
                 self._normalize_query_scopes(plan)
-                self._materialize_requirements(plan, message)
+                self._materialize_requirements(plan, message, previous_context, book_mode)
                 self._sanitize_conditions(plan, message, book_mode, previous_context)
                 if (plan.intent == 'analyze_orders' and (plan.analyses or plan.analysisType == 'financial_analysis')
                         and getattr(self, 'reviewer', None)):
@@ -474,7 +474,7 @@ class QueryPlanner:
     ) -> AgentPlan:
         # normalize 的目的，是把“不稳定的 LLM 输出”整理成“稳定的程序输入”。
         self._coalesce_forecasts(plan)
-        self._materialize_requirements(plan, message)
+        self._materialize_requirements(plan, message, plan._analysis_context, book_mode)
         if plan.analysisType == "financial_analysis" and not plan.analyses:
             plan.analyses = [AnalysisRequest(tool=name) for name in ("cashflow", "trends", "changes", "anomalies", "recurring")]
         if plan.analyses:
@@ -671,7 +671,52 @@ class QueryPlanner:
                         task.changes = [c for c in task.changes if not (
                             c.metric == 'expense' and not c.source and c.amount is not None and -c.amount*c.count == amount)]
 
-    def _materialize_requirements(self, plan, message=''):
+    def _decision_goals(self, message, plan, previous, book_mode):
+        """Evidence labels request support; decisions need a user goal or a scoped referent."""
+        clauses = [c for c in re.split(r'[，。；！？,;\n]', message) if not re.search(
+            r'(?:不用|无需|不必|不要|先不|暂不|别)(?:再|帮我)?(?:预测|推演|计算|考虑|评估|分析|做|买|估算|模拟)', c)]
+        text = '，'.join(clauses)
+        temporal_outlook = r'(?:下下?个?月|下个?季度|明年|未来|接下来)'
+        forecast = (re.search(r'预测|预计|预估|预期', text)
+                    or re.search(temporal_outlook + r'.{0,18}(?:收入|支出|进账|开销|收支|结余)', text))
+        horizon = re.search(rf'(?:未来|接下来|今后|往后)\s*(?:{NUMBER}\s*个?月|半年|一年)', text)
+        buying = r'(?:购买|购置|买)(?!过|了|完|的)'
+        requests = {
+            'forecast': forecast,
+            'projection': (re.search(r'多月推演|累计.{0,6}结余|逐月预测', text) or
+                           (horizon and re.search(r'收支|收入|支出|结余|攒|存|余额', text))),
+            'purchase': re.search(r'买得起|买不起|(?:能否|能不能|可以|能|该不该|要不要|是否|可不可以).{0,5}' + buying
+                                  + r'|(?:准备|打算|计划|想).{0,14}' + buying + r'|' + buying
+                                  + r'.{0,20}(?:吗|合适|划算|可行|足够|够不够|影响)', text),
+            'savings': re.search(r'储蓄目标|存款目标|目标(?:余额|存款)|存到|攒到|攒够|存够|多久.{0,8}(?:存|攒)', text),
+            'budget': re.search(r'预算.{0,12}(?:还剩|剩余|还够|够不够|超|还可以|还能|[元块]|上限|额度)|'
+                                r'(?:核算|规划|计算|制定|安排|设置|检查|看下|查查).{0,5}预算|超预算', text),
+            'runway': re.search(r'(?:撑|坚持|支撑|维持|承受|支应).{0,4}(?:多久|多少|几个月|多长|多远|得住)', text),
+            'optimization': re.search(r'每个?月.{0,5}多(?:留|存|攒|节省)|优化.{0,6}(?:开支|支出|预算)|'
+                                      r'(?:怎么|如何|怎样|可|能).{0,5}(?:调整|节省|削减|压缩|省钱)|节支空间', text),
+            'scenario': re.search(r'情景(?:分析|测算|推演|比较)|模拟.{0,8}(?:收支|变化)|'
+                                  r'(?:假设|如果|假如|要是).{0,32}(?:增|减|少花|多花|停发|中断|翻倍|归零)', text)
+                        or named_percent_changes(text),
+        }
+        explicit = {tool for tool, supported in requests.items() if supported}
+        if explicit or not (plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext
+                            and previous and not previous.get('ambiguous')
+                            and re.search(r'刚才|上轮|上次|之前那|原来那|原计划|那个|这个数|同样|沿用|继续|再算|重新算', text)):
+            return explicit
+        scope = {(call.toolName, call.args.cost_type, call.args.remark or '') for call in plan.toolCalls}
+        if not scope:
+            default = 'search_family_orders' if self._normalize_mode(book_mode) == '家庭版' else 'search_personal_orders'
+            scope = {(default, '不限', '')}
+        if len(scope) != 1 or [list(next(iter(scope)))] != previous.get('scope'):
+            return set()
+        active = previous.get('activeAnalyses') or previous.get('conversation', {}).get('analyses', [])
+        if not active and previous.get('targetMonth') and not any(previous.get(k) is not None for k in (
+                'months', 'purchaseAmount', 'targetAmount', 'monthlyImprovement', 'budgetAmount')):
+            # Legacy forecast histories stored a scoped target before activeAnalyses existed.
+            return {'forecast'}
+        return {row.get('tool') for row in active}
+
+    def _materialize_requirements(self, plan, message='', previous=None, book_mode='个人版'):
         from app.agent.plan_review import CLAUSES, HISTORY_WORDS, NEGATED, _amount_matches, _explicit_amount, _time_evidence
 
         if plan.intent != 'analyze_orders':
@@ -684,14 +729,20 @@ class QueryPlanner:
                     for c in plan.toolCalls}
         decisions = HISTORY_BASED_TOOLS | {'budget'}
         requested = requirements & {'cashflow', 'data_quality', 'trends', 'changes', 'aggregate', 'income_stability', 'recurring', 'anomalies'}
-        if len(bindings) <= 1:
-            requested |= requirements & decisions
+        missing_decisions = (requirements & decisions) - existing
+        if missing_decisions:
+            grounded = self._decision_goals(message, plan, previous, book_mode) if len(bindings) <= 1 else set()
+            requested |= missing_decisions & grounded
+            unsupported = missing_decisions - grounded
+            if unsupported:
+                plan.understanding.evidenceNeeds = [need for need in plan.understanding.evidenceNeeds if need not in unsupported]
+                plan._planning_issues.append({'type': 'ungrounded_decision_needs', 'tools': sorted(unsupported)})
         if requirements & {'sources', 'members', 'remarks'}:
             requested.add('sources')
         if 'quality' in requirements:
             requested.add('data_quality')
 
-        future = bool((existing | requirements) & decisions)
+        future = bool((existing | requested) & decisions)
         overall = re.search(r"财务|收支|现金流", message) or ("收入" in message and "支出" in message)
         direction_only = re.search(r"(?:只|仅|单)(?:想|需|要)?(?:看|算|分析|统计|比较).{0,12}(?:收入|支出|开销)", message)
         filtered = any(c.args.cost_type != '不限' or c.args.remark for c in plan.toolCalls) or any(
