@@ -181,3 +181,53 @@ class HistoricalWindowTests(unittest.TestCase):
         forecast = next(row['evidence'] for row in result if row['tool'] == 'forecast')
         self.assertEqual(forecast['estimate'], 100)
         self.assertEqual(forecast['baselineMonths'], ['2026-08', '2026-09'])
+
+
+class ForecastSampleProvenanceTests(unittest.TestCase):
+    def test_explicit_monthly_improvement_is_a_goal_not_an_assumed_cut(self):
+        planner = QueryPlanner.__new__(QueryPlanner)
+        for raw in ('三百', '300', '一千二百', '两千五百元'):
+            amount = {'三百': 300, '300': 300, '一千二百': 1200, '两千五百元': 2500}[raw]
+            plan = AgentPlan.model_validate({'analyses': [{'tool': 'optimization', 'changes': [
+                {'metric': 'expense', 'amount': -amount, 'label': '每月多留目标'}]}]})
+            planner._normalize_explicit_conditions(plan, '房租保留，我想每月多留' + raw)
+            self.assertEqual(plan.analyses[0].monthlyImprovement, amount)
+            self.assertEqual(plan.analyses[0].changes, [])
+
+    def test_ambiguous_or_negated_goals_do_not_become_known_conditions(self):
+        planner = QueryPlanner.__new__(QueryPlanner)
+        for text in ('不是每月多留三百', '每月多留三百还是每月多留五百？'):
+            plan = AgentPlan.model_validate({'analyses': [{'tool': 'optimization'}]})
+            planner._normalize_explicit_conditions(plan, text)
+            self.assertIsNone(plan.analyses[0].monthlyImprovement)
+
+    def test_undated_followup_cannot_replace_referents_sample_with_model_default(self):
+        planner = QueryPlanner.__new__(QueryPlanner)
+        previous = {'scope': [['search_personal_orders', '不限', '']], 'targetMonth': '2027-01',
+            'activeAnalyses': [{'tool': 'forecast', 'queryIds': ['ledger'], 'targetMonth': '2027-01'}],
+            'activeHistoryWindow': None, 'conversation': {'analysisWindow': None,
+                'queries': [{'id': 'ledger', 'toolName': 'search_personal_orders'}],
+                'analyses': [{'tool': 'forecast', 'queryIds': ['ledger'], 'targetMonth': '2027-01'}]}}
+        plan = AgentPlan.model_validate({'followUpOfPreviousQuestion': True, 'analyses': [{'tool': 'sources'}],
+            'analysisWindow': {'startDate': '2026-10-01', 'endDate': '2026-10-31'}})
+        planner._preserve_referent_window(plan, previous, '刚才的原始备注列出来', datetime(2026, 11, 19))
+        planner._inherit_conversation(plan, previous)
+        self.assertIsNone(plan.analysisWindow)
+        self.assertIn('forecast', [task.tool for task in plan.analyses])
+
+    def test_future_target_in_question_does_not_authorize_invented_current_sample(self):
+        planner = QueryPlanner.__new__(QueryPlanner)
+        plan = AgentPlan.model_validate({'analyses': [{'tool': 'forecast', 'targetMonth': '2027-01'}],
+            'analysisWindow': {'startDate': '2026-11-01', 'endDate': '2026-12-31'}})
+        result = planner._normalize_plan(plan, datetime(2026, 11, 19), '预计2027年1月能进账多少？')
+        self.assertIsNone(result.analysisWindow)
+        self.assertEqual([c.args.month for c in result.toolCalls], [5, 6, 7, 8, 9, 10, 11])
+        self.assertEqual(result.analyses[0].targetMonth, '2027-01')
+
+    def test_explicit_current_sample_is_respected_even_with_future_target(self):
+        planner = QueryPlanner.__new__(QueryPlanner)
+        plan = AgentPlan.model_validate({'analyses': [{'tool': 'forecast', 'targetMonth': '2027-01'}],
+            'analysisWindow': {'startDate': '2026-11-01', 'endDate': '2026-11-19'}})
+        result = planner._normalize_plan(plan, datetime(2026, 11, 19), '仅用本月已记数据，预计2027年1月能进账多少？')
+        self.assertIsNotNone(result.analysisWindow)
+        self.assertEqual([c.args.month for c in result.toolCalls], [11])

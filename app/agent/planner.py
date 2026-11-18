@@ -34,6 +34,30 @@ _COMPLETE_MONTHS = re.compile(r'(?:最近|上)\s*([0-9]+|[一二两三四五六�
 _CHINESE_DIGITS = {char: number for number, char in enumerate('零一二三四五六七八九')} | {'两': 2}
 
 
+def explicit_goal_amount(raw):
+    """Parse bounded literal goal amounts; leave colloquial omitted units unknown."""
+    if re.fullmatch(r'\d+(?:\.\d+)?万?', raw):
+        return float(raw.rstrip('万')) * (10000 if raw.endswith('万') else 1)
+    if re.search(r'[百千万亿][一二两三四五六七八九]$', raw):
+        return None
+    total = section = number = 0
+    units = {'十': 10, '百': 100, '千': 1000, '万': 10000, '亿': 100000000}
+    for char in raw:
+        if char in _CHINESE_DIGITS:
+            number = _CHINESE_DIGITS[char]
+        elif char in units:
+            unit = units[char]
+            if unit < 10000:
+                section += (number or 1) * unit
+            else:
+                total = (total + section + number) * unit
+                section = 0
+            number = 0
+        else:
+            return None
+    return total + section + number
+
+
 def explicit_complete_month_window(message, today):
     matches = list(_COMPLETE_MONTHS.finditer(message))
     if len(matches) != 1:
@@ -113,6 +137,7 @@ class QueryPlanner:
                     plan.analysisWindow = requested_window
                     plan._planning_issues.append({'type': 'normalized_complete_month_window',
                         'window': requested_window.model_dump(mode='json')})
+                self._preserve_referent_window(plan, previous_context or {}, message, now)
                 context = self._inherit_conversation(plan, previous_context or {})
                 self._normalize_explicit_conditions(plan, message)
                 self._coalesce_forecasts(plan)
@@ -124,6 +149,8 @@ class QueryPlanner:
             except (asyncio.TimeoutError, json.JSONDecodeError, ValidationError, ValueError) as exc:
                 detail = "; ".join(f"{error['loc']}: {error['msg']}" for error in exc.errors()) if isinstance(exc, ValidationError) else str(exc)
                 issues.append({'type': type(exc).__name__, 'detail': detail[:800]})
+                if isinstance(exc, json.JSONDecodeError):
+                    issues[-1]['outputExcerpt'] = raw_content[max(0, exc.pos - 60):exc.pos + 140]
                 if attempt == 0:
                     prompt_values["message"] = message + "\n上次计划校验失败：" + detail[:800] + "\n仅修正这些结构或参数错误，保留当前用户目标、已选工具与已提供条件。不要为了修复结构而新增情景、金额、变化或无关字段。"
 
@@ -157,6 +184,21 @@ class QueryPlanner:
             return
         clauses = re.split(r'[，。；,;\n]', message)
         positive = [clause for clause in clauses if not re.search(r'不是|并非|不会|并未|并不|不用|无需|不需要|不保留|不留', clause)]
+        optimizations = [task for task in plan.analyses if task.tool == 'optimization']
+        goal_pattern = r'(?:每月|每个月)\s*(?:额外)?\s*(?:多留(?:下)?|多存(?:下)?|多攒(?:下)?|多结余|多节省)\s*(\d+(?:\.\d+)?万?|[零一二两三四五六七八九十百千万亿]+)'
+        goals = {explicit_goal_amount(raw) for clause in positive for raw in re.findall(goal_pattern, clause)} - {None}
+        if len(optimizations) == 1 and len(goals) == 1:
+            amount = goals.pop()
+            if 0 <= amount <= 1e12:
+                task = optimizations[0]
+                task.monthlyImprovement = amount
+                # A desired improvement is not a realized/assumed spending cut.
+                # Keep separately stated source-specific or other scenario changes.
+                if not re.search(r'假设|已经|已减少|少花|支出减少', message):
+                    task.changes = [change for change in task.changes if not (
+                        change.metric == 'expense' and not change.source and change.amount is not None
+                        and -change.amount * change.count == amount)]
+                plan._planning_issues.append({'type': 'normalized_explicit_condition', 'field': 'monthlyImprovement', 'value': amount})
         purchases = [task for task in plan.analyses if task.tool == 'purchase']
         amounts = set()
         patterns = (r'(?:保留|预留|留出|留)\s*(\d+(?:\.\d+)?)\s*(万)?\s*(?:元|块)?\s*(?:的|作为)?(?:应急|备用|储备)',
@@ -195,7 +237,7 @@ class QueryPlanner:
         if plan.analyses:
             plan.intent = "analyze_orders"
             plan.needsTools = True
-            explicit_history = re.search(r'本月|这个月|当月|今天|本周|这周|最近|过去|\d{1,4}[-年/]\d{1,2}|(?:\d{1,2}|[一二三四五六七八九十]+)月', message)
+            explicit_history = self._has_history_reference(message, now)
             if (plan.analysisWindow and plan.analysisWindow.startDate >= now.date().replace(day=1)
                     and any(task.tool in HISTORY_BASED_TOOLS for task in plan.analyses) and not explicit_history):
                 plan._planning_issues.append({'type': 'normalized_implicit_history_window',
@@ -275,6 +317,31 @@ class QueryPlanner:
             plan.finalInstruction = "根据所有工具结果回答用户问题。"
 
         return plan
+
+    @staticmethod
+    def _has_history_reference(message, now):
+        def historical_date(match):
+            year, month = map(int, match.groups())
+            return match[0] if (year, month) <= (now.year, now.month) else ''
+        historical_message = re.sub(r'(\d{4})\s*[-年/]\s*(\d{1,2})\s*月?', historical_date, message)
+        return bool(re.search(r'本月|这个月|当月|今天|昨天|前天|本周|这周|上周|上(?:上)?(?:个)?月|去年|前年|今年|本季度|上季度|最近|过去|\d{1,4}[-年/]\d{1,2}|(?:\d{1,2}|[一二三四五六七八九十]+)月', historical_message))
+
+    def _preserve_referent_window(self, plan, previous, message, now):
+        if not (plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext and previous.get('conversation')):
+            return
+        if plan.toolCalls:
+            scope = sorted({(call.toolName, self._normalize_cost_type(call.args.cost_type), call.args.remark)
+                            for call in plan.toolCalls})
+            if [list(row) for row in scope] != previous.get('scope'):
+                return
+        if self._has_history_reference(message, now):
+            return
+        window = previous.get('activeHistoryWindow', previous['conversation'].get('analysisWindow'))
+        current = plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None
+        if current != window:
+            plan.analysisWindow = AnalysisWindow.model_validate(window) if window else None
+            plan._planning_issues.append({'type': 'preserved_referent_window',
+                'detail': '追问未修改历史时间范围，保留被追问分析的样本窗口。'})
 
     def _materialize_requirements(self, plan):
         requirements = set(plan.understanding.evidenceNeeds)

@@ -21,6 +21,19 @@ class AggregatePipelineTests(unittest.TestCase):
             'aggregate': {'groupBy': ['member', 'category']}})
         self.assertEqual(task.aggregate.groupBy, ['member', 'category'])
 
+    def test_unused_scenario_fields_cannot_invalidate_historical_analysis(self):
+        task = AnalysisRequest.model_validate({'tool': 'aggregate', 'metric': 'expense',
+            'aggregate': {'groupBy': ['category']}, 'changes': [{'metric': 'expense', 'source': '房租'}]})
+        self.assertEqual(task.changes, [])
+        with self.assertRaises(ValidationError):
+            AnalysisRequest.model_validate({'tool': 'scenario', 'changes': [{'metric': 'expense', 'source': '房租'}]})
+
+    def test_descriptive_referent_overflow_is_bounded_without_discarding_tools(self):
+        plan = AgentPlan.model_validate({'understanding': {'referents': ['记录范围'] * 9},
+                                        'analyses': [{'tool': 'aggregate'}]})
+        self.assertEqual(len(plan.understanding.referents), 8)
+        self.assertEqual(plan.analyses[0].tool, 'aggregate')
+
     def test_query_bound_filters_periods_and_computed_values_reach_report(self):
         plan = AgentPlan.model_validate({'toolCalls': [{'id': 'family', 'toolName': 'search_family_orders'}],
             'output': {'table': True, 'metric': 'expense'}, 'analyses': [{'tool': 'aggregate',
@@ -98,6 +111,16 @@ class AggregatePipelineTests(unittest.TestCase):
                                        {'label': '省略比较', 'value': 2, 'unit': '项'}]}]
         self.assertFalse(numerical_issues('另有4个分组、2项比较未展示。', ['f1'], facts))
         self.assertTrue(numerical_issues('另有5个分组。', ['f1'], facts))
+
+    def test_inline_internal_fact_markers_are_cleaned_without_erasing_quantities(self):
+        from app.agent.evidence_report import prepare_draft
+        facts = [{'id': 'f1', 'text': '计算收入100元', 'required': True,
+                  'values': [{'label': '收入', 'value': 100, 'unit': '元'}]}]
+        draft = ReportDraft.model_validate({'sections': [{'title': '来源', 'factIds': ['f1'],
+            'analysis': '这笔收入（f1）为100元，后续是否延续需确认。'}]})
+        prepared, _ = prepare_draft(draft, facts)
+        self.assertNotIn('f1', prepared.sections[0].analysis)
+        self.assertIn('100元', prepared.sections[0].analysis)
 
 
 class AggregateInvestigationTests(unittest.IsolatedAsyncioTestCase):

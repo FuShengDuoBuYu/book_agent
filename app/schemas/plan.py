@@ -117,6 +117,9 @@ class AnalysisRequest(BaseModel):
             value.pop("metric")
         if isinstance(value, dict) and value.get('tool') != 'aggregate':
             value = {key: item for key, item in value.items() if key != 'aggregate'}
+        if isinstance(value, dict) and value.get('tool') not in {'scenario', 'savings', 'projection', 'runway', 'optimization'}:
+            # Historical changes are computed by the tool, not user hypotheses.
+            value = {key: item for key, item in value.items() if key != 'changes'}
         return value
 
     tool: str
@@ -130,7 +133,8 @@ class AnalysisRequest(BaseModel):
     targetAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False, description='储蓄目标的期末总余额，不是购买后需保留的应急金')
     months: int | None = Field(default=None, ge=1, le=600)
     monthsDelta: int | None = Field(default=None, ge=-599, le=599)
-    monthlyImprovement: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False)
+    monthlyImprovement: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False,
+        description='optimization 要达到的每月额外结余目标；每月多留三百填300。这是目标，不是changes里的已假定削减。')
     purchaseAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False)
     reserveAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False, description='购买后需保留的应急金或现金底线；还要留5000元应急钱对应5000')
     protectedCategories: list[str] = Field(default_factory=list, max_length=30)
@@ -170,6 +174,21 @@ class AnalysisWindow(BaseModel):
 
 
 class IntentUnderstanding(BaseModel):
+    @model_validator(mode='before')
+    @classmethod
+    def bound_descriptive_annotations(cls, value):
+        if not isinstance(value, dict):
+            return value
+        result = dict(value)
+        for name, definition in cls.model_fields.items():
+            limit = next((meta.max_length for meta in definition.metadata if hasattr(meta, 'max_length')), None)
+            item = result.get(name)
+            if limit and isinstance(item, (str, list)):
+                result[name] = item[:limit]
+        if isinstance(result.get('evidenceNeeds'), list):
+            result['evidenceNeeds'] = [item[:80] if isinstance(item, str) else item for item in result['evidenceNeeds']]
+        return result
+
     objective: str = Field(default='', max_length=600, description='当前真正要解决的问题，追问须解析它指向上轮哪项结论')
     referents: list[str] = Field(default_factory=list, max_length=8, description='这、它、刚才的金额等在当前对话中的明确含义；未确定就标记待确认')
     requestedAnswers: list[str] = Field(default_factory=list, max_length=8, description='回答必须完成的具体事项，不是工具名称')

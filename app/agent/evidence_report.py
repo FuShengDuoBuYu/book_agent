@@ -311,6 +311,10 @@ def unsupported_assertion(text, facts):
 def prepare_draft(draft, facts):
     """Reject unsupported prose for repair; never silently erase a user's answer."""
     draft = draft.model_copy(deep=True)
+    for section in draft.sections:
+        # Hide only declared internal markers; unknown references still fail.
+        section.analysis = re.sub(r'[(（](f\d+)[)）]',
+            lambda match: '' if match[1] in section.factIds else match[0], section.analysis)
     used = {key for section in draft.sections for key in section.factIds}
     # Conditions cannot disappear just because the model omitted a reference.
     missing = [row['id'] for row in facts if row['required'] and row['id'] not in used]
