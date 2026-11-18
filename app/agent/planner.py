@@ -15,7 +15,7 @@ from app.agent.analysis_context import remove_withdrawn_changes, resolve_context
 from app.agent.intent_resolution import IntentResolver
 from app.agent.plan_parsing import repair_descriptive_arrays
 from app.agent.report_context import build_report_context
-from app.agent.plan_review import NUMBER, PlanReviewer, explicit_month_delta, explicit_projection_start, named_percent_changes, sanitize_user_conditions
+from app.agent.plan_review import NUMBER, PlanReviewer, calendar_context, explicit_month_delta, explicit_projection_start, named_percent_changes, sanitize_user_conditions
 from app.agent.prompts import PLANNER_HUMAN_PROMPT, PLANNER_SYSTEM_PROMPT
 from app.schemas.plan import (
     AgentPlan,
@@ -124,7 +124,7 @@ class QueryPlanner:
         self.prompt = ChatPromptTemplate.from_messages(
             [
                 ("system", PLANNER_SYSTEM_PROMPT),
-                ("human", PLANNER_HUMAN_PROMPT),
+                ("human", PLANNER_HUMAN_PROMPT + "\n当前日期对应的日历月份：{calendar_context}"),
             ]
         ).partial(
             tools_text=render_planner_tools_for_prompt(),
@@ -149,6 +149,7 @@ class QueryPlanner:
                 for tool, category, remark in previous_context['scope']})]
         prompt_values = {
             "current_date": now.strftime("%Y-%m-%d"),
+            "calendar_context": json.dumps(calendar_context(now.date()), ensure_ascii=False),
             "book_mode": self._normalize_mode(book_mode),
             "history": history + '\n上轮已解析的用户条件（追问时沿用，独立新问题不沿用）：' + json.dumps(previous_context or {}, ensure_ascii=False),
             "message": message,
@@ -215,6 +216,7 @@ class QueryPlanner:
                         'window': requested_window.model_dump(mode='json')})
                 relative_periods = _relative_month_comparison(message, now.date())
                 if relative_periods:
+                    self._align_calendar_descriptions(plan, message, relative_periods)
                     plan.analysisWindow = AnalysisWindow(startDate=relative_periods[0].startDate, endDate=relative_periods[-1].endDate)
                     for task in plan.analyses:
                         if task.aggregate:
@@ -263,6 +265,35 @@ class QueryPlanner:
         except json.JSONDecodeError:
             repaired, self._parse_repairs = repair_descriptive_arrays(content)
             return json.loads(repaired)
+
+    @staticmethod
+    def _align_calendar_descriptions(plan, message, periods):
+        # Relative words in the actual question remain valid when an annotation
+        # paired them with the wrong absolute month. Keep the requested deliverables.
+        expected = {p.startDate.strftime("%Y-%m") for p in periods}
+        canonical = "；".join(f"{p.label}为{p.startDate:%Y-%m}" for p in periods)
+        def conflicts(text):
+            concrete = re.findall(r"(\d{4})\s*[-年/.]\s*(\d{1,2})", text)
+            if any(f"{int(y):04}-{int(m):02}" not in expected for y,m in concrete):
+                return True
+            months = {p.startDate.month for p in periods}
+            if any(int(m) not in months for m in re.findall(r"(?<!\d)(\d{1,2})\s*月份?", text)):
+                return True
+            for p in periods:
+                label = r"(?<!上)" + ("上" * p.label.count("上") + "个?月" if "上" in p.label else "本月|这个月")
+                paired = re.search("(?:" + label + ")" + r"\s*[（(：:=为是指 ]+\s*(\d{4})[-年/.](\d{1,2})", text)
+                if paired and (int(paired[1]), int(paired[2])) != (p.startDate.year, p.startDate.month):
+                    return True
+            return False
+        u = plan.understanding
+        if conflicts(u.objective):
+            u.objective = message[:600]
+        if any(conflicts(answer) for answer in u.requestedAnswers):
+            u.requestedAnswers = ([a for a in u.requestedAnswers if not conflicts(a)][:7] + [message[:600]])
+        u.referents = ([r for r in u.referents if not conflicts(r) and r != canonical][:7] + [canonical])
+        if conflicts(plan.finalInstruction):
+            plan.finalInstruction = f"按用户问题逐项回答。历史核算月份为{canonical}。"
+        plan._planning_issues.append({"type": "resolved_calendar_months", "periods": [p.model_dump(mode="json") for p in periods]})
 
     def _normalize_projection(self, plan, message, context, book_mode, today):
         if plan.intent != 'analyze_orders' or not plan.analyses:
@@ -352,8 +383,26 @@ class QueryPlanner:
         clauses = re.split(r'[，。；,;\n]', message)
         positive = [clause for clause in clauses if not re.search(r'不是|并非|不会|并未|并不|不用|无需|不需要|不保留|不留', clause)]
         optimizations = [task for task in plan.analyses if task.tool == 'optimization']
-        goal_pattern = r'(?:每月|每个月)\s*(?:额外)?\s*(?:多留(?:下)?|多存(?:下)?|多攒(?:下)?|多结余|多节省)\s*(\d+(?:\.\d+)?万?|[零一二两三四五六七八九十百千万亿]+)'
+        goal_pattern = r'(?:每月|每个月)\s*(?:还)?(?:想|希望|要)?(?:能)?\s*(?:额外)?\s*(?:多留(?:下)?|多存(?:下)?|多攒(?:下)?|多结余|多节省)\s*(\d+(?:\.\d+)?万?|[零一二两三四五六七八九十百千万亿]+)'
         goals = {explicit_goal_amount(raw) for clause in positive for raw in re.findall(goal_pattern, clause)} - {None}
+        if len(goals) == 1 and plan.intent == 'analyze_orders':
+            empty_scenarios = [t for t in plan.analyses if t.tool == 'scenario' and not t.changes]
+            if not optimizations:
+                if len(empty_scenarios) == 1 and not re.search(r'假设|如果|情景', message):
+                    task = empty_scenarios.pop()
+                    task.tool = 'optimization'
+                else:
+                    task = AnalysisRequest(tool='optimization')
+                    plan.analyses.append(task)
+                optimizations = [task]
+            if not re.search(r'假设|如果|情景', message):
+                plan.analyses = [t for t in plan.analyses if t not in empty_scenarios]
+            for clause in clauses:
+                bound = re.fullmatch(r"\s*([\w·、和与及]{1,100}?)(?:都|继续|要)?(?:维持原状|保持不变|不能动|不动|保留)\s*", clause)
+                if bound and len(optimizations) == 1:
+                    named = [item for item in re.split(r"[、和与及]", bound[1]) if item]
+                    task = optimizations[0]
+                    task.protectedCategories = list(dict.fromkeys(task.protectedCategories + named))[:30]
         if len(optimizations) == 1 and len(goals) == 1:
             amount = goals.pop()
             if 0 <= amount <= 1e12:

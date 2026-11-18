@@ -40,6 +40,27 @@ class ConversationContextTests(unittest.TestCase):
 
 
 class InvestigationIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_old_merged_alias_is_grounded_before_initial_forecast_is_sent_to_investigation(self):
+        from app.agent.investigation import InvestigationDecision
+        from app.tools.source_analysis import observed_source_key
+        from tests.test_decision_analysis import ledger
+        rows = ledger()
+        keys = sorted({observed_source_key(row) for row in rows if row['money'] > 0})
+        plan = AgentPlan.model_validate({'analyses': [{'tool': 'forecast', 'metric': 'income'}],
+            'toolCalls': [{'id': 'ledger', 'toolName': 'search_personal_orders'}],
+            'sourceGroups': [{'label': '同一个人的所有进账', 'sourceKeys': keys}]})
+        captured = []
+        async def reflect(question, history, plan, catalogs, *, results=None):
+            captured.extend(results or [])
+            return InvestigationDecision(), {'status': 'refined', 'issues': []}
+        agent = BookAgent.__new__(BookAgent)
+        agent._execute_tool_call = AsyncMock(return_value={'ok': True, 'mode': '个人版', 'ordersInfo': rows})
+        agent.investigator = SimpleNamespace(refine=reflect)
+        await agent._execute_tool_calls('个人版', None, plan, question='按实际来源拆开预测')
+        initial = next(row['evidence'] for row in captured if row['tool'] == 'forecast')
+        self.assertEqual(sorted(row['estimate'] for row in initial['sourceForecasts']), [1600, 5000])
+        self.assertEqual(plan.sourceGroups, [])
+
     async def test_supplemental_category_summary_keeps_primary_monthly_expense_chart(self):
         from app.tools.financial_analysis import run_analysis
         from tests.test_aggregate_analysis import row

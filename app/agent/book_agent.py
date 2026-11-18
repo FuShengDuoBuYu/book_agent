@@ -15,6 +15,7 @@ from app.agent.analysis_context import latest_context, logical_queries
 from app.agent.evidence_report import EvidenceReporter
 from app.agent.artifacts import build_artifacts
 from app.agent.investigation import EvidenceInvestigator, merged_source_groups
+from app.agent.source_grouping import grounded_source_groups
 from app.agent.progress import with_progress
 from app.agent.prompts import BOOK_AGENT_ANALYSIS_PROMPT, BOOK_AGENT_SYSTEM_PROMPT
 from app.clients.bookkeeping_api import BookkeepingApiClient
@@ -213,7 +214,10 @@ class BookAgent:
                 async for progress in with_progress(self.reporter.answer(
                     message, plan._analysis_context, results, history=history_text,
                     instruction=plan.finalInstruction, artifacts=artifacts,
-                    understanding=plan.understanding.model_dump()), '正在核对分析结论与问题要求'):
+                    understanding=plan.understanding.model_dump(), analysis_scope={
+                        'historyWindow': plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None,
+                        'primaryTasks': [task.model_dump(mode='json', exclude_none=True) for task in plan.analyses if not task._supplemental]
+                    }), '正在核对分析结论与问题要求'):
                     if progress['type'] == 'result':
                         reply, validation = progress['value']
                     else:
@@ -410,11 +414,15 @@ class BookAgent:
                 records = merge_orders([rows for _, rows in queries])
                 # Reflection sees actual observed labels/remarks, never the raw account IDs.
                 catalogs.append({'mode': scope, **run_analysis('sources', records, as_of=today, catalog_metric=plan.output.metric)})
+            plan.sourceGroups, grouping_issues = grounded_source_groups(plan.sourceGroups, catalogs, question)
             initial_results = collect_analysis_results(plan, datasets, today)
             if question and getattr(self, 'investigator', None):
                 decision, plan._investigation = await self.investigator.refine(question, history, plan, catalogs, results=initial_results)
+                plan._investigation.setdefault('issues', [])[:0] = grouping_issues
                 if decision.sourceGroups:
                     plan.sourceGroups = merged_source_groups(plan.sourceGroups, decision.sourceGroups)
+                    plan.sourceGroups, final_grouping_issues = grounded_source_groups(plan.sourceGroups, catalogs, question)
+                    plan._investigation.setdefault('issues', []).extend(final_grouping_issues)
                 for task in decision.additionalAnalyses[:max(0, 12 - len(plan.analyses))]:
                     supplemental = AnalysisRequest.model_validate(task.model_dump())
                     supplemental._supplemental = True

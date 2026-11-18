@@ -62,6 +62,40 @@ class ReportContextTests(unittest.TestCase):
         self.assertEqual(stats['omittedOptionalFactCount'], 0)
         self.assertLessEqual(stats['estimatedPromptTokens'], stats['promptBudgetTokens'])
 
+    def test_budget_without_value_catalog_keeps_eight_sources_and_typed_data(self):
+        base = {**base_payload(), 'values': {'old': '历史变量目录。'}}
+        required = fact(1, required=True, text='预测使用完整历史月份。')
+        sources = [
+            {**fact(number + 1, required=False, text='该来源的详细账单备注。' * 60),
+             'modelText': f'收入来源{number}，预测贡献 {number * 100} 元。',
+             'values': [{'label': '来源核对依据' * 9, 'value': number * i * 100, 'unit': '元'}
+                        for i in range(1, 5)]}
+            for number in range(1, 9)
+        ]
+        facts = [required, *sources]
+        budget = {'num_ctx': 1600, 'num_predict': 384}
+        _, selected_with_values, _ = build_report_context(base, facts, SYSTEM, SCHEMA, **budget)
+        self.assertLess(len(selected_with_values), len(facts))
+
+        payload, selected, stats = build_report_context(
+            base, facts, SYSTEM, SCHEMA, include_values=False, **budget,
+        )
+        self.assertNotIn('values', payload)
+        self.assertEqual(selected, facts)
+        self.assertEqual(value_catalog(selected), value_catalog(facts))
+        self.assertEqual([item['text'] for item in payload['facts'][1:]],
+                         [item['modelText'] for item in sources])
+        self.assertEqual(payload['question'], base['question'])
+        self.assertEqual(payload['understanding'], base['understanding'])
+        self.assertTrue(payload['facts'][0]['required'])
+        self.assertEqual(stats['omittedOptionalFactCount'], 0)
+        self.assertLessEqual(stats['estimatedPromptTokens'], stats['promptBudgetTokens'])
+
+        repaired, _ = repair_context(payload, None, ['补足汇总口径。'], SYSTEM, SCHEMA, **budget)
+        self.assertNotIn('values', repaired)
+        self.assertEqual(repaired['facts'], payload['facts'])
+        self.assertEqual(base['values'], {'old': '历史变量目录。'})
+
     def test_pressure_keeps_question_instructions_required_facts_and_artifact_columns(self):
         base = base_payload()
         base['history'] = '较早的聊天记录' * 450 + '\n最新一句是此前问的餐饮支出。'

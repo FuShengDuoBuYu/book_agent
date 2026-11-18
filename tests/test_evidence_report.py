@@ -16,6 +16,15 @@ class EvidenceReportTests(unittest.TestCase):
     def test_unknown_reference_rejected(self):
         self.assertTrue(validate_draft(self.draft(factIds=['fake']), self.facts))
 
+    def test_same_unit_after_a_typed_variable_is_normalized_without_changing_its_value(self):
+        facts = [{'id': 'f1', 'required': True, 'text': '历史样本入账 8,000 元。',
+                  'values': [{'label': '样本', 'value': 8000, 'unit': '元'}]}]
+        prepared, repairs = prepare_draft(self.draft(analysis='样本入账{{v1}}元，不能代表持续收入。'), facts)
+        self.assertEqual(prepared.sections[0].analysis, '样本入账{{v1}}，不能代表持续收入。')
+        self.assertEqual(repairs['normalizedUnits'], 1)
+        with self.assertRaises(ValueError):
+            prepare_draft(self.draft(analysis='样本记录{{v1}}天。'), facts)
+
     def test_declared_inline_evidence_reference_is_restored_before_validation(self):
         facts = [*self.facts, {'id': 'f2', 'required': False, 'text': '旧设备出售被剔除。'}]
         draft = self.draft(analysis='设备出售不属于持续入账（f2），需要核对后续来源安排。')
@@ -53,6 +62,14 @@ class EvidenceReportTests(unittest.TestCase):
         facts = build_facts([{'tool': 'purchase', 'mode': '个人版', 'evidence': {
             'sufficientData': False, 'missingInputs': ['startingBalance'], 'purchaseAmount': 6000}}])
         self.assertTrue(any(f['required'] and '可动用余额' in f['text'] for f in facts))
+
+    def test_required_evidence_can_fill_additional_sections_without_losing_the_model_answer(self):
+        facts = [{'id': f'f{i}', 'text': f'已核对条件{"甲" * i}。', 'required': True} for i in range(1, 17)]
+        draft = self.draft(analysis='应根据已核对条件逐项评估后续安排。')
+        prepared, _ = prepare_draft(draft, facts)
+        self.assertEqual({key for section in prepared.sections for key in section.factIds}, {f['id'] for f in facts})
+        self.assertEqual(prepared.sections[0].analysis, draft.sections[0].analysis)
+        self.assertEqual(validate_draft(prepared, facts), [])
 
     def test_expense_category_names_are_preserved(self):
         facts = build_facts([{'tool': 'cashflow', 'evidence': {'computedConclusion': '月均',

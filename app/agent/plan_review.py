@@ -253,10 +253,64 @@ def _change_supported(change, question, prior, withdrawn):
     return False
 
 
+def calendar_context(today):
+    return {label: shift_month(today.replace(day=1), offset).strftime("%Y-%m")
+            for label, offset in (("本月", 0), ("上个月", -1), ("上上个月", -2))}
+
+
+def _aggregate_constraints(task, plan, question, prior, mode, *, strip, single_aggregate):
+    if not task.aggregate or len({s[:3] for s in _scope_for(None, plan, mode)}) != 1:
+        return []
+    issues = []
+    filters = task.aggregate.filters
+    exclude = re.compile(r"(?:排除|剔除|不含|不包括|不计入)[^，。；！？,;\n]*?(?:后|以外|之外|(?=[，。；！？,;\n]|$))")
+    # Recover a literal category list only when its boundary and dimension are
+    # explicit. Other selectors (members, sources or remarks) keep their own meaning.
+    literal = re.search(r"(?:排除|剔除|不含|不包括|不计入)([^，。；！？,;\n]{1,120}?)(?:后|以外|之外)", question)
+    if literal and ("category" in task.aggregate.groupBy or filters.excludeCategories):
+        names = [v.strip(" ‘“「」”’") for v in re.split(r"[、和与及]", literal[1])]
+        if (all(re.fullmatch(r"[\w·-]{1,30}", v) for v in names)
+                and not re.search(r"备注|成员|来源|金额|用户|包含|所有|大于|小于|超过|以下|以上", literal[1])):
+            if not re.search(r"沿用|仍按|还是按", question) and set(names) != set(filters.excludeCategories):
+                issues.append({"type": "unsupported_user_condition", "tool": "aggregate", "field": "excludeCategories"})
+                if strip:
+                    filters.excludeCategories = list(dict.fromkeys(names))
+    if exclude.search(question) or re.search(r"只(?:看|统计|算)|仅(?:限|看|统计)", question):
+        positive_text = exclude.sub("", question)
+        inherited = set()
+        if re.search(r"沿用|仍按|还是按|保留.{0,6}筛选", question) and not re.search(r"只看|只统计|仅限", question):
+            for row in prior.get("conversation", {}).get("analyses", []):
+                if row.get("tool") == "aggregate":
+                    inherited.update((row.get("aggregate") or {}).get("filters", {}).get("includeCategories", []))
+        allowed = [name for name in filters.includeCategories
+                   if name not in filters.excludeCategories and (name in positive_text or name in inherited)]
+        if allowed != filters.includeCategories:
+            issues.append({"type": "unsupported_user_condition", "tool": "aggregate", "field": "includeCategories"})
+            if strip:
+                filters.includeCategories = allowed
+
+    # A directional aggregate ignores opposite-signed entries, including them in
+    # neither its transaction count nor its average. Mixed requests keep each task's metric.
+    if single_aggregate and not re.search(r"收支|净额|净现金流|结余|收与支", question):
+        directions = {key for key, words in (("income", r"收入|进账|入账"), ("expense", r"支出|开销|花费"))
+                      if re.search(words, question)}
+        if len(directions) == 1 and task.metric not in directions:
+            issues.append({"type": "unsupported_user_condition", "tool": "aggregate", "field": "metric"})
+            if strip:
+                task.metric = next(iter(directions))
+        if strip and len(plan.analyses) == 1 and len(directions) == 1:
+            plan.output.metric = task.metric
+    return issues
+
+
 def _check_conditions(analyses, plan, question, mode, previous, *, strip):
     issues = []
     for task in analyses or [None]:
         prior = _prior_for(task, plan, mode, previous)
+        if task and task.tool == "aggregate":
+            issues.extend(_aggregate_constraints(task, plan, question, prior, mode, strip=strip,
+                single_aggregate=sum(t.tool == "aggregate" for t in plan.analyses) <= 1
+                and sum(t.tool == "aggregate" for t in analyses) <= 1))
         for field in ROLES:
             value = getattr(task, field, None)
             retire = strip and _retracts(question, field, prior.get(field))
@@ -418,7 +472,7 @@ class PlanReviewer:
         logical_ids = {call.id for call in plan.toolCalls if call.id} if plan.toolCalls else {"ledger"}
         previous = previous_context or {}
         payload = {"question": question, "history": history[-4000:], "bookMode": book_mode, "today": today.isoformat(),
-                   "previousContext": to_jsonable_python(previous), "logicalQueryIds": sorted(logical_ids),
+                   "calendarContext": calendar_context(today), "previousContext": to_jsonable_python(previous), "logicalQueryIds": sorted(logical_ids),
                    "plan": plan.model_dump(mode="json")}
         system = PROMPT + json.dumps(ANALYSIS_TOOLS, ensure_ascii=False) + "\nJSON schema：" + json.dumps(
             PlanReviewDecision.model_json_schema(), ensure_ascii=False, separators=(",", ":"))

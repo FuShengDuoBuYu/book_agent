@@ -8,6 +8,7 @@ from time import perf_counter
 from pydantic_core import to_jsonable_python
 
 from app.agent.report_context import build_report_context
+from app.agent.plan_review import calendar_context
 from app.core.config import get_settings
 from app.core.llm import get_structured_model
 from app.schemas.plan import IntentUnderstanding
@@ -32,7 +33,8 @@ class IntentResolver:
         try:
             payload, _, budget = build_report_context({
                 'question': question, 'history': history[-4000:], 'today': today.isoformat(),
-                'bookMode': book_mode, 'userConditions': to_jsonable_python(previous_context or {})},
+                'bookMode': book_mode, 'calendarContext': calendar_context(today),
+                'userConditions': to_jsonable_python(previous_context or {})},
                 [], PROMPT, IntentUnderstanding, num_ctx=settings.ollama_num_ctx, num_predict=2048)
             payload.pop('facts', None)
             payload.pop('values', None)

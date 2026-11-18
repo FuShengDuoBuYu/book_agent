@@ -8,6 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.agent.source_grouping import grounded_source_groups
 from app.core.config import get_settings
 from app.core.llm import get_structured_model
 from app.schemas.plan import SourceGroup
@@ -116,7 +117,7 @@ class EvidenceInvestigator:
             compact.append({'mode': catalog.get('mode'), 'sources': rows,
                             'sourceCount': catalog.get('sourceCount', len(catalog.get('sources', []))),
                             'omittedSourceCount': catalog.get('omittedSourceCount', 0) + max(0, len(catalog.get('sources', [])) - len(rows))})
-        issues = []
+        plan.sourceGroups, issues = grounded_source_groups(plan.sourceGroups, catalogs, question)
         try:
             findings = []
             for result in (results or [])[:10]:
@@ -153,12 +154,20 @@ class EvidenceInvestigator:
                 groups.append({'label': group.label, 'sourceKeys': [mapping[key] for key in group.sourceKeys]})
             try:
                 validate_source_groups(groups, set(mapping.values()))
-                decision.sourceGroups = [SourceGroup.model_validate(group) for group in groups]
+                proposals = [SourceGroup.model_validate(group) for group in groups]
+                decision.sourceGroups, corrections = grounded_source_groups(proposals, catalogs, question)
+                issues.extend(corrections)
             except ValueError:
                 issues.append('来源归组重复或无效，保留原始来源')
                 decision.sourceGroups = []
             known_ids = {key for call in plan.toolCalls for key in (call.sourceIds or [call.id])}
             applied_groups = merged_source_groups(plan.sourceGroups, decision.sourceGroups)
+            # Replacing keys can leave an inherited alias attached to just one unrelated row.
+            if plan.sourceGroups and decision.sourceGroups:
+                applied_groups, corrections = grounded_source_groups(applied_groups, catalogs, question)
+                issues.extend(corrections)
+                plan.sourceGroups = [group for group in applied_groups if group not in decision.sourceGroups]
+                decision.sourceGroups = [group for group in decision.sourceGroups if group in applied_groups]
             safe = []
             for task in decision.additionalAnalyses:
                 if task.tool not in READ_ONLY_ANALYSES or set(task.queryIds) - known_ids:

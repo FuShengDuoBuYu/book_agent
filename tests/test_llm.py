@@ -40,6 +40,14 @@ class ModelConfigurationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(planner.num_predict, 4096)
         self.assertFalse(planner.reasoning)
 
+    def test_native_report_interprets_program_facts_without_generating_its_own_numbers(self):
+        from app.schemas.report import ReportDraft
+        with patch.dict(os.environ, {'LLM_PROVIDER': 'ollama'}, clear=True):
+            writer = get_structured_model(ReportDraft, reasoning=False, num_predict=2048)
+        fields = writer.kwargs['format']['$defs']['ReportSection']['properties']
+        for field in ('analysis', 'title'):
+            self.assertEqual(fields[field]['pattern'], '^[^0-9]*$')
+
     def setUp(self):
         for factory in (get_settings, get_chat_model, get_planner_model, get_structured_model):
             factory.cache_clear()

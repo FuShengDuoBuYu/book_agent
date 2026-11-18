@@ -229,3 +229,83 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(c['source'],c['percent']) for c in saved['changes']], [('工资',-20)])
         follow = await self.plan('按刚才的情景再算。', {'followUpOfPreviousQuestion':True, 'analyses':[{'tool':'projection'}]},saved)
         self.assertEqual([(c.source,c.percent) for c in follow.analyses[0].changes], [('工资',-20)])
+
+    async def test_exclusion_only_aggregate_keeps_custom_categories_and_directional_counts(self):
+        question = '对照上上个月和上个月，排除房租、交通后，我的支出按月份和类别列出金额、笔数和每笔均额，各类别增加多少？'
+        draft = {'toolCalls':[{'id':'mine','toolName':'search_personal_orders'}],
+                 'analyses':[{'tool':'aggregate','queryIds':['mine'],'metric':'all','aggregate':{
+                     'groupBy':['month','category'],'filters':{'includeCategories':['餐饮','购物','娱乐'],
+                                                               'excludeCategories':['房租','交通']}}}]}
+        plan = await self.plan(question,draft,{})
+        task = plan.analyses[0]
+        self.assertEqual((task.metric,task.queryIds,task.aggregate.filters.includeCategories),('expense',['mine'],[]))
+        self.assertEqual(plan.output.metric,'expense')
+        partial=json.loads(json.dumps(draft))
+        partial['analyses'][0]['aggregate']['filters']['excludeCategories']=['房租','购物']
+        repaired=(await self.plan(question,partial,{})).analyses[0]
+        self.assertEqual(repaired.aggregate.filters.excludeCategories,['房租','交通'])
+        rows = [{'year':2026,'month':m,'day':2,'costType':kind,'money':amt,'orderRemark':kind}
+                for m,kind,amt in [(9,'展览',-10),(10,'展览',-50),(10,'展览',-10),(10,'展览',700),(10,'房租',-800)]]
+        data = collect_analysis_results(plan,{'个人版':[(q,rows) for q in plan.toolCalls]},date(2026,11,19))
+        e = next(r['evidence'] for r in data if r['tool']=='aggregate')
+        october = next(r for r in e['rows'] if r['category']=='展览' and r['month']=='2026-10')
+        self.assertEqual((october['amount'],october['count'],october['meanTransactionAmount'],e['comparisons'][0]['change']),(60,2,30,50))
+        for text,metric in [('排除房租后，只看展览的收入。','income'),('排除房租后，只看展览的收入和支出。','all')]:
+            custom = json.loads(json.dumps(draft))
+            filters = custom['analyses'][0]['aggregate']['filters']
+            filters.update(includeCategories=['展览','购物'],excludeCategories=['房租'])
+            t=(await self.plan(text,custom,{})).analyses[0]
+            self.assertEqual((t.metric,t.aggregate.filters.includeCategories),(metric,['展览']))
+
+    async def test_monthly_improvement_materializes_optimization_with_protections_without_a_cut(self):
+        question = '房租和交通维持原状，我每个月还想多留三百，给我可调整开销和差多少。'
+        for include_projection in (False,True):
+            tasks=[{'tool':'scenario','changes':[{'metric':'expense','amount':-300}]},{'tool':'changes'}]
+            if include_projection:
+                tasks.append({'tool':'projection','months':3})
+            plan=await self.plan(question,{'analyses':tasks},{})
+            opt=next((t for t in plan.analyses if t.tool=='optimization'),None)
+            self.assertIsNotNone(opt)
+            self.assertEqual((opt.monthlyImprovement,opt.protectedCategories,opt.changes),(300,['房租','交通'],[]))
+            self.assertNotIn('scenario',[t.tool for t in plan.analyses])
+            self.assertEqual(include_projection, any(t.tool=='projection' for t in plan.analyses))
+
+    async def test_mixed_ledger_aggregate_metrics_and_decisions_are_not_globally_rewritten(self):
+        draft={'toolCalls':[{'id':'mine','toolName':'search_personal_orders'},{'id':'home','toolName':'search_family_orders'}],
+               'analyses':[{'tool':'aggregate','queryIds':['mine'],'metric':'income'}, {'tool':'aggregate','queryIds':['home'],'metric':'expense'}]}
+        p=await self.plan('比较我和家庭的收入和支出，每月多留三百的想法先记录。',draft,{})
+        self.assertEqual([(t.queryIds,t.metric) for t in p.analyses],[(['mine'],'income'),(['home'],'expense')])
+
+    async def test_calendar_prompt_and_answer_instructions_agree_with_resolved_historical_window(self):
+        question='对照上上个月和上个月，按类别列出支出和笔数。'
+        draft={'analysisWindow':{'startDate':'2026-10-01','endDate':'2026-11-30'},
+               'understanding':{'objective':'对比2026年10月和11月的分类支出','requestedAnswers':['列出2026-10和2026-11各类金额和笔数'],
+                                'referents':['上上个月：2026-10','上个月：2026-11']},
+               'finalInstruction':'汇报2026-10到2026-11的分类金额','analyses':[{'tool':'aggregate'}]}
+        planner=QueryPlanner.__new__(QueryPlanner)
+        planner.chain=SimpleNamespace(ainvoke=AsyncMock(return_value=SimpleNamespace(content=json.dumps(draft))))
+        with patch('app.agent.planner.datetime',wraps=datetime) as clock:
+            clock.now.return_value=datetime(2026,11,19)
+            p=await planner.create_plan(question,'','个人版',{})
+        args=planner.chain.ainvoke.await_args.args[0]
+        self.assertIn('2026-09',str(args.get('calendar_context','')))
+        self.assertIn('2026-10',str(args.get('calendar_context','')))
+        descriptions=' '.join([p.understanding.objective,p.finalInstruction,*p.understanding.referents,*p.understanding.requestedAnswers])
+        self.assertNotIn('2026-11',descriptions)
+        self.assertNotIn('11月',descriptions)
+        self.assertNotIn('上上个月：2026-10',descriptions)
+        self.assertIn('2026-09',descriptions)
+        self.assertIn('笔数',descriptions)
+
+    async def test_reviewer_cannot_add_unrequested_category_whitelist(self):
+        original={'tool':'aggregate','metric':'expense','aggregate':{'groupBy':['category'],'filters':{'excludeCategories':['通勤']}}}
+        changed=json.loads(json.dumps(original))
+        changed['aggregate']['filters']['includeCategories']=['衣物','饮食']
+        response={'adequate':False,'issues':[],'analysisWindow':None,'answerInstruction':'','analyses':[changed]}
+        model=AsyncMock()
+        model.ainvoke.return_value=SimpleNamespace(content=json.dumps(response))
+        with patch('app.agent.plan_review.get_structured_model',return_value=model):
+            result,audit=await PlanReviewer().review('排除通勤后统计各类支出。','',AgentPlan(analyses=[original]),
+                                                     date(2026,11,19),'个人版',{})
+        self.assertIsNone(result)
+        self.assertEqual(audit.get('error'),'unsupported_includeCategories')

@@ -66,13 +66,18 @@ def _fit_previews(payload, estimate, limit):
     return payload
 
 
-def _with_evidence(payload, facts):
-    return {
+def _with_evidence(payload, facts, *, include_values):
+    projected = {
         **payload,
         'facts': [{'id': row['id'], 'text': row.get('modelText') or row['text'],
                    'required': bool(row.get('required'))} for row in facts],
-        'values': {row['id']: f"{row['factId']} {row['label']} = {row['display']}" for row in value_catalog(facts)},
     }
+    if include_values:
+        projected['values'] = {row['id']: f"{row['factId']} {row['label']} = {row['display']}"
+                               for row in value_catalog(facts)}
+    else:
+        projected.pop('values', None)
+    return projected
 
 
 def _ensure_fit(payload, estimate, limit):
@@ -94,7 +99,9 @@ def _stats(payload, estimate, limit):
     }
 
 
-def build_report_context(base_payload, facts, system_text, schema, *, num_ctx=8192, num_predict=2048):
+def build_report_context(
+    base_payload, facts, system_text, schema, *, num_ctx=8192, num_predict=2048, include_values=True,
+):
     """Preserve the goal and required evidence while selecting previews within the prompt budget."""
     limit, estimate = _prompt_budget(system_text, schema, num_ctx, num_predict)
     required = [row for row in facts if row.get('required')]
@@ -102,17 +109,20 @@ def build_report_context(base_payload, facts, system_text, schema, *, num_ctx=81
     previews = _artifact_previews(base_payload.get('artifacts', []))
     base = {**base_payload, 'artifacts': previews}
     minimum = {**base, 'history': '', 'artifacts': _artifact_previews(previews, 0)}
-    required_tokens = _ensure_fit(_with_evidence(minimum, required), estimate, limit)
+    required_tokens = _ensure_fit(_with_evidence(minimum, required, include_values=include_values), estimate, limit)
     draft_limit = max(required_tokens, limit - min(MAX_REPAIR_RESERVE, limit // 8))
 
     selected = required + optional
-    payload = _fit_previews(_with_evidence(base, selected), estimate, draft_limit)
+    payload = _fit_previews(_with_evidence(base, selected, include_values=include_values), estimate, draft_limit)
     if estimate(payload) > draft_limit:
-        count = _largest_fit(len(optional),
-                             lambda n: estimate(_with_evidence(minimum, required + optional[:n])) <= draft_limit)
+        count = _largest_fit(
+            len(optional),
+            lambda n: estimate(_with_evidence(minimum, required + optional[:n], include_values=include_values))
+            <= draft_limit,
+        )
         selected = required + optional[:count]
         # Reclaim available space for recent turns or previews once optional evidence is dropped.
-        payload = _fit_previews(_with_evidence(base, selected), estimate, draft_limit)
+        payload = _fit_previews(_with_evidence(base, selected, include_values=include_values), estimate, draft_limit)
 
     _ensure_fit(payload, estimate, limit)
     stats = _stats(payload, estimate, limit)
