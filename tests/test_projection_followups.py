@@ -448,3 +448,56 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
                                                         date(2026,11,19),'家庭版',{})
             self.assertIsNone(result)
             self.assertEqual(audit['error'],'unsupported_'+key)
+
+    async def test_monthly_spending_goal_does_not_acquire_optional_unasked_financial_decisions(self):
+        q='沿用刚才两个月，场租和通勤保留。我想每月多留三百，哪些地方可调整，还差多少？'
+        needs=['totals','changes','sources','budget','optimization','savings','purchase','scenario','runway']
+        draft={'understanding':{'evidenceNeeds':needs,'requestedAnswers':['哪些开支可以调整','当前余额距离存款目标的差额（若涉及）','现金能撑多久（若涉及）'],
+                               'unknowns':['存款目标余额','待确认的支出安排']},
+               'analyses':[{'tool':t} for t in ['optimization','changes','budget','purchase','savings','scenario','runway']]}
+        p=await self.plan(q,draft,{})
+        forbidden={'budget','purchase','savings','scenario','runway'}
+        self.assertFalse(forbidden & {t.tool for t in p.analyses})
+        self.assertFalse(forbidden & set(p.understanding.evidenceNeeds))
+        self.assertEqual(p.understanding.requestedAnswers,['哪些开支可以调整'])
+        self.assertNotIn('存款目标余额',p.understanding.unknowns)
+        opt=next(t for t in p.analyses if t.tool=='optimization')
+        self.assertEqual((opt.monthlyImprovement,opt.protectedCategories,opt.changes),(300,['场租','通勤'],[]))
+        combined=await self.plan(q+'另外想花700元买扫描仪，可行吗？',draft,{})
+        self.assertIn('purchase',[t.tool for t in combined.analyses])
+
+    async def test_protected_spending_and_deadline_followups_survive_aggregate_only_and_duplicate_projections(self):
+        rows=[{'year':2026,'month':m,'day':2,'money':value,'costType':cat,'orderRemark':name}
+              for m in (8,9,10) for value,cat,name in [(5000,'工资','工资'),(1600,'家教','家教'),(-2200,'房租','房租'),(-400,'餐饮','午饭')]]
+        sh={'metric':'income','percent':-50,'source':'家教'}
+        initial=await self.plan('未来三个月能攒多少？',{'analyses':[{'tool':'projection','months':3}]},{})
+        shocked=await self.plan('家教收入如果减少一半，重算。',{'followUpOfPreviousQuestion':True,'analyses':[{'tool':'projection','changes':[sh]}]},await self.save(initial))
+        # The reviewer chose historical exclusion filters instead of protected decision inputs.
+        supported=await self.plan('房租不能动，吃饭也不想再省，其他地方还能怎么调整？',
+            {'followUpOfPreviousQuestion':True,'analyses':[{'tool':'aggregate','metric':'expense','aggregate':{
+                'groupBy':['category'],'filters':{'excludeCategories':['房租','餐饮']}}},{'tool':'changes'}],
+             'understanding':{'objective':'保持房租和餐饮，优化其他开支','referents':['固定条件：房租（不可动）、餐饮（不想再省）'],
+                              'evidenceNeeds':['aggregate','changes','trends']}},await self.save(shocked))
+        self.assertIn('optimization',[t.tool for t in supported.analyses])
+        saved=await self.save(supported)
+        self.assertTrue({'房租','餐饮'} <= set(saved['protectedCategories']))
+        self.assertIn('projection',[t['tool'] for t in saved['activeAnalyses']])
+        extended=await self.plan('那把目标推迟两个月，压力能小多少？',{'followUpOfPreviousQuestion':True,
+            'understanding':{'evidenceNeeds':['projection','scenario']},'analyses':[
+                {'tool':'projection','months':3,'queryIds':['ledger']},{'tool':'projection','months':5,'queryIds':['ledger']},
+                {'tool':'scenario','months':3}]},saved)
+        current=await self.save(extended)
+        self.assertFalse(current.get('ambiguous'))
+        self.assertEqual((current['months'],current['previousMonths']),(5,3))
+        self.assertTrue({'房租','餐饮'} <= set(current['protectedCategories']))
+        projection=next(t for t in extended.analyses if t.tool=='projection')
+        self.assertEqual([(c.metric,c.source,c.percent) for c in projection.changes],[('income','家教',-50)])
+        result=collect_analysis_results(extended,{'个人版':[(t,rows) for t in extended.toolCalls]},date(2026,11,19))
+        amounts=[(r['evidence']['months'],r['evidence']['totalNet']) for r in result if r['tool']=='projection']
+        self.assertEqual(amounts,[(5,16000)])
+
+    async def test_old_balance_is_not_current_and_does_not_make_savings_plan_unexecutable(self):
+        for draft in ({'tool':'savings'}, {'tool':'savings','startingBalance':10000}):
+            p=await self.plan('去年余额为10000元。今年想了解存款目标，还需要哪些信息？',{'analyses':[draft]},{})
+            self.assertEqual([t.tool for t in p.analyses],['savings'])
+            self.assertIsNone(p.analyses[0].startingBalance)

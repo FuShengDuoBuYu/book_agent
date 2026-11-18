@@ -73,6 +73,25 @@ class EvidenceReportTests(unittest.TestCase):
             'sufficientData': False, 'missingInputs': ['startingBalance'], 'purchaseAmount': 6000}}])
         self.assertTrue(any(f['required'] and '可动用余额' in f['text'] for f in facts))
 
+    def test_family_income_subtotals_are_computed_evidence_for_the_answer(self):
+        from datetime import date
+        from app.tools.financial_analysis import run_analysis
+        rows = [{'year': 2026, 'month': 10, 'day': 4, 'money': amount, 'costType': category,
+            'orderRemark': remark, 'memberKey': member, 'memberName': name}
+            for member, name, amount, category, remark in [('a', '甲', 3200, '收入', '编辑部月结'),
+                ('a', '甲', 500, '稿费', '海报项目'), ('a', '甲', 8000, '其他', '旧设备出售'),
+                ('b', '乙', 2100, '收入', '编辑部月结'), ('b', '乙', 450, '配送', '配送费')]]
+        evidence = run_analysis('sources', rows, as_of=date(2026, 11, 19), catalog_metric='income')
+        facts = build_facts([{'tool': 'sources', 'mode': '家庭版', 'evidence': evidence}])
+        required = [f['id'] for f in facts if f['required']]
+        self.assertEqual(len(required), 2)
+        draft = self.draft(title='成员收入小计', factIds=required, analysis='甲已记录11700元，乙已记录2550元；历史入账不等于持续性收入。')
+        self.assertEqual(validate_draft(draft, facts), [])
+
+    def test_empty_source_query_has_a_required_unknown_result(self):
+        facts = build_facts([{'tool': 'sources', 'evidence': {'sources': [], 'memberTotals': [], 'sourceCount': 0}}])
+        self.assertTrue(any(f['required'] and '未知' in f['text'] for f in facts))
+
     def test_required_evidence_can_fill_additional_sections_without_losing_the_model_answer(self):
         facts = [{'id': f'f{i}', 'text': f'已核对条件{"甲" * i}。', 'required': True} for i in range(1, 17)]
         draft = self.draft(analysis='应根据已核对条件逐项评估后续安排。')
@@ -156,6 +175,37 @@ class EvidenceReportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             prepare_draft(draft, facts)
 
+    def test_no_duplicate_finding_is_not_rejected_as_a_positive_claim(self):
+        facts = [{'id': 'f1', 'required': True, 'text': '检测到疑似重复组 0 组。'}]
+        for wording in ['没有检测到疑似重复组，但还需核对凭据。', '未发现重复记录，不能证明没有记账错误。']:
+            with self.subTest(wording=wording):
+                prepared, _ = prepare_draft(self.draft(analysis=wording), facts)
+                self.assertEqual(prepared.sections[0].analysis, wording)
+
+    def test_filtered_period_totals_are_available_without_model_arithmetic(self):
+        from app.tools.financial_analysis import run_analysis
+        from tests.test_aggregate_analysis import TODAY, period, row
+        records = [row('2026-09-04', -220, '餐饮'), row('2026-09-05', -180, '展览'),
+                   row('2026-10-02', -220, '餐饮'), row('2026-10-03', -440, '展览')]
+        e = run_analysis('aggregate', records, as_of=TODAY, metric='expense', aggregate={
+            'periods': [period('九月', '2026-09-01', '2026-09-30'), period('十月', '2026-10-01', '2026-10-31')],
+            'groupBy': ['month', 'category'], 'limit': 1})
+        facts = build_facts([{'tool': 'aggregate', 'evidence': e}])
+        totals = [f for f in facts if any(v['label'] == '区间支出小计' for v in f['values'])]
+        self.assertEqual([next(v['value'] for v in f['values'] if v['label'] == '区间支出小计') for f in totals], [400, 660])
+        self.assertTrue(any(any(v['label'] == '区间总额变化' and v['value'] == 260 for v in f['values']) for f in facts))
+        draft = self.draft(factIds=[f['id'] for f in totals], analysis='筛选后支出从400元变为660元。')
+        prepared, _ = prepare_draft(draft, facts)
+        self.assertIn('400元', prepared.sections[0].analysis)
+
+    def test_neutral_gap_heading_and_explicit_no_gap_are_not_positive_gap_claims(self):
+        facts = build_facts([{'tool': 'purchase', 'evidence': {'sufficientData': True,
+            'startingBalance': 12000, 'purchaseAmount': 6000, 'cashAfterPurchase': 6000,
+            'reserveAmount': 5000, 'reserveMargin': 1000}}])
+        draft = self.draft(title='资金缺口分析', analysis='购买和储备可以同时覆盖，不存在资金缺口。还需核对其他近期必付账单。')
+        prepared, _ = prepare_draft(draft, facts)
+        self.assertIn('不存在资金缺口', prepared.sections[0].analysis)
+
     def test_action_before_an_unverified_numeric_consequence_is_preserved(self):
         draft = self.draft(analysis='若收入中断，需尽快确认新的收入来源或调整非必要支出，否则资金将在不到四个月耗尽。')
         with self.assertRaises(ValueError):
@@ -163,6 +213,25 @@ class EvidenceReportTests(unittest.TestCase):
 
 
 class EvidenceReviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_each_rejected_section_has_its_own_complete_repair_diagnostic(self):
+        reporter = EvidenceReporter()
+        bad = ReportDraft.model_validate({'sections': [
+            {'title': '第一处', 'factIds': ['f1'], 'analysis': '请确认用途。' * 70 + '可以撑999个月。'},
+            {'title': '第二处', 'factIds': ['f1'], 'analysis': '能多花888元。'}]})
+        good = ReportDraft.model_validate({'sections': [
+            {'title': '核查条件', 'factIds': ['f1'], 'analysis': '需先提供当前可动用余额和近期必付账单，才能评估购买影响。'}]})
+        reporter._draft = AsyncMock(side_effect=[bad, good])
+        reporter._review = AsyncMock(return_value=[])
+        _, result = await reporter.answer('购买后生活受影响吗？', {}, [{'tool': 'purchase', 'evidence': {
+            'sufficientData': False, 'missingInputs': ['startingBalance']}}])
+        corrections = reporter._draft.call_args_list[1].args[0]['corrections']
+        self.assertEqual(len(corrections), 2)
+        self.assertIn('第1段', corrections[0])
+        self.assertIn('999个月', corrections[0])
+        self.assertIn('第2段', corrections[1])
+        self.assertIn('888元', corrections[1])
+        self.assertEqual(result['status'], 'reviewed')
+
     async def test_completeness_review_receives_uncited_available_evidence(self):
         reporter = EvidenceReporter()
         reporter._draft = AsyncMock(return_value=ReportDraft.model_validate({'sections': [

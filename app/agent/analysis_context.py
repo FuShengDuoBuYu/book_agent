@@ -52,19 +52,19 @@ def resolve_group(tasks, previous, scope):
         state['targetMonth'] = next(iter(future_targets))
     elif len(future_targets) > 1:
         state.pop('targetMonth', None)
-    delta = {task.monthsDelta for task in tasks if task.monthsDelta is not None}
+    delta = {task.monthsDelta for task in tasks if task.monthsDelta not in (None, 0)}
     if len(delta) > 1:
         raise ValueError('Multiple incompatible deadline changes')
     if delta:
         if not state.get('months'):
             raise ValueError('延长期限需要上一轮明确的月数，请确认期限')
         state['previousMonths'] = state['months']
-        state['months'] += delta.pop()
+        state['months'] += next(iter(delta))
         if not 1 <= state['months'] <= 600:
             raise ValueError('Resulting horizon must be between 1 and 600 months')
     for field in FIELDS:
         values = {getattr(task, field) for task in tasks if getattr(task, field) is not None
-                  and not (field == 'months' and task.monthsDelta is not None)}
+                  and not (field == 'months' and delta)}
         if len(values) > 1:
             raise ValueError('同一情景存在互相冲突的条件，请分成独立情景')
         if values:

@@ -24,6 +24,45 @@ class AggregateTests(unittest.TestCase):
         self.assertIn("aggregate", ANALYSIS_TOOLS)
         return run_analysis("aggregate", rows, as_of=TODAY, metric=metric, aggregate=spec, source_groups=source_groups)
 
+    def test_filtered_period_totals_and_changes_use_all_categories_before_display_limit(self):
+        records = [row("2026-09-04", -220, "餐饮"), row("2026-09-05", -180, "展览"),
+                   row("2026-10-02", -220, "餐饮"), row("2026-10-03", -440, "展览"),
+                   row("2026-09-06", -1100, "房租"), row("2026-10-07", -180, "交通"),
+                   row("2026-10-07", 3200, "工资")]
+        spans = [period("九月", "2026-09-01", "2026-09-30"), period("十月", "2026-10-01", "2026-10-31")]
+        result = self.run_aggregate(records, "expense", periods=spans, groupBy=["month", "category"],
+                                    filters={"excludeCategories": ["房租", "交通"]}, limit=1)
+        self.assertEqual(len(result["rows"]), 1)
+        self.assertEqual(result["totals"]["expense"], 1060)
+        self.assertEqual([(p["period"], p["amount"], p["count"]) for p in result["periodTotals"]],
+                         [("九月", 400, 2), ("十月", 660, 2)])
+        change, = result["periodComparisons"]
+        self.assertEqual((change["before"], change["after"], change["change"], change["changePercent"]),
+                         (400, 660, 260, 65))
+        self.assertNotIn("category", change)
+
+    def test_period_totals_keep_filtered_zero_separate_from_missing_or_partial_coverage(self):
+        records = [row("2026-09-02", 12, "工资"), row("2026-10-02", -10, "餐饮")]
+        spans = [period("九月", "2026-09-01", "2026-09-30"), period("十月", "2026-10-01", "2026-10-31"),
+                 period("八月", "2026-08-01", "2026-08-31"), period("七月", "2026-07-01", "2026-07-31")]
+        result = run_analysis("aggregate", records, as_of=TODAY, metric="expense", aggregate={"periods": spans},
+                              queried_intervals=[{"startDate": "2026-08-01", "endDate": "2026-10-15"}])
+        self.assertEqual([(r["queryCoverage"], r["observed"], r["amount"]) for r in result["periodTotals"]],
+                         [("complete", True, 0), ("partial", True, None), ("complete", False, None),
+                          ("not_queried", False, None)])
+        self.assertTrue(all(c["change"] is None for c in result["periodComparisons"]))
+        self.assertEqual(result["coverage"][1]["totals"]["expense"], 10)
+
+    def test_period_totals_double_membership_in_overlaps_but_union_counts_once(self):
+        records = [row("2026-10-02", -20, "餐饮"), row("2026-10-03", 12, "工资")]
+        spans = [period("两天", "2026-10-02", "2026-10-03"), period("单日", "2026-10-03", "2026-10-03")]
+        result = self.run_aggregate(records, periods=spans, groupBy=["category"], limit=1)
+        self.assertEqual([(p["net"], p["amount"], p["count"]) for p in result["periodTotals"]],
+                         [(-8, None, 2), (12, None, 1)])
+        self.assertEqual(result["totals"]["count"], 2)
+        self.assertEqual({c["metric"]: c["change"] for c in result["periodComparisons"]},
+                         {"net": 20, "income": 0, "expense": -20})
+
     def test_month_member_category_gross_ledger_totals_and_audited_exclusions(self):
         rows = [row("2026-10-01", 100, "转入"), row("2026-10-03", "-12.35", "餐饮", "面馆"),
                 row("2026-10-07", "-3.40", "餐饮", "零食"), row("2026-10-09", -1, "交通"),

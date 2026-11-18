@@ -53,6 +53,34 @@ class SourceAnalysisTests(unittest.TestCase):
         self.assertIn(name, ANALYSIS_TOOLS)
         return run_analysis(name, records, as_of=TODAY, **kwargs)
 
+    def test_member_totals_reconcile_gross_receipts_and_keep_directions_and_unknowns_separate(self):
+        records = [order(8, 3200, "月结", category="劳务"), order(8, 300, "共同项目初排"),
+                   order(8, 200, "共同项目完稿"), order(8, 8000, "旧设备出售", category="其他"),
+                   order(8, 2100, "月结", member="two"), order(8, 450, "共同项目初排", member="two"),
+                   order(8, -450, "共同项目初排", member="two"),
+                   order(8, 19.99, "临时款", member=None, memberName=None)]
+        catalog = self.tool("sources", records)
+        def indexed(result):
+            return {(r["memberKey"], r["metric"]): (r["member"], r["amount"], r["recordCount"], r["sourceCount"])
+                    for r in result["memberTotals"]}
+        expected = {("one", "income"): ("小雨", 11700, 4, 4), ("two", "income"): ("小雨", 2550, 2, 2),
+                    ("two", "expense"): ("小雨", 450, 1, 1), ("member_unknown", "income"): ("未知成员", 19.99, 1, 1)}
+        self.assertEqual(indexed(catalog), expected)
+        groups = [{"label": "共同项目", "sourceKeys": [r["sourceKey"] for r in catalog["sources"]
+                                                   if r["source"].startswith("共同项目")]}]
+        for metric in ("income", "expense"):
+            filtered = self.tool("sources", records, source_groups=groups, catalog_metric=metric)
+            self.assertEqual(indexed(filtered), {k: v for k, v in expected.items() if k[1] == metric})
+        self.assertEqual(self.tool("sources", records[:1], catalog_metric="expense")["memberTotals"], [])
+
+    def test_member_totals_include_observed_sources_beyond_the_visible_catalog(self):
+        records = [order(8, "0.10", f"作品{index}") for index in range(70)]
+        records += [order(9, "0.20", "作品0"), order(9, "1.25", "作品0", member="two")]
+        data = self.tool("sources", records, catalog_metric="income")
+        self.assertGreater(data["omittedSourceCount"], 0)
+        self.assertEqual({r["memberKey"]: (r["amount"], r["recordCount"], r["sourceCount"])
+                          for r in data["memberTotals"]}, {"one": (7.20, 71, 70), "two": (1.25, 1, 1)})
+
     def test_catalog_keeps_remarks_members_categories_and_direction(self):
         records = [order(8, 100, "项目甲 8月"), order(9, 200, "项目甲 9月"),
                    order(8, 40, "项目乙"), order(8, 27, "项目甲 8月", member="two"),

@@ -69,6 +69,14 @@ def _amount_matches(clause, field):
     if field == "purchaseAmount" and re.search(r"买|购", clause):
         patterns.append(rf"(?:花费?|付){joins}({NUMBER})")
     if field == "startingBalance":
+        # A past snapshot is not proof of present cash. When the clause explicitly
+        # transitions back to the present, examine only that current portion.
+        past = list(re.finditer(r"去年|前年|上(?:上)?个?月|以前|当时|曾经|过去|截至\d{4}年", clause))
+        if past:
+            current = re.search(r"现在|目前|当前|如今|今天", clause[past[-1].end():])
+            if not current:
+                return set()
+            clause = clause[past[-1].end()+current.start():]
         # A savings target uses a future balance, not available cash.
         clause = re.sub(r"(?:目标(?:余额|存款)|存款目标|希望余额|想要余额)", "目标款项", clause)
     return {_number(raw) for pattern in patterns for raw in re.findall(pattern, clause)} - {None}
@@ -172,7 +180,12 @@ def named_percent_changes(question):
         if _negated_change(clause):
             continue
         # A condition may follow an introductory phrase ("未来三个月如果…").
-        clause = re.split(r"如果|假如|假设|假定|要是", clause)[-1].strip()
+        parts = re.split(r"如果|假如|假设|假定|要是", clause)
+        clause = parts[-1].strip()
+        if re.match(r"减少|降低|下降|缩减|减半|增加|上涨|少一半", clause):
+            if len(parts) < 2 or not parts[-2].strip():
+                continue
+            clause = parts[-2].strip() + clause
         clause = re.sub(r"^(?:那么?|改为|改成|我的?|下个?月|未来\s*(?:" + NUMBER + r")\s*个月)+", "", clause)
         match = re.match(
             rf"(?P<subject>[\w·'‘’「」“”]{{1,100}}?)(?:预计|可能|将会|将|会|大概|大约)*\s*"

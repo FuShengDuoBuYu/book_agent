@@ -41,6 +41,9 @@ _COMPLETE_MONTHS = re.compile(r'(?:最近|上)\s*([0-9]+|[一二两三四五六�
 _CHINESE_DIGITS = {char: number for number, char in enumerate('零一二三四五六七八九')} | {'两': 2}
 
 
+_MONTHLY_GOAL = r'(?:每月|每个月)\s*(?:还)?(?:想|希望|要)?(?:能)?\s*(?:额外)?\s*(?:多留(?:下)?|多存(?:下)?|多攒(?:下)?|多结余|多节省)\s*(\d+(?:\.\d+)?万?|[零一二两三四五六七八九十百千万亿]+)'
+
+
 def explicit_goal_amount(raw):
     """Parse bounded literal goal amounts; leave colloquial omitted units unknown."""
     if re.fullmatch(r'\d+(?:\.\d+)?万?', raw):
@@ -270,12 +273,12 @@ class QueryPlanner:
                             task.aggregate.periods = relative_periods
                 self._preserve_referent_window(plan, previous_context or {}, message, now)
                 context = self._inherit_conversation(plan, previous_context or {})
-                self._normalize_projection(plan, message, context, book_mode, now.date())
                 self._normalize_explicit_conditions(plan, message)
+                self._normalize_projection(plan, message, context, book_mode, now.date())
                 self._sanitize_conditions(plan, message, book_mode, context)
                 self._coalesce_forecasts(plan)
                 resolve_context(plan, context, self._normalize_mode(book_mode))
-                self._sanitize_conditions(plan, message, book_mode, plan._analysis_context, prune_prior=False)
+                self._sanitize_conditions(plan, message, book_mode, context, prune_prior=False)
                 if requested_window and plan.intent == 'analyze_orders' and not plan.analyses and plan.toolCalls:
                     self._prepare_analysis_queries(plan, now, book_mode)
                 plan._planning_issues.extend(issues)
@@ -364,8 +367,9 @@ class QueryPlanner:
         other_goals = any(t.tool in {'purchase', 'runway', 'savings', 'budget', 'optimization'} for t in plan.analyses)
         cumulative = bool(re.search(r'累计.*?结余|多月推演|累计.*?存', intent))
         withdrawn = any(issue['type'] == 'withdrawn_source_assumption' for issue in plan._planning_issues)
+        protected_adjustment = any(t.tool == 'optimization' and t.protectedCategories for t in plan.analyses)
         amend = (len(active) == 1 and not re.search(r'只(?:看|算)|仅(?:看|算)|下下?个?月(?:的|会|能)', message)
-                 and ((not other_goals and (conditions or withdrawn)) or delta is not None or cumulative))
+                 and ((not other_goals and (conditions or withdrawn)) or delta is not None or cumulative or protected_adjustment))
         outlook = bool(scenarios or any(t.tool == 'forecast' for t in plan.analyses)
                        or re.search(r'收支|结余|能存|收入预测|支出预测', message))
         if not projections and ((horizon and outlook and not other_goals) or amend):
@@ -378,6 +382,14 @@ class QueryPlanner:
             else:
                 raise ValueError('多个情景需要分别绑定预测期限')
             projections = [task]
+        if (delta and prior.get('months') and len(projections) > 1 and not conditions
+                and not re.search(r'如果|假设|不同情景|两种情景|分别按', message)):
+            # One amended deadline has one active scenario. previousMonths supplies
+            # the old horizon for the reporter's before/after calculation.
+            revised = prior['months'] + delta
+            projection = next((t for t in projections if t.months == revised), projections[0])
+            plan.analyses = [t for t in plan.analyses if t.tool != 'projection' or t is projection]
+            projections = [projection]
         if len(projections) == 1:
             projection = projections[0]
             start = explicit_projection_start(message, today)
@@ -429,39 +441,7 @@ class QueryPlanner:
             return
         clauses = re.split(r'[，。；,;\n]', message)
         positive = [clause for clause in clauses if not re.search(r'不是|并非|不会|并未|并不|不用|无需|不需要|不保留|不留', clause)]
-        optimizations = [task for task in plan.analyses if task.tool == 'optimization']
-        goal_pattern = r'(?:每月|每个月)\s*(?:还)?(?:想|希望|要)?(?:能)?\s*(?:额外)?\s*(?:多留(?:下)?|多存(?:下)?|多攒(?:下)?|多结余|多节省)\s*(\d+(?:\.\d+)?万?|[零一二两三四五六七八九十百千万亿]+)'
-        goals = {explicit_goal_amount(raw) for clause in positive for raw in re.findall(goal_pattern, clause)} - {None}
-        if len(goals) == 1 and plan.intent == 'analyze_orders':
-            empty_scenarios = [t for t in plan.analyses if t.tool == 'scenario' and not t.changes]
-            if not optimizations:
-                if len(empty_scenarios) == 1 and not re.search(r'假设|如果|情景', message):
-                    task = empty_scenarios.pop()
-                    task.tool = 'optimization'
-                else:
-                    task = AnalysisRequest(tool='optimization')
-                    plan.analyses.append(task)
-                optimizations = [task]
-            if not re.search(r'假设|如果|情景', message):
-                plan.analyses = [t for t in plan.analyses if t not in empty_scenarios]
-            for clause in clauses:
-                bound = re.fullmatch(r"\s*([\w·、和与及]{1,100}?)(?:都|继续|要)?(?:维持原状|保持不变|不能动|不动|保留)\s*", clause)
-                if bound and len(optimizations) == 1:
-                    named = [item for item in re.split(r"[、和与及]", bound[1]) if item]
-                    task = optimizations[0]
-                    task.protectedCategories = list(dict.fromkeys(task.protectedCategories + named))[:30]
-        if len(optimizations) == 1 and len(goals) == 1:
-            amount = goals.pop()
-            if 0 <= amount <= 1e12:
-                task = optimizations[0]
-                task.monthlyImprovement = amount
-                # A desired improvement is not a realized/assumed spending cut.
-                # Keep separately stated source-specific or other scenario changes.
-                if not re.search(r'假设|已经|已减少|少花|支出减少', message):
-                    task.changes = [change for change in task.changes if not (
-                        change.metric == 'expense' and not change.source and change.amount is not None
-                        and -change.amount * change.count == amount)]
-                plan._planning_issues.append({'type': 'normalized_explicit_condition', 'field': 'monthlyImprovement', 'value': amount})
+        self._ground_spending_request(plan, message)
         purchases = [task for task in plan.analyses if task.tool == 'purchase']
         amounts = set()
         patterns = (r'(?:保留|预留|留出|留)\s*(\d+(?:\.\d+)?)\s*(万)?\s*(?:元|块)?\s*(?:的|作为)?(?:应急|备用|储备)',
@@ -532,8 +512,6 @@ class QueryPlanner:
                 if task.tool == "budget" and task.budgetAmount is None and re.search(r"预算\D{0,6}\d", message):
                     raise ValueError("budget.budgetAmount 未提取用户明确给出的预算")
                 if task.tool == "savings":
-                    if task.startingBalance is None and re.search(r"(?:已有(?:存款|余额)?|(?:当前|现有|现在)的?(?:存款|余额)|存款|余额)\s*[为是有：:]?\s*\d", message):
-                        raise ValueError("savings.startingBalance 未提取用户明确给出的当前余额")
                     if task.targetAmount is None and re.search(r"(?:存到|达到|目标)\D{0,6}\d", message):
                         raise ValueError("savings.targetAmount 未提取用户明确给出的目标金额")
                     if task.months is None and re.search(r"\d+\s*个月", message):
@@ -637,11 +615,68 @@ class QueryPlanner:
             plan._planning_issues.append({'type': 'preserved_referent_window',
                 'detail': '追问未修改历史时间范围，保留被追问分析的样本窗口。'})
 
+    def _ground_spending_request(self, plan, message):
+        """Bind an explicit spending-adjustment goal to its executable task."""
+        if plan.intent != 'analyze_orders' or ('个人' in message and '家庭' in message):
+            return
+        if len({(c.toolName, c.args.cost_type, c.args.remark) for c in plan.toolCalls}) > 1:
+            return
+        clauses = re.split(r'[，。；！？,;\n]', message)
+        goals = {explicit_goal_amount(raw) for clause in clauses if not re.search(r'不是|并非|不想|不用|无需', clause)
+                 for raw in re.findall(_MONTHLY_GOAL, clause)} - {None}
+        protected = []
+        aliases = {name for t in plan.analyses if t.aggregate for name in t.aggregate.filters.excludeCategories}
+        referents = ' '.join(plan.understanding.referents)
+        for clause in clauses:
+            match = re.fullmatch(r'\s*([\w·、和与及]{1,100}?)(?:都|也|继续|要)?(维持原状|保持不变|不能动|不动|保留|不想再省|不能再省)\s*', clause)
+            if not match:
+                continue
+            names = [name for name in re.split(r'[、和与及]', match[1]) if name]
+            protected.extend(names)
+            # An excluded ledger label can accompany the user's literal when the
+            # understanding explicitly binds it to the same protection instruction.
+            protected.extend(name for name in sorted(aliases) if name not in names and
+                             re.search(re.escape(name) + r'[（(：:\s]*' + re.escape(match[2]), referents))
+        adjusting = protected and re.search(r'调整|可削减|还能.{0,4}省|节省空间', message)
+        if len(goals) != 1 and not adjusting:
+            return
+        if len(goals) == 1:
+            decision_words = {'budget': r'预算|花费上限', 'purchase': r'买|购买|购置',
+                              'savings': r'存到|攒到|攒够|存够|储蓄目标|存款目标|目标(?:金额|余额)',
+                              'runway': r'撑多久|承受多久|撑几个月|支撑|承受时长|维持多久|runway',
+                              'scenario': r'假设|如果|情景|(?:收入|支出).{0,5}(?:减少|增加|中断|减半)'}
+            absent = {name for name, words in decision_words.items() if not re.search(words, message)}
+            plan.understanding.evidenceNeeds = [name for name in plan.understanding.evidenceNeeds if name not in absent]
+            for field in ('requestedAnswers', 'unknowns'):
+                texts = getattr(plan.understanding, field)
+                setattr(plan.understanding, field, [text for text in texts if not any(
+                    re.search(decision_words[name], text) for name in absent)])
+            plan.analyses = [t for t in plan.analyses if t.tool not in absent]
+        optimizers = [t for t in plan.analyses if t.tool == 'optimization']
+        if not optimizers:
+            opt = AnalysisRequest(tool='optimization')
+            plan.analyses.append(opt)
+            optimizers = [opt]
+        if len(optimizers) == 1:
+            task = optimizers[0]
+            task.protectedCategories = list(dict.fromkeys(task.protectedCategories + protected))[:30]
+
+            if len(goals) == 1:
+                amount = next(iter(goals))
+                if 0 <= amount <= 1e12:
+                    if task.monthlyImprovement != amount:
+                        plan._planning_issues.append({'type':'normalized_explicit_condition','field':'monthlyImprovement','value':amount})
+                    task.monthlyImprovement = amount
+                    if not re.search(r'假设|已经|已减少|少花|支出减少', message):
+                        task.changes = [c for c in task.changes if not (
+                            c.metric == 'expense' and not c.source and c.amount is not None and -c.amount*c.count == amount)]
+
     def _materialize_requirements(self, plan, message=''):
         from app.agent.plan_review import CLAUSES, HISTORY_WORDS, NEGATED, _amount_matches, _explicit_amount, _time_evidence
 
         if plan.intent != 'analyze_orders':
             return
+        self._ground_spending_request(plan, message)
         requirements = set(plan.understanding.evidenceNeeds)
         existing = {task.tool for task in plan.analyses}
         scoped = {(c.toolName, c.args.cost_type, c.args.remark) for c in plan.toolCalls}

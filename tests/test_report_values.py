@@ -62,3 +62,25 @@ class CalendarProvenanceTests(unittest.TestCase):
     def test_repeating_total_still_requires_its_own_fact(self):
         self.assertEqual(self.issues("项目收入总额为3,700元。"), [])
         self.assertTrue(self.issues("1、按分项分解\n总额3,700元。", ("f2",)))
+
+    def test_repair_diagnostic_names_invalid_quantities_without_copying_bad_prose(self):
+        errors = self.issues('已核实总额3,700元。' + '请确认后续安排。' * 50 + '还可以花999元并维持8个月。')
+        self.assertIn('999元', str(errors))
+        self.assertIn('8个月', str(errors))
+        self.assertNotIn('3,700', str(errors))
+        self.assertNotIn('请确认后续安排', str(errors))
+        self.assertLess(len(str(errors)), 230)
+
+    def test_half_reduction_and_doubling_require_cited_signed_change(self):
+        facts = [{'id': 'half', 'values': [quantity('家教变化', -50, '%')]},
+                 {'id': 'double', 'values': [quantity('工资变化', 100, '%')]}]
+        self.assertEqual(numerical_issues('家教减半，继续核对后续安排。', ['half'], facts), [])
+        self.assertEqual(numerical_issues('该收入减少一半。', ['half'], facts), [])
+        self.assertEqual(numerical_issues('该收入翻倍。', ['double'], facts), [])
+        self.assertTrue(numerical_issues('家教增加一半。', ['half'], facts))
+        self.assertTrue(numerical_issues('家教减半。', ['double'], facts))
+
+    def test_decimal_money_is_not_parsed_as_a_dotted_calendar_month(self):
+        facts = [{'id': 'cash', 'values': [quantity('月结余', 3850)]}]
+        self.assertEqual(numerical_issues('月结余3850.0元。', ['cash'], facts), [])
+        self.assertTrue(numerical_issues('月结余3850.1元。', ['cash'], facts))

@@ -167,6 +167,8 @@ def _validate_calendars(text, allowed, issues):
         return ' '
 
     def single(match):
+        if '.' in match[0] and re.match(r'\s*(?:元|块|%|％)', match.string[match.end():]):
+            return match[0]  # e.g. 3850.0 元 is an amount, not year 3850/month 0.
         year, month, day = match.groups()
         value = f'{int(year):04}-{int(month):02}' + (f'-{int(day):02}' if day else '')
         valid = value in allowed if day else int(year) * 12 + int(month) - 1 in known and 1 <= int(month) <= 12
@@ -230,7 +232,20 @@ def numerical_issues(text, fact_ids, facts):
     remainder = re.sub(rf'({CHINESE_NUMBER})\s*(?:～|~|至|到|—|–)\s*({CHINESE_NUMBER})\s*{CHINESE_UNIT}', chinese_range, remainder)
     remainder = re.sub(rf'({CHINESE_NUMBER})\s*{CHINESE_UNIT}',
         lambda match: '' if known_chinese(match[1], match[2]) else match[0], remainder)
+    percentages = {Decimal(str(row['value'])) for row in allowed
+                   if row['unit'] == '%' and isinstance(row['value'], (int, float))}
+    changes = {'减半': -50, '少一半': -50, '减少一半': -50, '减至一半': -50,
+               '增加一半': 50, '多一半': 50, '翻倍': 100}
+    remainder = re.sub('|'.join(changes),
+        lambda match: '' if Decimal(changes[match[0]]) in percentages else match[0], remainder)
     remainder = ORDINAL.sub('', remainder)
     if QUANTITY.search(remainder):
-        issues.append('未核实的数量或日期：' + remainder[:240] + '；请引用本段计算事实的相同指标与单位，或使用 values 变量')
+        # Give the repair call the actual offending values, not a clipped copy
+        # of the rejected paragraph (which may hide the numbers at its end).
+        invalid = re.finditer(r'[-+]?\d+(?:,\d{3})*(?:\.\d+)?(?:\s*(?:元|块|%|％|个月|笔|天|次|个|项|组))?'
+                             r'|减少一半|增加一半|减至一半|少一半|多一半|减半|一半|翻倍'
+                             rf'|{CHINESE_NUMBER}\s*{CHINESE_UNIT}', remainder)
+        quantities = [item[0] for item in invalid]
+        issues.append('未核实的数量或日期：' + '、'.join(dict.fromkeys(quantities))[:180]
+                      + '；删除这些数量或引用包含该指标及单位的事实，不能自行换算。')
     return list(dict.fromkeys(issues))

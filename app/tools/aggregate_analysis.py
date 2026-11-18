@@ -193,8 +193,14 @@ def _comparisons(states, dimensions, comparison_dimensions, metric):
     if len(states) < 2:
         return []
     keep = [dimensions.index(name) for name in comparison_dimensions]
-    periods = [(state, _comparison_groups(state["groups"], keep) if dimensions != comparison_dimensions else state["groups"])
-               for state in states]
+    periods = []
+    for state in states:
+        groups = state["groups"]
+        if not comparison_dimensions:
+            groups = {(): state["included"]}
+        elif dimensions != comparison_dimensions:
+            groups = _comparison_groups(groups, keep)
+        periods.append((state, groups))
     (first, first_groups), *others = periods
     results = []
     for other, other_groups in others:
@@ -267,7 +273,7 @@ def aggregate_analysis(orders, *, as_of, metric="all", aggregate=None, source_gr
             state["included"].add(cents)
             state["groups"][key].add(cents, sample=directional)
 
-    rows, coverage = [], []
+    rows, coverage, period_totals = [], [], []
     for state in states:
         ranges = state["ranges"]
         coverage.append({"period": state["period"], "startDate": state["requestedStart"].isoformat(),
@@ -281,6 +287,15 @@ def aggregate_analysis(orders, *, as_of, metric="all", aggregate=None, source_gr
                          "matchedCount": state["included"].count,
                          "firstRecordedDate": state["first"].isoformat() if state["first"] else None,
                          "lastRecordedDate": state["last"].isoformat() if state["last"] else None})
+        if spec.periods:
+            info = coverage[-1]
+            full = info["observed"] and info["queryCoverage"] == "complete"
+            summary = {key: value if full else None for key, value in info["totals"].items()}
+            if directional:
+                other = "expense" if metric == "income" else "income"
+                summary[other] = summary[other + "Count"] = summary["net"] = None
+            period_totals.append({**{key: info[key] for key in ("period", "startDate", "endDate", "queryCoverage", "observed")},
+                                  **summary, "metric": metric, "amount": summary.get(metric)})
         if not spec.groupBy and state["recordCount"]:
             state["groups"].setdefault((), Bucket())
         for key, bucket in sorted(state["groups"].items()):
@@ -289,11 +304,14 @@ def aggregate_analysis(orders, *, as_of, metric="all", aggregate=None, source_gr
     rows.sort(key=lambda r: abs(r["amount"]) if r["amount"] is not None else r["income"] + r["expense"], reverse=True)
     comparison_dimensions = [name for name in spec.groupBy if name not in {"month", "year"}]
     comparisons = _comparisons(states, spec.groupBy, comparison_dimensions, metric)
+    period_comparisons = (_comparisons(states, spec.groupBy, [], metric) if comparison_dimensions
+                          else list(comparisons))
     comparisons.sort(key=lambda r: abs(r["change"]) if r["change"] is not None else -1, reverse=True)
     return {"metric": metric, "dimensions": (["period"] if spec.periods else []) + spec.groupBy,
             "rows": rows[:spec.limit], "totalGroupCount": len(rows), "omittedGroupCount": max(0, len(rows) - spec.limit),
             "totals": audit["included"].summary(), "filterAudit": {name: bucket.summary() for name, bucket in audit.items()},
             "appliedFilters": spec.filters.model_dump(exclude_defaults=True), "coverage": coverage,
+            "periodTotals": period_totals, "periodComparisons": period_comparisons,
             "totalsBasis": "requested_periods" if all(s["queryCoverage"] == "complete" for s in states) else "queried_subset",
             "comparisonDimensions": comparison_dimensions, "comparisons": comparisons[:spec.limit], "totalComparisonCount": len(comparisons),
             "omittedComparisonCount": max(0, len(comparisons) - spec.limit),

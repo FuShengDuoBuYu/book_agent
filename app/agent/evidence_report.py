@@ -22,6 +22,14 @@ INPUT_NAMES = {'startingBalance': '当前可动用余额', 'targetAmount': '希�
                'reserveAmount': '需要保留的应急储备', 'budgetAmount': '预算金额'}
 
 
+class ReportEvidenceError(ValueError):
+    """Keep separate repair diagnostics instead of truncating a joined message."""
+
+    def __init__(self, issues):
+        self.issues = issues
+        super().__init__('；'.join(issues))
+
+
 def money(value):
     return f'{value:,.2f}'.rstrip('0').rstrip('.') if isinstance(value, (int, float)) else '未知'
 
@@ -109,6 +117,21 @@ def build_facts(results):
                      '已查询范围内未见记录，金额和变化未知。' if query_status != 'complete' else '完整查询后未见账单，现实金额和变化仍未知。'),
                     not coverage['observed'], values=[q('区间开始', coverage['startDate'], 'date'), q('区间结束', coverage['endDate'], 'date'),
                         q('区间已记笔数', coverage['recordCount'], '笔'), q('筛选匹配笔数', coverage['matchedCount'], '笔')])
+            for row in e.get('periodTotals', []):
+                if row.get('count') is None:
+                    continue  # Coverage facts above explain why this complete total is unknown.
+                amounts = '、'.join(f"{labels[name]} {money(row[name])} 元" for name in measures)
+                add(f"区间 {literal(row['period'])} 按当前筛选的完整已记小计：{amounts}，共 {row['count']} 笔。"
+                    '重叠日期在各区间内分别统计，不能再将各期小计相加当作并集总额。', True,
+                    values=[q('区间' + labels[name] + '小计', row[name]) for name in measures]
+                        + [q('区间笔数', row['count'], '笔')])
+            for row in e.get('periodComparisons', []):
+                if row.get('change') is None:
+                    continue
+                add(f"筛选后区间总额比较，{literal(row['beforePeriod'])} 至 {literal(row['afterPeriod'])}的已记{labels[row['metric']]}"
+                    f"从 {money(row['before'])} 元变为 {money(row['after'])} 元，变化 {money(row['change'])} 元。", True,
+                    values=[q('区间前期总额', row['before']), q('区间后期总额', row['after']),
+                            q('区间总额变化', row['change']), q('区间总额变化率', row.get('changePercent'), '%')])
             for row in e['rows'][:8]:
                 dimensions = '、'.join(f"{name}={literal(row[name])}" for name in e['dimensions'] if name in row) or '全部选中记录'
                 amounts = '，'.join(f"{labels[name]} {money(row[name])} 元" for name in measures)
@@ -146,6 +169,17 @@ def build_facts(results):
                 add(f"{row['month']} 已记收入 {money(row['incomeTotal'])} 元，支出 {money(row['expenseTotal'])} 元，结余 {money(row['netIncomeMinusExpense'])} 元。" + ('此月尚未完整覆盖，不能与整月直接比较。' if row['partial'] else ''), values=[q('月份', row['month'], 'month'), q('已记收入', row['incomeTotal']), q('已记支出', row['expenseTotal']), q('已记结余', row['netIncomeMinusExpense'])])
             add('有记录月份只能说明已记账收支；缺失月份未知，不能按零补齐。', True)
         elif tool == 'sources':
+            if not e.get('sources') and not e.get('memberTotals'):
+                add('查询范围内未见可归集的该方向账单，现实金额与来源仍未知，不能把空结果当作现实收支为零。', True)
+            for row in e.get('memberTotals', []):
+                label = '收入' if row['metric'] == 'income' else '支出'
+                member = row.get('member') or '归属未知的记录'
+                if row.get('memberKey') in (None, 'member_unknown'):
+                    member = '归属未知的记录'
+                add(f"{member}在查询区间内的已记{label}小计 {money(row['amount'])} 元，共 {row['recordCount']} 笔。"
+                    + ('已记收入包括该方向所有入账，不直接当作持续性收入。' if row['metric'] == 'income' else ''),
+                    result.get('mode') == '家庭版',
+                    values=[q('该成员查询期' + label + '小计', row['amount']), q('该成员' + label + '账单笔数', row['recordCount'], '笔')])
             for row in e.get('sources', [])[:8]:
                 label = '收入' if row['metric'] == 'income' else '支出'
                 summary = f"{row.get('member', '归属未知')}的{label}来源“{row['source']}”已记录 {money(row['amount'])} 元，备注依据："
@@ -280,12 +314,12 @@ def validate_draft(draft, facts):
     missing = {row['id'] for row in facts if row['required']} - used
     if missing:
         issues.append('factIds 遗漏必需证据编号：' + ','.join(sorted(missing)))
-    for section in draft.sections:
+    for index, section in enumerate(draft.sections, 1):
         prose = section.title + '\n' + section.analysis
-        issues.extend(numerical_issues(prose, section.factIds, facts))
+        issues.extend(f'第{index}段：{issue}' for issue in numerical_issues(prose, section.factIds, facts))
         unsupported = unsupported_assertion(expand_values(prose, facts), facts)
         if unsupported:
-            issues.append(unsupported)
+            issues.append(f'第{index}段：{unsupported}')
     return list(dict.fromkeys(issues))
 
 
@@ -317,13 +351,16 @@ def unsupported_assertion(text, facts):
             return '没有识别出候选项不等于已证明没有调整余地'
         if '可能' in clause:
             continue
-        if duplicate_counts and all(int(n) == 0 for n in duplicate_counts) and re.search(r'(?:存在|发现|检测到|检出|识别到|识别出|查出)(?:了)?(?:疑似)?重复', clause):
+        duplicate_claim = re.sub(r'(?:未|没有|尚未)(?:发现|检测到|检出|识别到|识别出|查出)(?:任何|疑似)?重复(?:组|记录)?', '', clause)
+        if duplicate_counts and all(int(n) == 0 for n in duplicate_counts) and re.search(r'(?:存在|发现|检测到|检出|识别到|识别出|查出)(?:了)?(?:疑似)?重复', duplicate_claim):
             return '规则没有重复线索，不能断言存在重复'
         if re.search(r'记录不完整|存在漏记|健康风险', clause):
             return '记录样本不足不能证明漏记、完整性或健康状况'
         if re.search(r'消费习惯.{0,8}(?:改变|变化|不变|改善|恶化)', clause):
             return '分类金额变化不能直接证明消费习惯的实际变化或未变'
-        if '不存在这两项的资金缺口' in evidence_text and re.search(r'资金缺口|填补.{0,4}缺口|弥补.{0,4}差额', clause):
+        gap_claim = re.sub(r'(?:不存在|没有|无须填补|无需填补|无)(?:任何|这两项的)?资金缺口', '', clause)
+        if '不存在这两项的资金缺口' in evidence_text and re.search(
+                r'(?:存在|出现|产生|造成|面临|形成|仍有|还有).{0,10}(?:资金)?缺口|(?:资金)?缺口(?:为|达|是)|填补.{0,4}缺口|弥补.{0,4}差额', gap_claim):
             return '购买和储备已能同时覆盖，不能把正的储备余量称为资金缺口'
         if re.search(r'不会(?:导致|影响|造成).{0,6}生活|肯定买得起|肯定买不起', clause):
             return '现有余额不能保证未来生活不受影响，还需确认必付账单和储备'
@@ -378,7 +415,7 @@ def prepare_draft(draft, facts):
         target.factIds.append(key)
     issues = validate_draft(draft, facts)
     if issues:
-        raise ValueError('；'.join(issues))
+        raise ReportEvidenceError(issues)
     return draft, {'restoredReferences': list(dict.fromkeys(restored + missing)), 'normalizedUnits': normalized_units}
 
 
@@ -565,7 +602,7 @@ class EvidenceReporter:
                     return reply + ('\n\n' + table_text if table_text else ''), {'status': 'reviewed', 'facts': facts, 'report': draft.model_dump(), 'attempts': attempts}
             except Exception as exc:
                 detail = '; '.join(f"{err['loc']}: {err['msg']}" for err in exc.errors()) if isinstance(exc, ValidationError) else (str(exc) if isinstance(exc, ValueError) else '')
-                issues = ['报告生成失败：' + type(exc).__name__ + ' ' + detail[:500]]
+                issues = exc.issues if isinstance(exc, ReportEvidenceError) else ['报告生成失败：' + type(exc).__name__ + ' ' + detail[:500]]
                 attempts.append({'issues': issues, 'draft': previous, 'call': getattr(self, '_last_call', {}),
                                  'calls': calls, 'contextBudget': budget_stats})
         selected = [row['text'] for row in all_facts if row['required']]

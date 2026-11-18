@@ -55,7 +55,9 @@ class AggregatePipelineTests(unittest.TestCase):
         self.assertIn('房租', text)
         self.assertIn('20', text)
         draft = ReportDraft.model_validate({'sections': [{'title': '区间比较',
-            'factIds': [f['id'] for f in facts], 'analysis': '餐饮已记支出增加20元；房租已按要求排除。'}]})
+            'factIds': [f['id'] for f in facts[offset:offset + 8]],
+            'analysis': '餐饮已记支出增加20元；房租已按要求排除。' if offset == 0 else ''}
+            for offset in range(0, len(facts), 8)]})
         self.assertFalse(validate_draft(draft, facts))
 
     def test_count_and_mean_changes_are_reported_as_ledger_statistics(self):

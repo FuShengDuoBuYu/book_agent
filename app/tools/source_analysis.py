@@ -154,12 +154,32 @@ def source_catalog(orders: list[dict], *, source_groups=None, catalog_metric="al
         if metric in directions:
             members_by_metric[metric][row["memberKey"]].append(row)
             counts[metric] += 1
+    # Sum the original signed ledger entries before source rounding or catalog truncation.
+    # An alias may change the displayed source count but never a member's recorded receipts.
+    amounts = defaultdict(Decimal)
+    for order in orders:
+        signed = Decimal(str(order["money"]))
+        metric = "income" if signed > 0 else "expense"
+        if signed and metric in directions:
+            amounts[order.get("memberKey") or "member_unknown", metric] += abs(signed)
+    member_totals = []
+    for metric in directions:
+        for key, sources in members_by_metric.get(metric, {}).items():
+            member_totals.append({
+                "memberKey": key, "member": sources[0]["member"], "metric": metric,
+                "amount": money(amounts[key, metric]),
+                "recordCount": sum(source["recordCount"] for source in sources),
+                "sourceCount": sum(len(source["observedSourceKeys"]) for source in sources),
+            })
+    member_totals.sort(key=lambda row: (row["metric"] != "income", -row["amount"], row["memberKey"]))
     # Every prefix, including the investigator's smaller view, samples directions and members.
     # Within each member and direction, the cumulative amount determines the order.
     scoped = _interleave(_interleave(members.values()) for members in members_by_metric.values())
     visible = list(islice(scoped, CATALOG_LIMIT))
     shown = Counter(row["metric"] for row in visible)
-    return {"sources": visible, "catalogMetric": catalog_metric or "all", "sourceCount": sum(counts.values()),
+    return {"sources": visible, "memberTotals": member_totals,
+            "memberTotalsBasis": "按成员和收支方向汇总全部已记非零流水，收入含出售等一次性款项。笔数按账单记录计，来源数按归组前的观测来源计。",
+            "catalogMetric": catalog_metric or "all", "sourceCount": sum(counts.values()),
             "omittedSourceCount": sum(counts.values()) - len(visible),
             "sourceCountByMetric": {metric: counts[metric] for metric in directions},
             "omittedSourceCountByMetric": {metric: counts[metric] - shown[metric] for metric in directions},

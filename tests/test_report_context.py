@@ -147,7 +147,7 @@ class ReportContextTests(unittest.TestCase):
             {'title': f'错误摘要{i}', 'factIds': ['f1', 'f2'], 'analysis': '待缩短的分析文字。' * 160}
             for i in range(1, 7)
         ]}
-        issues = ['先纠正交通变化的方向。'] + ['其余冗长问题。' * 220] * 8
+        issues = ['第一段应纠正交通变化的方向。', '第二段应按账单证据核对笔数。']
         repair, stats = repair_context(payload, prior, issues, SYSTEM, SCHEMA, **budget)
         self.assertEqual(repair['facts'], payload['facts'])
         self.assertEqual(repair['values'], {
@@ -157,9 +157,53 @@ class ReportContextTests(unittest.TestCase):
         self.assertEqual(repair['corrections'][0], issues[0])
         self.assertEqual(repair['previousReport']['sections'][0]['title'], '错误摘要1')
         self.assertEqual(repair['previousReport']['sections'][0]['factIds'], ['f1', 'f2'])
-        self.assertLess(len(repair['previousReport']['sections'][0]['analysis']), len(prior['sections'][0]['analysis']))
+        self.assertNotIn('analysis', repair['previousReport']['sections'][0])
         self.assertLessEqual(stats['estimatedPromptTokens'], stats['promptBudgetTokens'])
         self.assertEqual(payload, original)
+
+    def test_retry_makes_room_for_all_diagnostics_before_optional_context(self):
+        base = {**base_payload(), 'analysisScope': {'metric': 'expense', 'window': '前两个月'}}
+        base['history'] = '较早的回答片段。' * 22
+        base['artifacts'] = [{'id': 'a1', 'title': '分类支出', 'columns': [{'key': 'amount', 'label': '金额'}],
+                              'rows': [{'amount': i} for i in range(8)]}]
+        facts = [fact(1, required=True, text='只根据账单记录的支出。')] + [
+            fact(i, required=False, text='次要账单说明。' * 9) for i in range(2, 9)
+        ]
+        budget = {'num_ctx': 1600, 'num_predict': 384}
+        initial, _, _ = build_report_context(base, facts, SYSTEM, SCHEMA, **budget)
+        before = deepcopy(initial)
+        issues = [
+            f'第{i}段把账单笔数当作购买数量。请删除该推断并保留统计口径。' for i in range(1, 9)
+        ]
+        prior = {'sections': [{'title': '支出说明', 'factIds': ['f1'], 'analysis': '错误段落不应被再次照抄。'}]}
+        repaired, stats = repair_context(initial, prior, issues, SYSTEM, SCHEMA, **budget)
+        self.assertEqual(repaired['corrections'], issues)
+        self.assertLess(len(repaired['facts']), len(initial['facts']))
+        self.assertIn(initial['facts'][0], repaired['facts'])
+        for key in ('question', 'understanding', 'userConditions', 'analysisScope', 'instruction'):
+            self.assertEqual(repaired[key], base[key])
+        self.assertEqual(repaired['artifacts'][0]['columns'], base['artifacts'][0]['columns'])
+        self.assertNotIn('错误段落不应被再次照抄', str(repaired))
+        self.assertEqual(stats['correctionCount'], 8)
+        self.assertLessEqual(stats['estimatedPromptTokens'], stats['promptBudgetTokens'])
+        self.assertEqual(initial, before)
+
+    def test_retry_keeps_required_value_ids_when_optional_evidence_is_removed(self):
+        payload = {**base_payload(), 'facts': [
+            {'id': 'f1', 'required': True, 'text': '总支出已核对。'},
+            {'id': 'f2', 'required': False, 'text': '次要的来源依据。' * 75},
+            {'id': 'f3', 'required': True, 'text': '本次忽略医疗支出。'},
+        ], 'values': {'v1': 'f1 已记支出 = 90 元', 'v2': 'f2 参考额 = 29 元', 'v3': 'f3 排除金额 = 12 元'}}
+        repaired, _ = repair_context(payload, None, ['第一段应保留医疗筛选。'], SYSTEM, SCHEMA,
+                                     num_ctx=1300, num_predict=384)
+        self.assertEqual([item['id'] for item in repaired['facts']], ['f1', 'f3'])
+        self.assertEqual(repaired['values'], {'v1': 'f1 已记支出 = 90 元', 'v3': 'f3 排除金额 = 12 元'})
+        self.assertIn('v2', payload['values'])
+
+    def test_retry_reports_overflow_instead_of_cutting_a_required_diagnostic(self):
+        initial, _, _ = build_report_context(base_payload(), [], SYSTEM, SCHEMA)
+        with self.assertRaisesRegex(ValueError, '预算'):
+            repair_context(initial, None, ['需保留的诊断。' * 1000], SYSTEM, SCHEMA)
 
     def test_required_facts_or_critical_question_over_budget_raise(self):
         budget = {'num_ctx': 1200, 'num_predict': 384}
