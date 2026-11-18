@@ -8,6 +8,15 @@ from app.tools.financial_analysis import _date, merge_orders, run_analysis
 from app.tools.source_analysis import observed_source_key
 
 
+def computed_metric(tool, evidence):
+    if tool in {'forecast', 'aggregate'}:
+        return evidence.get('metric')
+    if tool == 'sources':
+        direction = evidence.get('catalogMetric')
+        return direction if direction in {'income', 'expense'} else 'all'
+    return {'budget': 'expense', 'income_stability': 'income'}.get(tool, 'all')
+
+
 def query_intervals(bound):
     ranges = []
     for call, _ in bound:
@@ -65,8 +74,9 @@ def collect_analysis_results(plan, datasets, today):
                 window_end=window.endDate if window else None,
             )
             analysis_results.append({"mode": scope, "tool": task.tool, "queryIds": task.queryIds,
-                                     "supplemental": task._supplemental, "metric": task.metric,
-                                     "historyWindow": window.model_dump(mode='json') if window else None,
+                                     "supplemental": task._supplemental, "metric": computed_metric(task.tool, result),
+                                     "requestedMetric": task.metric,
+                                     "historyWindow": window.model_dump(mode='json') if window and task.tool != 'budget' else None,
                                      "filters": [{"category": category, "remark": remark} for category, remark in sorted(filters)],
                                      "evidence": result})
 

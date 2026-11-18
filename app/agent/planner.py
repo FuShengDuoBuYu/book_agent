@@ -259,6 +259,8 @@ class QueryPlanner:
                         plan.analyses = decision.analyses
                         plan.analysisWindow = decision.analysisWindow
                         plan.finalInstruction = decision.answerInstruction
+                        self._materialize_requirements(plan, message, previous_context, book_mode)
+                        self._sanitize_conditions(plan, message, book_mode, previous_context)
                 requested_window = explicit_complete_month_window(message, now.date()) or _historical_half_year(message, now.date())
                 if requested_window and requested_window != plan.analysisWindow:
                     plan.analysisWindow = requested_window
@@ -676,6 +678,8 @@ class QueryPlanner:
         clauses = [c for c in re.split(r'[，。；！？,;\n]', message) if not re.search(
             r'(?:不用|无需|不必|不要|先不|暂不|别)(?:再|帮我)?(?:预测|推演|计算|考虑|评估|分析|做|买|估算|模拟)', c)]
         text = '，'.join(clauses)
+        # Quoted ledger labels are selectors, even when a label names a decision.
+        text = re.sub(r"""(?:备注|分类|类别|来源|项目)(?:名(?:称)?)?(?:里|中)?(?:写着|包含|含有|含|为|是|叫)?\s*[“‘「"'][^”’」"']*[”’」"']""", '', text)
         temporal_outlook = r'(?:下下?个?月|下个?季度|明年|未来|接下来)'
         forecast = (re.search(r'预测|预计|预估|预期', text)
                     or re.search(temporal_outlook + r'.{0,18}(?:收入|支出|进账|开销|收支|结余)', text))
@@ -699,22 +703,22 @@ class QueryPlanner:
                         or named_percent_changes(text),
         }
         explicit = {tool for tool, supported in requests.items() if supported}
-        if explicit or not (plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext
-                            and previous and not previous.get('ambiguous')
-                            and re.search(r'刚才|上轮|上次|之前那|原来那|原计划|那个|这个数|同样|沿用|继续|再算|重新算', text)):
-            return explicit
+        if not (plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext
+                and previous and not previous.get('ambiguous')
+                and re.search(r'刚才|上轮|上次|之前那|原来那|原计划|那个|这个数|同样|沿用|继续|再算|重新算', text)):
+            return explicit, set()
         scope = {(call.toolName, call.args.cost_type, call.args.remark or '') for call in plan.toolCalls}
         if not scope:
             default = 'search_family_orders' if self._normalize_mode(book_mode) == '家庭版' else 'search_personal_orders'
             scope = {(default, '不限', '')}
         if len(scope) != 1 or [list(next(iter(scope)))] != previous.get('scope'):
-            return set()
+            return explicit, set()
         active = previous.get('activeAnalyses') or previous.get('conversation', {}).get('analyses', [])
         if not active and previous.get('targetMonth') and not any(previous.get(k) is not None for k in (
                 'months', 'purchaseAmount', 'targetAmount', 'monthlyImprovement', 'budgetAmount')):
             # Legacy forecast histories stored a scoped target before activeAnalyses existed.
-            return {'forecast'}
-        return {row.get('tool') for row in active}
+            return explicit, {'forecast'}
+        return explicit, {row['tool'] for row in active if row.get('tool')}
 
     def _materialize_requirements(self, plan, message='', previous=None, book_mode='个人版'):
         from app.agent.plan_review import CLAUSES, HISTORY_WORDS, NEGATED, _amount_matches, _explicit_amount, _time_evidence
@@ -729,14 +733,33 @@ class QueryPlanner:
                     for c in plan.toolCalls}
         decisions = HISTORY_BASED_TOOLS | {'budget'}
         requested = requirements & {'cashflow', 'data_quality', 'trends', 'changes', 'aggregate', 'income_stability', 'recurring', 'anomalies'}
+        explicit, referenced = self._decision_goals(message, plan, previous, book_mode) if len(bindings) <= 1 else (set(), set())
+        grounded = explicit | referenced
+        if len(explicit) == 1 and not (previous or {}).get('ambiguous'):
+            primary = next(iter(explicit))
+            # A committed task may already compute an input hypothesis or the monthly outlook.
+            covered = ((primary == 'scenario' and existing & {'projection', 'savings', 'runway'})
+                       or (primary == 'forecast' and 'projection' in existing))
+            if not covered:
+                requested.add(primary)
+            # A supporting cashflow/trend calculation needs no independent user goal.
+            # Conversely, a decision requiring a separate price, budget, target or shock
+            # cannot usefully answer this one when both its goal and its input are absent.
+            required_input = {'budget': 'budgetAmount', 'savings': 'targetAmount', 'runway': 'changes',
+                              'purchase': 'purchaseAmount', 'scenario': 'changes'}
+            def unrelated_empty(task):
+                if task.tool in grounded or task.tool not in required_input:
+                    return False
+                value = getattr(task, required_input[task.tool])
+                return value is None or value == []
+            plan.analyses = [task for task in plan.analyses if not unrelated_empty(task)]
+            existing = {task.tool for task in plan.analyses}
         missing_decisions = (requirements & decisions) - existing
-        if missing_decisions:
-            grounded = self._decision_goals(message, plan, previous, book_mode) if len(bindings) <= 1 else set()
-            requested |= missing_decisions & grounded
-            unsupported = missing_decisions - grounded
-            if unsupported:
-                plan.understanding.evidenceNeeds = [need for need in plan.understanding.evidenceNeeds if need not in unsupported]
-                plan._planning_issues.append({'type': 'ungrounded_decision_needs', 'tools': sorted(unsupported)})
+        requested |= missing_decisions & grounded
+        unsupported = missing_decisions - grounded
+        if unsupported:
+            plan.understanding.evidenceNeeds = [need for need in plan.understanding.evidenceNeeds if need not in unsupported]
+            plan._planning_issues.append({'type': 'ungrounded_decision_needs', 'tools': sorted(unsupported)})
         if requirements & {'sources', 'members', 'remarks'}:
             requested.add('sources')
         if 'quality' in requirements:

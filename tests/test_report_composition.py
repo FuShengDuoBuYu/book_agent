@@ -38,11 +38,26 @@ class FakeComposition:
 
 
 class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_native_outline_cannot_generate_artifact_ids_or_new_goals(self):
+        from app.agent.report_composition import outline_schema
+        p = payload_for_composition()
+        p['answerGoals'] = p['understanding']['requestedAnswers']
+        schema = outline_schema(p)['$defs']['OutlineSection']['properties']
+        self.assertEqual(schema['factIds']['items']['enum'], ['f1', 'f2', 'f3'])
+        self.assertEqual(schema['answerGoal']['enum'], ['解释哪些类别增加'])
+        self.assertNotIn('抗风险弱', schema['title']['enum'])
+
+    async def test_outline_cannot_invent_a_new_answer_goal_from_its_observations(self):
+        fake = FakeComposition(section('分析结论', '证明收入单一所以抗风险能力弱', 'f1'))
+        with self.assertRaisesRegex(ValueError, '目标'):
+            await compose_report(payload_for_composition(), fake.invoke)
+        self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline])
+
     async def test_each_comment_receives_only_its_bound_facts_and_original_value_ids(self):
         payload = payload_for_composition()
         initial = deepcopy(payload)
-        fake = FakeComposition(section('交通分析', '解释交通支出变化', 'f1'),
-                               section('餐饮分析', '解释餐饮支出变化', 'f2'))
+        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'),
+                               section('统计口径', '解释哪些类别增加', 'f2'))
         draft = await compose_report(payload, fake.invoke)
         self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline, ReportComment, ReportComment])
         outline = fake.calls[0][1]
@@ -52,27 +67,27 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('values', outline)
         for index, (key, value) in enumerate([('v1', 'f1'), ('v7', 'f2')], 1):
             comment = fake.calls[index][1]
-            self.assertEqual(comment['section'], fake.outline['sections'][index - 1])
-            self.assertEqual(comment['facts'], [next(row for row in payload['facts'] if row['id'] == value)])
-            self.assertEqual(comment['values'], {key: payload['values'][key]})
+            self.assertEqual(comment['section'], {k: v for k, v in fake.outline['sections'][index - 1].items() if k != 'factIds'})
+            self.assertEqual(comment['computedFacts'], [{k: v for k, v in next(row for row in payload['facts'] if row['id'] == value).items() if k in {'text', 'binding'}}])
+            self.assertEqual(comment['values'], {key: payload['values'][key].split(' ', 1)[1]})
             self.assertEqual(comment['question'], payload['question'])
             self.assertEqual(comment['analysisScope'], payload['analysisScope'])
             self.assertEqual(comment['userConditions'], payload['userConditions'])
             self.assertNotIn('artifacts', comment)
             self.assertNotIn('history', comment)
         self.assertEqual([(row.title, row.factIds) for row in draft.sections],
-                         [('交通分析', ['f1']), ('餐饮分析', ['f2'])])
+                         [('变化来源', ['f1']), ('统计口径', ['f2'])])
         self.assertEqual(payload, initial)
 
     async def test_unknown_outline_reference_is_rejected_before_any_comment(self):
-        fake = FakeComposition(section('交通分析', '解释交通', 'f1'),
-                               section('无证据', '猜测其他范围', 'fabricated'))
+        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'),
+                               section('需要确认的事项', '猜测其他范围', 'fabricated'))
         with self.assertRaisesRegex(ValueError, '证据'):
             await compose_report(payload_for_composition(), fake.invoke)
         self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline])
 
     async def test_omitted_required_evidence_has_independent_blank_analysis_sections(self):
-        fake = FakeComposition(section('交通分析', '解释交通', 'f1'))
+        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'))
         payload = payload_for_composition()
         payload['facts'] = [{'id': f'f{n}', 'text': '原始必需证据。', 'required': True}
                             for n in range(1, 12)]
@@ -86,7 +101,7 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline, ReportComment])
 
     async def test_too_many_required_evidence_sections_raise_before_comment(self):
-        fake = FakeComposition(section('交通分析', '解释交通', 'f1'))
+        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'))
         payload = payload_for_composition()
         payload['facts'] = [{'id': f'f{n}', 'text': '必需证据。', 'required': True}
                             for n in range(1, 43)]
@@ -97,15 +112,15 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
     async def test_diagnostics_follow_the_bound_section_when_outline_reorders_sections(self):
         payload = payload_for_composition()
         payload['previousReport'] = {'sections': [
-            {'title': '交通分析', 'factIds': ['f1'], 'analysis': '旧段落错误结论'},
-            {'title': '餐饮分析', 'factIds': ['f2'], 'analysis': '另一个旧段落错误结论'},
+            {'title': '变化来源', 'factIds': ['f1'], 'analysis': '旧段落错误结论'},
+            {'title': '统计口径', 'factIds': ['f2'], 'analysis': '另一个旧段落错误结论'},
         ]}
         first = '第1段：不要把支出变化当成余额。'
         second = '第2段：不要把账单笔数当成购买数量。'
         common = '解释时保留用户明确保护的房租。'
         payload['corrections'] = [first, second, common]
-        fake = FakeComposition(section('餐饮分析', '解释餐饮', 'f2'),
-                               section('交通分析', '解释交通', 'f1'))
+        fake = FakeComposition(section('统计口径', '解释哪些类别增加', 'f2'),
+                               section('变化来源', '解释哪些类别增加', 'f1'))
         await compose_report(payload, fake.invoke)
         outline, dining, travel = [entry[1] for entry in fake.calls]
         self.assertEqual(outline['corrections'], [first, second, common])
@@ -118,7 +133,7 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
     async def test_comment_budget_never_drops_bound_value_to_force_a_call(self):
         payload = payload_for_composition()
         payload['values']['v1'] = 'f1 ' + '必须保留的已绑定数量依据。' * 700
-        fake = FakeComposition(section('交通分析', '解释交通', 'f1'))
+        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'))
         with self.assertRaisesRegex(ValueError, '预算'):
             await compose_report(payload, fake.invoke)
         self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline])

@@ -2,7 +2,7 @@
 
 import re
 from copy import deepcopy
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -13,10 +13,11 @@ from app.schemas.report import ReportDraft
 OUTLINE_TOKENS = 768
 COMMENT_TOKENS = 768
 OUTLINE_PROMPT = '''根据本轮问题、用户条件和账本证据拟定简短提纲。
-优先覆盖用户要求的交付和判断。每段用中性标题与 answerGoal 说明该段要回答什么，再绑定直接支持它的 factIds。
+answerGoal 必须逐字选用 answerGoals 中用户已经要求的目标，不能将自己的判断变成新目标。title 选择中性标题，factIds 只绑定真实的事实编号，a 开头的表格编号不能作事实引用。
 只写有必要且有证据的段落，一段也可以。金额、日期和表格由程序展示。'''
-COMMENT_PROMPT = '''用两至三句回答 section.answerGoal。先给判断，再说明它与本段证据的关系，或指出具体需要核查的信息。
-程序会展示已引用的账本事实和表格。数量沿用证据中的原指标、单位和时间，计算交给程序。
+COMMENT_PROMPT = '''计算已经完成。用两至三句解释 section.answerGoal 与 computedFacts 的关系，先直接回答，再指出具体需要核查或调整的事项。
+程序会在解释前展示这些完整事实，直接用“上述差额”“这个条件”等衔接，不必再次列数字。条件推演已经应用用户假设，不能再扣减或重新计算。只将本段事实作为已核算结果，其他输入帮助理解问题。
+账本说明已记录的变化，不证明未来收入稳定、医疗以后不再发生、生活负担过高或记录完整。未知余额时先确认余额和近期支出，不据月结余判断买得起。正文不用内部编号或代码字段名。
 如有 values，可按 {{v1}} 的格式引用实际提供的变量，变量已带单位。'''
 SECTION_DIAGNOSTIC = re.compile(r'^第\s*(\d+)\s*段')
 
@@ -24,7 +25,7 @@ SECTION_DIAGNOSTIC = re.compile(r'^第\s*(\d+)\s*段')
 class OutlineSection(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
 
-    title: str = Field(min_length=1, max_length=120)
+    title: Literal['分析结论', '变化来源', '收入构成', '条件与方案', '统计口径', '记录核查', '需要确认的事项']
     answerGoal: str = Field(min_length=1, max_length=240)
     factIds: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1, max_length=8)
 
@@ -38,7 +39,16 @@ class ReportOutline(BaseModel):
 class ReportComment(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
-    analysis: str = Field(max_length=1000)
+    analysis: str = Field(max_length=1000, description='解释已算好的结果与本段目标的关系及具体下一步；不重新计算，不写内部编号。')
+
+
+def outline_schema(payload):
+    """Constrain native generation to the actual user goals and available facts."""
+    schema = ReportOutline.model_json_schema()
+    fields = schema['$defs']['OutlineSection']['properties']
+    fields['answerGoal']['enum'] = payload['answerGoals']
+    fields['factIds']['items']['enum'] = [row['id'] for row in payload['facts']]
+    return schema
 
 
 def _subset(source, fields):
@@ -70,8 +80,9 @@ async def compose_report(payload, invoke, *, num_ctx=8192) -> ReportDraft:
         raise ValueError('报告提纲需要唯一、可引用的证据编号')
 
     corrections = payload.get('corrections', [])
+    goals = list(dict.fromkeys((payload.get('understanding') or {}).get('requestedAnswers') or [payload['question']]))
     outline_input = {**common, **_subset(payload, ('understanding', 'requestedAnswers', 'corrections')),
-                     'facts': facts}
+                     'answerGoals': goals, 'facts': facts}
     if 'artifacts' in payload:
         outline_input['artifacts'] = _artifact_previews(payload['artifacts'])
     limit, estimate = _prompt_budget(OUTLINE_PROMPT, ReportOutline, num_ctx, OUTLINE_TOKENS)
@@ -88,6 +99,8 @@ async def compose_report(payload, invoke, *, num_ctx=8192) -> ReportDraft:
         if set(identifiers) - available.keys():
             raise ValueError('报告提纲引用了未提供的证据编号')
         used.update(identifiers)
+    if any(goal not in goals for _, goal, _ in briefs):
+        raise ValueError('报告提纲改变了用户已经确定的回答目标')
 
     missing = [row['id'] for row in facts if row.get('required') and row['id'] not in used]
     remaining = [missing[index:index + 8] for index in range(0, len(missing), 8)]
@@ -100,10 +113,10 @@ async def compose_report(payload, invoke, *, num_ctx=8192) -> ReportDraft:
     comment_inputs = []
     for number, (title, goal, identifiers) in enumerate(briefs, 1):
         selected = set(identifiers)
-        comment = {**common, 'section': {'title': title, 'answerGoal': goal, 'factIds': list(identifiers)},
-                   'facts': [available[key] for key in identifiers]}
+        comment = {**common, 'section': {'title': title, 'answerGoal': goal},
+                   'computedFacts': [_subset(available[key], ('text', 'binding')) for key in identifiers]}
         if 'values' in payload:
-            comment['values'] = {key: value for key, value in payload['values'].items()
+            comment['values'] = {key: value.split(' ', 1)[1] for key, value in payload['values'].items()
                                  if value.split(' ', 1)[0] in selected}
         diagnostics = _section_diagnostics(corrections, previous, number, title, selected)
         if diagnostics:

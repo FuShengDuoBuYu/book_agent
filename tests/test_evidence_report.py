@@ -243,7 +243,7 @@ class EvidenceReviewTests(unittest.IsolatedAsyncioTestCase):
         from app.schemas.report import ReportReview
         reporter = EvidenceReporter()
         reporter._invoke = AsyncMock(side_effect=[
-            ReportOutline(sections=[{'title': '购买条件', 'answerGoal': '缺少什么才能判断购买影响', 'factIds': ['f1']}]),
+            ReportOutline(sections=[{'title': '条件与方案', 'answerGoal': '购买会影响生活吗？', 'factIds': ['f1']}]),
             ReportComment(analysis='需先确认当前可动用余额和近期必付账单，再判断购买影响。'),
             ReportReview(supported=True, completed=True, issues=[])])
         reply, result = await reporter.answer('购买会影响生活吗？', {}, [{'tool': 'purchase', 'evidence': {

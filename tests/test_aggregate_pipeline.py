@@ -12,6 +12,56 @@ from tests.test_aggregate_analysis import row, period
 
 
 class AggregatePipelineTests(unittest.TestCase):
+    def test_directions_in_old_snapshots_come_from_the_calculation(self):
+        for tool, evidence, expected in [
+            ('trends', {}, 'all'), ('changes', {}, 'all'), ('cashflow', {}, 'all'),
+            ('income_stability', {}, 'income'), ('aggregate', {'metric': 'expense'}, 'expense'),
+            ('sources', {'catalogMetric': 'expense'}, 'expense'),
+        ]:
+            with self.subTest(tool=tool):
+                fact, = build_facts([{'tool': tool, 'metric': 'net',
+                                      'evidence': {'sufficientData': False, **evidence}}])
+                self.assertEqual(fact['binding']['metric'], expected)
+
+    def test_source_and_member_bindings_follow_recorded_direction_even_for_default_income_request(self):
+        plan = AgentPlan.model_validate({'toolCalls': [{'id': 'ledger', 'toolName': 'search_family_orders'}],
+                                        'analyses': [{'tool': 'sources'}]})
+        records = [row('2026-10-03', 1000, '工资'), row('2026-10-04', -200, '房租')]
+        result, = collect_analysis_results(plan, {'家庭版': [(plan.toolCalls[0], records)]}, date(2026, 11, 19))
+        self.assertEqual(result['metric'], 'all')
+        self.assertEqual(result['requestedMetric'], 'income')
+        facts = build_facts([dict(result, metric='income')])  # Older snapshots stored the requested direction.
+        binds = [f['binding'] for f in facts]
+        self.assertEqual({(b['member'], b['metric'], b.get('source')) for b in binds},
+                         {('春枝', 'income', None), ('春枝', 'expense', None),
+                          ('春枝', 'income', '工资'), ('春枝', 'expense', '房租')})
+
+    def test_budget_binding_uses_actual_month_and_not_history_window(self):
+        plan = AgentPlan.model_validate({'toolCalls': [{'id': 'ledger', 'toolName': 'search_personal_orders'}],
+            'analysisWindow': {'startDate': '2026-10-01', 'endDate': '2026-10-31'},
+            'analyses': [{'tool': 'budget', 'budgetAmount': 900, 'targetMonth': '2026-11'}]})
+        records = [row('2026-10-03', -600, '房租'), row('2026-11-04', -200, '房租')]
+        results = collect_analysis_results(plan, {'个人版': [(plan.toolCalls[0], records)]}, date(2026, 11, 19))
+        budget = results[0]
+        self.assertEqual(budget['evidence']['spent'], 200)
+        self.assertIsNone(budget['historyWindow'])
+        fact, = build_facts([dict(budget, metric='income', historyWindow=plan.analysisWindow.model_dump(mode='json'))])
+        self.assertNotIn('historyWindow', fact['binding'])
+        self.assertEqual((fact['binding']['metric'], fact['binding']['month']), ('expense', '2026-11'))
+
+    def test_forecast_and_projection_bind_future_dates_separately_from_input_history(self):
+        window = {'startDate': '2026-08-01', 'endDate': '2026-10-31'}
+        plan = AgentPlan.model_validate({'toolCalls': [{'id': 'ledger', 'toolName': 'search_personal_orders'}],
+            'analysisWindow': window, 'analyses': [
+                {'tool': 'forecast', 'targetMonth': '2027-01', 'metric': 'expense'},
+                {'tool': 'projection', 'targetMonth': '2027-01', 'months': 3}]})
+        records = [row(f'2026-{m:02}-03', n, kind) for m in (8, 9, 10) for n, kind in [(1000, '工资'), (-200, '房租')]]
+        results = collect_analysis_results(plan, {'个人版': [(plan.toolCalls[0], records)]}, date(2026, 11, 19))
+        forecast, projection = [build_facts([dict(result, metric='income')])[0]['binding'] for result in results[:2]]
+        self.assertEqual((forecast['historyWindow'], forecast['targetMonth'], forecast['metric']), (window, '2027-01', 'expense'))
+        self.assertEqual((projection['historyWindow'], projection['startMonth'], projection['endMonth'],
+                          projection['months'], projection['metric']), (window, '2027-01', '2027-03', 3, 'all'))
+
     def test_plan_validates_bounded_aggregate_arguments_and_forecast_direction(self):
         with self.assertRaises(ValidationError):
             AnalysisRequest.model_validate({'tool': 'aggregate', 'aggregate': {'groupBy': ['sql']}})

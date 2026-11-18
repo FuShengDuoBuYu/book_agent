@@ -528,3 +528,55 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([t.tool for t in follow.analyses if t.tool in {'budget','purchase'}],['budget'])
         other=await self.plan('家庭账本也按同样方式展开。',{**draft,'toolCalls':[{'id':'home','toolName':'search_family_orders'}]},saved)
         self.assertFalse({t.tool for t in other.analyses} & {'budget','purchase'})
+
+    async def test_explicit_new_goal_and_referenced_budget_are_both_executed_only_in_the_original_scope(self):
+        first=await self.plan('我本月预算300元，还剩多少？',{'analyses':[{'tool':'budget','budgetAmount':300}]},{})
+        saved=await self.save(first)
+        draft={'followUpOfPreviousQuestion':True,'analyses':[{'tool':'forecast','metric':'income'}],
+               'understanding':{'evidenceNeeds':['budget','forecast']}}
+        combined='把上次的结果再算一遍，另外预测下个月收入。'
+        follow=await self.plan(combined,draft,saved)
+        self.assertEqual({t.tool for t in follow.analyses},{'budget','forecast'})
+        self.assertEqual(next(t for t in follow.analyses if t.tool=='budget').budgetAmount,300)
+        self.assertEqual(next(t for t in follow.analyses if t.tool=='forecast').targetMonth,'2026-12')
+        for question, extra in [
+            ('预测下个月收入。',{'followUpOfPreviousQuestion':False}),
+            ('预测下个月收入。',{}),
+            (combined,{'resetAnalysisContext':True}),
+            (combined,{'toolCalls':[{'id':'home','toolName':'search_family_orders'}]}),
+        ]:
+            with self.subTest(question=question,extra=extra):
+                plan=await self.plan(question,{**draft,'analyses':[{'tool':'trends'}],**extra},saved)
+                self.assertIn('forecast',{t.tool for t in plan.analyses})
+                self.assertNotIn('budget',{t.tool for t in plan.analyses})
+
+    async def test_stated_purchase_is_computed_even_when_both_model_tool_lists_miss_it(self):
+        question='我下个月想花6000元买电脑，现在买合适吗？会影响后面的生活吗？'
+        draft={'understanding':{'objective':'评估购买电脑的可行性及生活影响','requestedAnswers':['判断是否合适'],
+                  'evidenceNeeds':['cashflow','savings','budget','runway']},'analyses':[
+                  {'tool':'cashflow','queryIds':['ledger'],'metric':'all'},{'tool':'budget','targetMonth':'2026-11'},
+                  {'tool':'runway','targetMonth':'2026-12'},{'tool':'savings','targetMonth':'2026-12'}]}
+        p=await self.plan(question,draft,{})
+        self.assertEqual({t.tool for t in p.analyses},{'purchase','cashflow'})
+        self.assertEqual(p.understanding.evidenceNeeds,['cashflow'])
+        purchase=next(t for t in p.analyses if t.tool=='purchase')
+        self.assertEqual((purchase.purchaseAmount,purchase.startingBalance),(6000,None))
+        rows=[{'year':2026,'month':m,'day':1,'costType':'工资','money':3000} for m in (8,9,10)]
+        result=collect_analysis_results(p,{'个人版':[(q,rows) for q in p.toolCalls]},date(2026,11,19))
+        e=next(r['evidence'] for r in result if r['tool']=='purchase')
+        self.assertEqual(e['purchaseAmount'],6000)
+        self.assertIn('startingBalance',e['missingInputs'])
+
+    async def test_unlisted_savings_goal_keeps_historical_support_and_uses_the_stated_conditions(self):
+        draft={'understanding':{'objective':'核算是否可达到目标','evidenceNeeds':['trends']},'analyses':[{'tool':'trends'}]}
+        p=await self.plan('现在有10000元，想三个月存到20000元，能做到吗？',draft,{})
+        self.assertEqual({t.tool for t in p.analyses},{'savings','trends'})
+        t=next(t for t in p.analyses if t.tool=='savings')
+        self.assertEqual((t.startingBalance,t.targetAmount,t.months),(10000,20000,3))
+
+    async def test_new_goal_recovery_does_not_add_decisions_to_past_purchase_or_history_of_forecasts(self):
+        draft={'understanding':{'evidenceNeeds':['sources']},'analyses':[{'tool':'sources'}]}
+        for q in ('我上个月买过电脑吗？','统计上个月备注写着“预测”的收入来源。'):
+            with self.subTest(q=q):
+                p=await self.plan(q,draft,{})
+                self.assertEqual([t.tool for t in p.analyses],['sources'])

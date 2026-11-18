@@ -43,13 +43,12 @@ class ModelConfigurationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(planner.reasoning)
 
     def test_native_report_keeps_natural_expression_with_a_grounding_contract(self):
-        from app.schemas.report import ReportDraft
+        from app.agent.report_composition import ReportComment
         with patch.dict(os.environ, {'LLM_PROVIDER': 'ollama'}, clear=True):
-            writer = get_structured_model(ReportDraft, reasoning=False, num_predict=2048)
-        fields = writer.kwargs['format']['$defs']['ReportSection']['properties']
-        self.assertIn('事实句', fields['analysis']['description'])
+            writer = get_structured_model(ReportComment, reasoning=False, num_predict=768)
+        fields = writer.kwargs['format']['properties']
+        self.assertIn('不重新计算', fields['analysis']['description'])
         self.assertNotIn('pattern', fields['analysis'])
-        self.assertNotIn('pattern', fields['title'])
 
     def setUp(self):
         for factory in (get_settings, get_chat_model, get_planner_model, get_structured_model):

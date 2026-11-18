@@ -13,7 +13,7 @@ from time import perf_counter
 from app.agent.artifacts import render_artifacts_markdown
 from app.agent.report_context import build_report_context, repair_context
 from app.agent.report_composition import (compose_report, ReportOutline, ReportComment,
-                                          OUTLINE_PROMPT, OUTLINE_TOKENS, COMMENT_TOKENS)
+                                          outline_schema, OUTLINE_PROMPT, OUTLINE_TOKENS, COMMENT_TOKENS)
 from app.tools.financial_analysis import shift_month
 from app.agent.report_values import (expand_values, literal, literal_links, numerical_issues,
                                      quantity as q, sanitize_fact, value_catalog)
@@ -37,6 +37,8 @@ def money(value):
 
 
 def build_facts(results):
+    from app.agent.evidence_pipeline import computed_metric
+
     facts = []
 
     def add(text, required=False, values=(), model_text=None, binding=None):
@@ -84,8 +86,11 @@ def build_facts(results):
         tool, e = result['tool'], result['evidence']
         scope = result.get('mode', '当前账本')
         base_binding = {key: value for key, value in {
-            'tool': tool, 'scope': scope, 'metric': result.get('metric') or e.get('metric') or e.get('catalogMetric'),
-            'historyWindow': result.get('historyWindow'),
+            'tool': tool, 'scope': scope, 'metric': computed_metric(tool, e),
+            'historyWindow': result.get('historyWindow') if tool != 'budget' else None,
+            'month': e.get('month') if tool == 'budget' else None,
+            'targetMonth': e.get('targetMonth') if tool == 'forecast' else None,
+            **({key: e.get(key) for key in ('startMonth', 'endMonth', 'months')} if tool == 'projection' else {}),
             'aggregation': {'sources': 'recorded_source_total', 'forecast': 'conditional_month_forecast',
                             'projection': 'conditional_period_projection', 'aggregate': 'filtered_aggregation',
                             'changes': 'recorded_period_comparison'}.get(tool, 'computed_evidence'),
@@ -135,6 +140,7 @@ def build_facts(results):
                 amounts = '、'.join(f"{labels[name]} {money(row[name])} 元" for name in measures)
                 add(f"区间 {literal(row['period'])} 按当前筛选的完整已记小计：{amounts}，共 {row['count']} 笔。"
                     '重叠日期在各区间内分别统计，不能再将各期小计相加当作并集总额。', True,
+                    binding={'period': row['period'], 'aggregation': 'filtered_period_total'},
                     values=[q('区间' + labels[name] + '小计', row[name]) for name in measures]
                         + [q('区间笔数', row['count'], '笔')])
             for row in e.get('periodComparisons', []):
@@ -142,6 +148,7 @@ def build_facts(results):
                     continue
                 add(f"筛选后区间总额比较，{literal(row['beforePeriod'])} 至 {literal(row['afterPeriod'])}的已记{labels[row['metric']]}"
                     f"从 {money(row['before'])} 元变为 {money(row['after'])} 元，变化 {money(row['change'])} 元。", True,
+                    binding={key: row[key] for key in ('metric', 'beforePeriod', 'afterPeriod')},
                     values=[q('区间前期总额', row['before']), q('区间后期总额', row['after']),
                             q('区间总额变化', row['change']), q('区间总额变化率', row.get('changePercent'), '%')])
             for row in e['rows'][:8]:
@@ -192,11 +199,14 @@ def build_facts(results):
                 add(f"{member}在查询区间内的已记{label}小计 {money(row['amount'])} 元，共 {row['recordCount']} 笔。"
                     + ('已记收入包括该方向所有入账，不直接当作持续性收入。' if row['metric'] == 'income' else ''),
                     result.get('mode') == '家庭版',
+                    binding={'aggregation': 'recorded_member_total', 'metric': row['metric'], 'member': member,
+                             'memberKey': row.get('memberKey')},
                     values=[q('该成员查询期' + label + '小计', row['amount']), q('该成员' + label + '账单笔数', row['recordCount'], '笔')])
             for row in e.get('sources', [])[:8]:
                 label = '收入' if row['metric'] == 'income' else '支出'
                 summary = f"{row.get('member', '归属未知')}的{label}来源“{row['source']}”已记录 {money(row['amount'])} 元，备注依据："
                 add(summary + '；'.join(row.get('remarks', [])) + '。',
+                    binding={key: row[key] for key in ('metric', 'member', 'memberKey', 'source', 'sourceKey') if key in row},
                     model_text=summary + '；'.join(str(remark)[:80] for remark in row.get('remarks', [])[:2]) + '。',
                     values=[q('金额', row['amount']), q('账单笔数', row.get('recordCount'), '笔')] + [q('账单月份', month, 'month') for month in row.get('monthlyAmounts', {})])
             if e.get('omittedSourceCount'):
@@ -239,6 +249,7 @@ def build_facts(results):
                 summary = f"{row.get('member', '归属未知')}的“{row['source']}”{historical}条件估计 {money(row.get('estimate'))} 元。备注依据："
                 exclusion = '此项为已剔除的入账，不计入持续收入。' if row.get('excluded') else ''
                 add(summary + '；'.join(row.get('remarks', [])) + '。' + exclusion,
+                    binding={'metric': 'income', **{key: row[key] for key in ('member', 'memberKey', 'source', 'sourceKey') if key in row}},
                     model_text=summary + '；'.join(str(remark)[:80] for remark in row.get('remarks', [])[:2]) + '。' + exclusion,
                     values=[q('该来源预测贡献', row.get('estimate')), q('该来源历史样本入账', row.get('amount'))])
             if e.get('excludedIncomeTotal'):
@@ -465,7 +476,10 @@ class EvidenceReporter:
         output_limit = {ReportReview: 512, ReportOutline: OUTLINE_TOKENS, ReportComment: COMMENT_TOKENS}[schema]
         if get_settings().llm_provider != 'ollama':
             system += '\n必须遵守的 JSON schema：' + json.dumps(schema.model_json_schema(), ensure_ascii=False, separators=(',', ':'))
-        response = await asyncio.wait_for(get_structured_model(schema, reasoning=False, num_predict=output_limit).ainvoke([
+        model = get_structured_model(schema, reasoning=False, num_predict=output_limit)
+        if schema is ReportOutline and get_settings().llm_provider == 'ollama':
+            model = model.bind(format=outline_schema(payload))
+        response = await asyncio.wait_for(model.ainvoke([
             ('system', system),
             ('human', json.dumps(payload, ensure_ascii=False, separators=(',', ':')))]),
             timeout=get_settings().request_timeout_seconds if schema is ReportReview else get_settings().planner_timeout_seconds)
