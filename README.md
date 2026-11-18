@@ -64,6 +64,7 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
 ## 模型回归
 
 ```sh
+python -m scripts.check_model_contract
 python -m scripts.evaluate_analysis
 python -m scripts.evaluate_analysis --case scenario --case forecast
 python -m scripts.evaluate_acceptance
@@ -73,6 +74,8 @@ python -m scripts.evaluate_intent --case forecast_followups --output intent-resu
 ```
 
 上述命令使用配置中的模型，但账本及记忆由虚构样本替代，不访问用户数据库。输出 JSONL 包含问题类型、所选工具、数值检查和回答，可用于比较模型与提示词。程序检查不能替代对解释是否准确、是否把推断说成事实的人工复核。
+
+修改模型或推理服务后，先运行 `check_model_contract`。它用没有账本数据的最小请求核对结构化输出是否真的受约束；只返回普通文字、字段或常量不匹配都算失败。`/ready` 列出模型并不能替代这个检查。家庭主机的 Ollama 0.21.2 已复现 Qwen3.5 在 `think=false` 时忽略格式约束的兼容问题，见 [上游修复](https://github.com/ollama/ollama/pull/15901)。固定运行时的验证和切换流程见架构文档。
 
 `evaluate_intent` 针对信息利用和连续追问：同项目不同备注的语义归并、非默认目标月份保持、备注质疑后查证、来源到总额的计算方法、家庭同备注不同成员、支出变化、保护项和缺少余额时的购买判断，以及筛选后跨期分类统计、承接日期范围的星期分组。按实际交付内容验收，不只检查答案是否非空或包含金额。两月样本与默认三月基准分别核算，不把改变时间口径当作同一组标准答案。
 

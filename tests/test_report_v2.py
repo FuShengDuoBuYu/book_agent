@@ -77,6 +77,17 @@ class ReportContractTests(unittest.TestCase):
 
 
 class ReportFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_old_answer_amounts_do_not_prime_fresh_fact_generation(self):
+        reporter = EvidenceReporter()
+        reporter._draft = AsyncMock(return_value=ReportDraft.model_validate({'sections': [
+            {'title': '来源解释', 'factIds': ['f1'], 'analysis': '应以本轮重新核算的来源和条件解释结果。'}]}))
+        reporter._review = AsyncMock(return_value=[])
+        await reporter.answer('按刚才情况解释', {'targetMonth': '2027-01', 'activeAnalyses': [{'tool': 'forecast'}]},
+            [forecast_result()], history='助手: 2027-01 净额变化7,740元，但不是当前余额。')
+        payload = reporter._draft.await_args.args[0]
+        self.assertNotIn('7,740', payload['history'])
+        self.assertIn('2027-01', payload['history'])
+        self.assertNotIn('activeAnalyses', payload['userConditions'])
     async def test_goal_and_prior_answer_reach_both_writer_and_reviewer(self):
         from app.agent.artifacts import build_artifacts
         reporter = EvidenceReporter()

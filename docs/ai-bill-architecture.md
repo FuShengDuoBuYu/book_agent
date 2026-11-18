@@ -62,3 +62,11 @@ agent/.venv/bin/python agent/deploy/run-home.py --existing-env /root/apps/book-a
 `aggregate` 使用声明式分组、筛选与最多八个比较区间，不执行模型生成的 SQL 或代码。它返回实际查询覆盖、筛选审计、完整范围的去重总计和有上限的分组行。确定性表格保留全部已返回分组，即使叙述只选择主要发现。叙述金额按本段引用的计算字段及单位核验，备注里的编号不能被当成金额，校验失败反馈给模型修正，失败后保留相关结果。
 
 共享 GPU 的发布验收还需记录显存峰值、其他任务占用、上下文长度、GPU 层数和空闲释放时间。降低驻留时间只减少空闲占用，不能替代运行峰值测试。参数通过 Agent 请求传给 Ollama，无需更改其他 GPU 服务。
+
+## 结构化推理运行时
+
+家庭主机原有 Ollama 0.21.2 对 Qwen3.5 的 `think=false` 加 JSON Schema 请求曾直接返回普通中文，导致规划或报告在读取账本前后反复失败。这与 [Ollama 上游问题及修复](https://github.com/ollama/ollama/pull/15901) 对应；发布前必须验证实际协议能力，不能只检查版本或模型名称。
+
+固定运行时在 `/opt/ai-bill/runtimes/ollama-v0.40.16`，官方发布包的大小和 SHA-256 直接与 GitHub 发布元数据核对后使用。先以临时 `app-ai-bill-ollama.service` 绑定 `127.0.0.1:11435` 验证，复用现有模型目录；原服务在验证期间保持原配置。
+
+发布顺序是启动验证实例、通过 `python -m scripts.check_model_contract`、完成模型质量回放，再停止验证实例，通过现有 `app-ollama.service` 的 drop-in 切换到已验证的二进制。原来的监听地址、模型目录和账号由现有服务继续配置，Agent 继续使用 `127.0.0.1:11434`，其他现有 API 路由无需改变。仓库提供 `deploy/ollama-runtime.conf.example`。生产复用同一个运行时，保持单路推理、最多一个驻留模型和一分钟空闲释放；模型不随应用发布复制。比较两个运行时时串行测试，等待前一个模型释放。Agent 发布和运行时配置都保留原版本，方便回滚。

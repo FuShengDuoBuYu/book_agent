@@ -20,7 +20,7 @@ MONTH_SERIES = re.compile(
 )
 DATE_UNIT = re.compile(r'\s*(?!笔数|笔均|天数|次数|次月)(?:元|块|%|％|个月|笔|天|次)')
 ORDINAL = re.compile(r'(?m)^[ \t]*(?:#{1,6}[ \t]+)?(?:[（(]\d{1,2}[）)]|\d{1,2}[.)）、．])[ \t]*(?!元|块|个月|笔|天|次)(?=[A-Za-z\u3400-\u9fff*])')
-NUMBER_UNIT = re.compile(r'([-+]?\d+(?:,\d{3})*(?:\.\d+)?)\s*(元|块|%|％|个月|笔|天|次|个|项)')
+NUMBER_UNIT = re.compile(r'([-+]?\d+(?:,\d{3})*(?:\.\d+)?)\s*(元|块|%|％|个月|笔|天|次|个|项|组)')
 
 
 def literal(value):
@@ -171,7 +171,7 @@ def numerical_issues(text, fact_ids, facts):
         row = by_id.get(match[1])
         if not row or row['factId'] not in fact_ids:
             issues.append('数量引用必须来自本段 factIds 所引用的计算事实')
-        if re.match(r'\s*(元|块|%|％|个月|笔|天|次|个|项)', text[match.end():]):
+        if re.match(r'\s*(元|块|%|％|个月|笔|天|次|个|项|组)', text[match.end():]):
             issues.append('数量引用已包含单位，不能另外添加或更换单位')
     remainder = REFERENCE.sub('', text)
     calendars = {str(row['value']) for row in allowed if row['unit'] in {'month', 'date'}}
@@ -183,7 +183,7 @@ def numerical_issues(text, fact_ids, facts):
         candidates = {Decimal(str(row['value'])) for row in allowed
                       if row['unit'] == canonical and isinstance(row['value'], (int, float))}
         return '' if Decimal(first.replace(',', '')) in candidates and Decimal(last.replace(',', '')) in candidates else match[0]
-    remainder = re.sub(r'([-+]?\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:～|~|至|到|—|–)\s*([-+]?\d+(?:,\d{3})*(?:\.\d+)?)\s*(元|块|%|％|个月|笔|天|次|个|项)', quantity_range, remainder)
+    remainder = re.sub(r'([-+]?\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:～|~|至|到|—|–)\s*([-+]?\d+(?:,\d{3})*(?:\.\d+)?)\s*(元|块|%|％|个月|笔|天|次|个|项|组)', quantity_range, remainder)
     def quantity(match):
         raw, unit = match.groups()
         canonical = {'块': '元', '％': '%'}.get(unit, unit)

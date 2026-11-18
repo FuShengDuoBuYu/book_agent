@@ -5,6 +5,18 @@ from app.schemas.plan import AgentPlan
 
 
 class InvestigationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_aggregate_dates_are_json_safe_in_model_payload_and_saved_audit(self):
+        import json
+        from app.agent.investigation import EvidenceInvestigator, InvestigationDecision
+        spec = {'periods': [{'label': '十月', 'startDate': '2026-10-01', 'endDate': '2026-10-31'}]}
+        plan = AgentPlan.model_validate({'toolCalls': [{'id': 'ledger', 'toolName': 'search_personal_orders'}],
+            'analyses': [{'tool': 'aggregate', 'aggregate': spec}]})
+        investigator = EvidenceInvestigator()
+        investigator._invoke = AsyncMock(return_value=InvestigationDecision.model_validate({'additionalAnalyses': [
+            {'tool': 'aggregate', 'queryIds': ['ledger'], 'aggregate': spec}]}))
+        _, audit = await investigator.refine('按月比较', '', plan, [])
+        json.dumps(investigator._invoke.await_args.args[0])
+        self.assertIn('2026-10-01', json.dumps(audit))
     async def test_invalid_model_structure_is_repaired_once_using_the_same_evidence(self):
         from app.agent.investigation import EvidenceInvestigator, InvestigationDecision
         investigator = EvidenceInvestigator()

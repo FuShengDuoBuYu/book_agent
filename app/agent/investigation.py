@@ -92,7 +92,7 @@ class EvidenceInvestigator:
                 findings.append({'mode': result.get('mode'), 'tool': result['tool'], 'evidence': summary})
             payload = {'question': question, 'history': history[-2400:],
                 'understanding': plan.understanding.model_dump(),
-                'currentAnalyses': [task.model_dump(exclude_none=True) for task in plan.analyses],
+                'currentAnalyses': [task.model_dump(mode='json', exclude_none=True) for task in plan.analyses],
                 'authorizedQueries': sorted({key for call in plan.toolCalls for key in (call.sourceIds or [call.id])}),
                 'observations': compact, 'computedFindings': findings}
             for attempt in range(2):
@@ -129,7 +129,7 @@ class EvidenceInvestigator:
                     continue
                 safe.append(task)
             decision.additionalAnalyses = safe
-            return decision, {'status': 'refined', 'decision': decision.model_dump(), 'issues': issues,
+            return decision, {'status': 'refined', 'decision': decision.model_dump(mode='json'), 'issues': issues,
                               'observedSources': len(mapping), 'call': getattr(self, '_last_call', {})}
         except Exception as exc:
             detail = '; '.join(f"{row['loc']}: {row['msg']}" for row in exc.errors()) if hasattr(exc, 'errors') else str(exc)

@@ -38,6 +38,7 @@ def build_facts(results):
                               [('income', '完整月份月均收入'), ('expense', '完整月份月均支出'), ('net', '完整月份月均结余')])
                 values.append(q('完整月份结余率', average.get('netIncomeRatioPercent'), '%'))
                 values.extend(q('参考月份', month, 'month') for month in average.get('months', []))
+                values.extend(q('完整月份数', len(average.get('months', [])), unit) for unit in ('个', '个月'))
             else:
                 fields = {'scenario': ['income', 'expense', 'net', 'baselineNet', 'netChange'],
                           'savings': ['projectedBalance', 'targetAmount']}.get(tool, [])
@@ -130,9 +131,9 @@ def build_facts(results):
         elif tool == 'sources':
             for row in e.get('sources', [])[:8]:
                 label = '收入' if row['metric'] == 'income' else '支出'
-                add(f"{row.get('member', '归属未知')}的{label}来源“{row['source']}”已记录 {money(row['amount'])} 元，备注依据：{'；'.join(row.get('remarks', []))}。", values=[q('金额', row['amount'])] + [q('账单月份', month, 'month') for month in row.get('monthlyAmounts', {})])
+                add(f"{row.get('member', '归属未知')}的{label}来源“{row['source']}”已记录 {money(row['amount'])} 元，备注依据：{'；'.join(row.get('remarks', []))}。", values=[q('金额', row['amount']), q('账单笔数', row.get('recordCount'), '笔')] + [q('账单月份', month, 'month') for month in row.get('monthlyAmounts', {})])
             if e.get('omittedSourceCount'):
-                add(f"来源摘要另有 {e['omittedSourceCount']} 项未展开，不能据摘要断言不存在其他来源。", True)
+                add(f"来源摘要另有 {e['omittedSourceCount']} 项未展开，不能据摘要断言不存在其他来源。", True, values=[q('省略来源', e['omittedSourceCount'], '项')])
         elif tool == 'changes':
             add(f"从 {e['from']} 到 {e['to']}，收入变化 {money(e['incomeChange'])} 元，支出变化 {money(e['expenseChange'])} 元，结余变化 {money(e['netChange'])} 元。", True, values=[q('from', e['from'], 'month'), q('to', e['to'], 'month'), q('incomeChange', e['incomeChange']), q('expenseChange', e['expenseChange']), q('netChange', e['netChange'])])
             if e.get('before') and e.get('after'):
@@ -148,9 +149,9 @@ def build_facts(results):
         elif tool == 'recurring':
             for direction, label in (('income', '收入'), ('expense', '支出')):
                 for row in e.get(direction, [])[:4]:
-                    add(f"重复出现的{label}“{row['source']}”：有记录月份 {row['activeMonths']} 个，合计 {row['transactions']} 笔，完整月份的月度中位数 {money(row['typicalAmount'])} 元。重复出现不保证未来继续发生。", values=[q('activeMonths', row['activeMonths'], '个月'), q('transactions', row['transactions'], '笔'), q('typicalAmount', row['typicalAmount'])])
+                    add(f"重复出现的{label}“{row['source']}”：有记录月份 {row['activeMonths']} 个，合计 {row['transactions']} 笔，完整月份的月度中位数 {money(row['typicalAmount'])} 元。重复出现不保证未来继续发生。", values=[q('activeMonths', row['activeMonths'], '个月'), q('有记录月份数', row['activeMonths'], '个'), q('transactions', row['transactions'], '笔'), q('typicalAmount', row['typicalAmount'])])
         elif tool in {'anomalies', 'data_quality'}:
-            add(f"检测到疑似重复组 {len(e['possibleDuplicates'])} 组；同类样本不足的类别包括：{'、'.join(row['category'] for row in e['insufficientCategories']) or '无'}。未命中规则不能证明账本完整或无误。", True)
+            add(f"检测到疑似重复组 {len(e['possibleDuplicates'])} 组；同类样本不足的类别包括：{'、'.join(row['category'] for row in e['insufficientCategories']) or '无'}。未命中规则不能证明账本完整或无误。", True, values=[q('疑似重复组数', len(e['possibleDuplicates']), '组')])
             for row in e['possibleDuplicates'][:3]:
                 add('待核查重复线索：' + literal(json.dumps(row, ensure_ascii=False)))
             if tool == 'anomalies':
@@ -197,9 +198,11 @@ def build_facts(results):
             if change.get('sufficientData'):
                 drivers = [row for row in change.get('expenseDrivers', []) if row['change']]
                 if drivers:
-                    add('最近完整月份的支出变化包括：' + '；'.join(f"{row['name']}变化 {money(row['change'])} 元" for row in drivers[:3]) + '。未来是否重复、是否还有其他大额安排，是测算前需要确认的变数；无法仅凭账本确定最大的未来风险。', True)
+                    add('最近完整月份的支出变化包括：' + '；'.join(f"{row['name']}变化 {money(row['change'])} 元" for row in drivers[:3]) + '。未来是否重复、是否还有其他大额安排，是测算前需要确认的变数；无法仅凭账本确定最大的未来风险。', True,
+                        values=[q(row['name'] + '变化', row['change']) for row in drivers[:3]])
         elif tool == 'income_stability':
-            add(f"已观察的完整月份共 {len(e['observedMonths'])} 个，月收入最低 {money(e['incomeMin'])} 元、最高 {money(e['incomeMax'])} 元、中位数 {money(e['incomeMedian'])} 元。仅说明已记录历史的波动。", True, values=[q('incomeMin', e['incomeMin']), q('incomeMax', e['incomeMax']), q('incomeMedian', e['incomeMedian'])])
+            add(f"已观察的完整月份共 {len(e['observedMonths'])} 个，月收入最低 {money(e['incomeMin'])} 元、最高 {money(e['incomeMax'])} 元、中位数 {money(e['incomeMedian'])} 元。仅说明已记录历史的波动。", True, values=[q('incomeMin', e['incomeMin']), q('incomeMax', e['incomeMax']), q('incomeMedian', e['incomeMedian'])] +
+                [q('完整月份数', len(e['observedMonths']), unit) for unit in ('个', '个月')] + [q('完整月份', month, 'month') for month in e['observedMonths']])
             for row in e['sources'][:3]:
                 add(f"历史收入来源“{row['source']}”累计 {money(row['amount'])} 元，占已记录收入 {row['sharePercent']}%。来源集中意味着该来源变化需要重点测算，并不证明它将减少。", True, values=[q('金额', row['amount']), q('sharePercent', row['sharePercent'], '%')])
         elif tool == 'optimization':
@@ -412,8 +415,14 @@ class EvidenceReporter:
         facts = [row for row in facts if row['required']] + [row for row in facts if not row['required']][:18]
         artifacts = artifacts or []
         artifact_preview = [{**row, 'rows': row['rows'][:12], 'totalRows': len(row['rows'])} for row in artifacts[:8]]
-        base_payload = {'question': question, 'history': history[-3200:], 'instruction': instruction,
-                        'understanding': understanding or {}, 'userConditions': {key: value for key, value in context.items() if key != 'conversation'},
+        # History resolves referents; fresh computed facts supply financial values.
+        # Explicit user conditions remain in the canonical scoped state below.
+        report_history = re.sub(r'[-+]?\d+(?:,\d{3})*(?:\.\d+)?\s*(?:元|块|%|％)',
+                                '[历史数量以本轮证据为准]', history[-3200:])
+        conditions = {key: value for key, value in context.items()
+                      if key not in {'conversation', 'activeAnalyses', 'activeHistoryWindow', 'scope'}}
+        base_payload = {'question': question, 'history': report_history, 'instruction': instruction,
+                        'understanding': understanding or {}, 'userConditions': conditions,
                         'artifacts': artifact_preview}
         previous = context.get('previousMonths')
         projection = next((row['evidence'] for row in results if row['tool'] == 'projection' and row['evidence'].get('sufficientData')), None)
@@ -421,7 +430,9 @@ class EvidenceReporter:
             extra = (projection['months'] - previous) * projection['monthlyNet']
             facts.append({'id': 'extension', 'required': True, 'text':
                 f"期限由 {previous} 个月延长至 {projection['months']} 个月，在同一假设下累计新增结余增加 {money(extra)} 元，月度结余仍是 {money(projection['monthlyNet'])} 元。"
-                + ('未给出明确存款目标，尚不能计算所需月结余能降低多少。' if context.get('targetAmount') is None else '')})
+                + ('未给出明确存款目标，尚不能计算所需月结余能降低多少。' if context.get('targetAmount') is None else ''),
+                'values': [q('原期限', previous, '个月'), q('新期限', projection['months'], '个月'),
+                           q('新增结余增量', extra), q('月度结余', projection['monthlyNet'])]})
         issues, attempts, previous = [], [], None
         for attempt in range(2):
             try:
