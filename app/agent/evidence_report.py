@@ -31,6 +31,8 @@ def build_facts(results):
         if tool == 'forecast' and required:
             values.extend(q('参考月份', month, 'month') for month in e.get('baselineMonths', []))
             values.append(q('参考月份数', len(e.get('baselineMonths', [])), '个月'))
+            values.extend(q('历史观察月份', month, 'month') for month in e.get('observedMonths', []))
+            values.extend(q('历史观察月份数', len(e.get('observedMonths', [])), unit) for unit in ('个', '个月'))
         if text == e.get('computedConclusion'):
             if tool == 'cashflow':
                 average = e.get('completeMonthAverage', {})
@@ -164,7 +166,9 @@ def build_facts(results):
             label = {'income': '收入', 'expense': '支出', 'net': '结余'}[e['metric']]
             add(f"假设历史模式延续，{e['targetMonth']} 的月度{label}基准 {money(e['estimate'])} 元，历史情景范围 {money(e['lower'])}～{money(e['upper'])} 元。基准参考月份：{'、'.join(e['baselineMonths'])}。这是条件估计，历史范围不是保证或置信区间。", True, values=[q('预测月份', e['targetMonth'], 'month'), q('预测基准', e['estimate']), q('历史情景下界', e['lower']), q('历史情景上界', e['upper'])])
             if e.get('method'):
-                add('计算方法：' + e['method'])
+                observed = '历史观察月份：' + '、'.join(e['observedMonths']) + '。' if e.get('observedMonths') else ''
+                add('计算方法：' + e['method'] + observed,
+                    values=[q('历史观察月份', month, 'month') for month in e.get('observedMonths', [])])
             for row in e.get('sourceForecasts', [])[:8]:
                 historical = f"历史样本入账 {money(row['amount'])} 元，" if row.get('amount') is not None else ''
                 add(f"{row.get('member', '归属未知')}的“{row['source']}”{historical}条件估计 {money(row.get('estimate'))} 元。备注依据：{'；'.join(row.get('remarks', []))}。" + ('此项为已剔除的入账，不计入持续收入。' if row.get('excluded') else ''),
