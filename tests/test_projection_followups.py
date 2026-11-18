@@ -13,6 +13,20 @@ from app.schemas.plan import AgentPlan
 
 
 class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
+    async def test_calendar_expansion_keeps_one_logical_scope_for_explicit_decision(self):
+        from app.agent.planner import QueryPlanner
+        from app.schemas.plan import AgentPlan
+        planner = QueryPlanner.__new__(QueryPlanner)
+        plan = AgentPlan(understanding={'objective': '判断购买扫描仪所缺的条件',
+            'evidenceNeeds': ['totals', 'sources', 'forecast', 'quality']}, analyses=[{'tool': 'cashflow'}],
+            toolCalls=[{'id': f'ledger_{month}', 'sourceIds': ['ledger'], 'toolName': 'search_personal_orders',
+                        'args': {'year': 2026, 'month': month}} for month in [9, 10]])
+        planner._materialize_requirements(plan, '按刚才讲的情况，我现在能直接拿七百元买扫描仪吗？还需要什么信息才能判断？')
+        purchase = next((t for t in plan.analyses if t.tool == 'purchase'), None)
+        self.assertIsNotNone(purchase)
+        self.assertEqual(purchase.purchaseAmount, 700)
+        self.assertIsNone(purchase.startingBalance)
+
     async def plan(self, text, draft, previous):
         planner = QueryPlanner.__new__(QueryPlanner)
         planner.chain = SimpleNamespace(ainvoke=AsyncMock(return_value=SimpleNamespace(content=json.dumps(draft))))

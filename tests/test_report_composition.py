@@ -23,6 +23,17 @@ def payload_for_composition():
     }
 
 
+WINDOW = {'startDate': '2026-08-01', 'endDate': '2026-10-31'}
+
+
+def bound_fact(identifier, text, group, tool, *, headline=False, primary=True, scope='个人版', window=WINDOW, **extra):
+    binding = {'resultGroup': group, 'tool': tool, 'scope': scope, 'historyWindow': window,
+               'metric': 'income', 'primary': primary, **extra}
+    if headline:
+        binding['headline'] = True
+    return {'id': identifier, 'text': text, 'required': headline and primary, 'binding': binding}
+
+
 class FakeComposition:
     def __init__(self, *sections):
         self.outline = {'sections': list(sections)}
@@ -137,6 +148,99 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, '预算'):
             await compose_report(payload, fake.invoke)
         self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline])
+
+    async def test_forecast_parts_share_the_computed_headline_and_may_merge(self):
+        payload = payload_for_composition()
+        goals = ['解释收入构成', '核对预测合计', '说明数据来源']
+        payload['understanding']['requestedAnswers'] = goals
+        payload['facts'] = [
+            bound_fact('f1', '条件预测为 3,700 元。', 'g1', 'forecast', headline=True),
+            bound_fact('f5', '各来源按参考月份分别计算。', 'g1', 'forecast', headline=True),
+            bound_fact('f2', '历史样本共 19,000 元。', 'g1', 'forecast', source='项目收入'),
+            bound_fact('f3', '同范围历史来源汇总。', 'g2', 'sources', source='项目明细', primary=False),
+            bound_fact('f4', '另一个账本的总额是 83,700 元。', 'g3', 'aggregate', scope='家庭版'),
+        ]
+        payload['values'] = {'v1': 'f1 条件预测 = 3,700 元', 'v2': 'f2 历史样本 = 19,000 元',
+                             'v12': 'f4 总额 = 83,700 元'}
+        fake = FakeComposition(section('收入构成', goals[0], 'f2'), section('分析结论', goals[1], 'f1'),
+                               section('统计口径', goals[2], 'f3'))
+        draft = await compose_report(payload, fake.invoke)
+        self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline, ReportComment])
+        self.assertEqual(set(draft.sections[0].factIds), {'f1', 'f2', 'f3', 'f5'})
+        comment = fake.calls[-1][1]
+        self.assertEqual(comment['section']['answerGoals'], goals)
+        self.assertEqual({row['text'] for row in comment['computedFacts']},
+                         {row['text'] for row in payload['facts'][:4]})
+        self.assertEqual(comment['values'], {'v1': '条件预测 = 3,700 元', 'v2': '历史样本 = 19,000 元'})
+        self.assertNotIn('83,700', repr(comment))
+        inventory = comment['availableEvidence']
+        self.assertTrue(any(row['tool'] == 'forecast' and row.get('sourceBreakdown') for row in inventory))
+        self.assertTrue(any(row['tool'] == 'aggregate' and row['scope'] == '家庭版' for row in inventory))
+        self.assertNotIn('项目收入', repr(inventory))
+
+    async def test_history_with_different_scope_window_or_missing_window_does_not_inherit_headline(self):
+        payload = payload_for_composition()
+        goal = payload['understanding']['requestedAnswers'][0]
+        payload['facts'] = [
+            bound_fact('f1', '预测合计为 3,700 元。', 'g1', 'forecast', headline=True),
+            bound_fact('f2', '另一期间的个人账本来源。', 'g2', 'sources',
+                       window={'startDate': '2026-07-01', 'endDate': '2026-07-31'}),
+            bound_fact('f3', '同一期间的家庭账本来源。', 'g3', 'sources', scope='家庭版'),
+            bound_fact('f4', '范围未确认的来源。', 'g4', 'sources', window=None),
+        ]
+        fake = FakeComposition(section('变化来源', goal, 'f2'), section('收入构成', goal, 'f3'),
+                               section('统计口径', goal, 'f4'))
+        draft = await compose_report(payload, fake.invoke)
+        self.assertEqual([row.factIds for row in draft.sections], [['f2'], ['f3'], ['f4'], ['f1']])
+        self.assertEqual(draft.sections[-1].analysis, '')
+        for _, comment in fake.calls[1:]:
+            self.assertNotIn('3,700', repr(comment))
+
+    async def test_same_window_alternative_forecasts_are_not_borrowed_by_history(self):
+        payload = payload_for_composition()
+        goal = payload['understanding']['requestedAnswers'][0]
+        payload['facts'] = [
+            bound_fact('f1', '第一种预测。', 'g1', 'forecast', headline=True),
+            bound_fact('f2', '第二种预测。', 'g2', 'forecast', headline=True),
+            bound_fact('f3', '历史来源。', 'g3', 'sources', primary=False),
+        ]
+        fake = FakeComposition(section('统计口径', goal, 'f3'))
+        draft = await compose_report(payload, fake.invoke)
+        self.assertEqual([row.factIds for row in draft.sections], [['f3'], ['f1', 'f2']])
+        self.assertEqual(draft.sections[-1].analysis, '')
+
+    async def test_different_filters_do_not_inherit_headline_in_the_same_book_and_window(self):
+        payload = payload_for_composition()
+        goal = payload['understanding']['requestedAnswers'][0]
+        payload['facts'] = [
+            bound_fact('f1', '目标分类的条件预测。', 'g1', 'forecast', headline=True,
+                       filters=[{'category': '工资'}]),
+            bound_fact('f2', '另一分类的历史来源。', 'g2', 'sources', filters=[{'category': '稿费'}]),
+        ]
+        fake = FakeComposition(section('统计口径', goal, 'f2'))
+        draft = await compose_report(payload, fake.invoke)
+        self.assertEqual([row.factIds for row in draft.sections], [['f2'], ['f1']])
+        self.assertEqual(draft.sections[-1].analysis, '')
+
+    async def test_headline_dependency_over_capacity_raises_without_discarding_selected_facts(self):
+        payload = payload_for_composition()
+        goal = payload['understanding']['requestedAnswers'][0]
+        payload['facts'] = [bound_fact('f1', '预测合计。', 'g1', 'forecast', headline=True)] + [
+            bound_fact(f'f{i}', '来源预测贡献。', 'g1', 'forecast') for i in range(2, 10)
+        ]
+        fake = FakeComposition(section('收入构成', goal, *(f'f{i}' for i in range(2, 10))))
+        with self.assertRaisesRegex(ValueError, '主结论.*8'):
+            await compose_report(payload, fake.invoke)
+        self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline])
+
+    async def test_duplicate_evidence_sections_keep_only_existing_answer_goals(self):
+        payload = payload_for_composition()
+        goals = ['解释哪些类别增加', '核对统计口径']
+        payload['understanding']['requestedAnswers'] = goals
+        fake = FakeComposition(section('变化来源', goals[0], 'f1'), section('统计口径', goals[1], 'f1'))
+        draft = await compose_report(payload, fake.invoke)
+        self.assertEqual([row.factIds for row in draft.sections], [['f1']])
+        self.assertEqual(fake.calls[1][1]['section']['answerGoals'], goals)
 
 
 if __name__ == '__main__':

@@ -67,6 +67,8 @@ def build_facts(results):
         fact = {'id': f'f{len(facts) + 1}', 'text': sanitize_fact(prefix + text, result),
                 'required': required and not result.get('supplemental', False), 'values': values,
                 'binding': {**base_binding, **(binding or {})}}
+        if tool in {'forecast', 'projection', 'scenario', 'savings', 'purchase', 'budget', 'runway', 'optimization'}:
+            fact['binding']['headline'] = len(facts) - result_start < 2
         if tool == 'cashflow' and text == e.get('computedConclusion'):
             fact['binding'].update(aggregation='complete_month_average', months=e.get('completeMonthAverage', {}).get('months', []))
         if tool == 'forecast' and e.get('targetMonth'):
@@ -82,10 +84,13 @@ def build_facts(results):
             fact['modelText'] = sanitize_fact(prefix + model_text, result)
         facts.append(fact)
 
-    for result in results:
+    for result_number, result in enumerate(results, 1):
+        result_start = len(facts)
         tool, e = result['tool'], result['evidence']
         scope = result.get('mode', '当前账本')
         base_binding = {key: value for key, value in {
+            'resultGroup': f'g{result_number}', 'primary': not result.get('supplemental', False),
+            'filters': result.get('filters', []), 'queryIds': result.get('queryIds', []),
             'tool': tool, 'scope': scope, 'metric': computed_metric(tool, e),
             'historyWindow': result.get('historyWindow') if tool != 'budget' else None,
             'month': e.get('month') if tool == 'budget' else None,

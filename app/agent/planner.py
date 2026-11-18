@@ -729,7 +729,7 @@ class QueryPlanner:
         requirements = set(plan.understanding.evidenceNeeds)
         existing = {task.tool for task in plan.analyses}
         scoped = {(c.toolName, c.args.cost_type, c.args.remark) for c in plan.toolCalls}
-        bindings = {(c.toolName, c.args.cost_type, c.args.remark, c.args.year, c.args.month, c.args.day)
+        bindings = {(c.toolName, c.args.cost_type, c.args.remark, tuple(c.sourceIds or [c.id]))
                     for c in plan.toolCalls}
         decisions = HISTORY_BASED_TOOLS | {'budget'}
         requested = requirements & {'cashflow', 'data_quality', 'trends', 'changes', 'aggregate', 'income_stability', 'recurring', 'anomalies'}
