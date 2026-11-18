@@ -14,12 +14,14 @@ from langsmith import traceable
 from app.agent.planner import QueryPlanner
 from app.agent.analysis_context import latest_context
 from app.agent.evidence_report import EvidenceReporter
+from app.agent.artifacts import build_artifacts
+from app.agent.investigation import EvidenceInvestigator
 from app.agent.prompts import BOOK_AGENT_ANALYSIS_PROMPT, BOOK_AGENT_SYSTEM_PROMPT
 from app.clients.bookkeeping_api import BookkeepingApiClient
 from app.core.llm import get_chat_model
 from app.core.config import get_settings
 from app.memory.store import MongoMemoryStore, conversation_scope
-from app.schemas.plan import AgentPlan, ToolCall
+from app.schemas.plan import AgentPlan, AnalysisRequest, SourceGroup, ToolCall
 from app.tools.order_calculations import (
     calculate_category_breakdown,
     calculate_order_summary,
@@ -30,6 +32,7 @@ from app.tools.order_calculations import (
 from app.tools.order_search import search_orders
 from app.tools.registry import PLANNER_TOOL_BY_NAME, format_tool_call
 from app.tools.financial_analysis import _date, merge_orders, run_analysis
+from app.agent.evidence_pipeline import collect_analysis_results
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +55,7 @@ class BookAgent:
         self.memory = MongoMemoryStore()
         self.planner = QueryPlanner()
         self.reporter = EvidenceReporter()
+        self.investigator = EvidenceInvestigator()
 
     async def chat(
         self,
@@ -112,7 +116,7 @@ class BookAgent:
             history_messages = await self.memory.get_recent_messages(
                 phone_num=phone_num,
                 session_id=resolved_session_id,
-                limit=6,
+                limit=12,
             )
             yield {
                 "type": "status",
@@ -150,6 +154,7 @@ class BookAgent:
                     mode=book_mode,
                     family_id=family_id,
                     plan=plan,
+                    question=message, history=history_text,
                 )
                 yield {"type": "status", "content": self._query_status(orders_json)}
             else:
@@ -184,8 +189,13 @@ class BookAgent:
                 return
 
             if plan.analyses:
+                results = self._safe_json_loads(orders_json).get('analysisResults', [])
+                artifacts = build_artifacts(results, plan.output.model_dump(),
+                    window=plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None)
                 report_task = asyncio.create_task(self.reporter.answer(
-                    message, plan._analysis_context, self._safe_json_loads(orders_json).get('analysisResults', [])))
+                    message, plan._analysis_context, results, history=history_text,
+                    instruction=plan.finalInstruction, artifacts=artifacts,
+                    understanding=plan.understanding.model_dump()))
                 try:
                     while not report_task.done():
                         done, _ = await asyncio.wait({report_task}, timeout=12)
@@ -198,10 +208,12 @@ class BookAgent:
                         await asyncio.gather(report_task, return_exceptions=True)
                 assistant_chunks.append(reply)
                 yield {'type': 'delta', 'content': reply}
+                if artifacts:
+                    yield {'type': 'artifacts', 'artifacts': artifacts}
                 await self._save_assistant_reply(
                     phone_num=phone_num, session_id=resolved_session_id, reply=reply, plan=plan,
                     evidence=self._safe_json_loads(orders_json),
-                    duration_ms=round((perf_counter() - started_at) * 1000), validation=validation)
+                    duration_ms=round((perf_counter() - started_at) * 1000), validation=validation, artifacts=artifacts)
                 yield {'type': 'done', 'content': ''}
                 return
 
@@ -268,17 +280,27 @@ class BookAgent:
         evidence: dict | None = None,
         duration_ms: int | None = None,
         validation: dict | None = None,
+        artifacts: list | None = None,
     ) -> None:
         if not reply or not session_id:
             return
         settings = get_settings()
+        plan._analysis_context['conversation'] = {
+            'objective': plan.understanding.objective,
+            'analyses': [task.model_dump(mode='json', exclude_none=True) for task in plan.analyses],
+            'analysisWindow': plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None,
+            'output': plan.output.model_dump(),
+            'sourceGroups': [group.model_dump() for group in plan.sourceGroups],
+        }
         await self.memory.add_message(
             phone_num=phone_num,
             session_id=session_id,
             role="assistant",
             content=reply,
             metadata={"plan": plan.model_dump(mode="json"), "evidence": evidence or {},
-                      "analysisVersion": 3, "durationMs": duration_ms,
+                      "analysisVersion": 4, "durationMs": duration_ms,
+                      "artifacts": artifacts or [], "understanding": plan.understanding.model_dump(),
+                      "investigation": plan._investigation,
                       "analysisContext": plan._analysis_context, "validation": validation or {},
                       "planningIssues": plan._planning_issues,
                       "model": {"provider": settings.llm_provider, "name": settings.llm_model,
@@ -310,6 +332,8 @@ class BookAgent:
         mode: str,
         family_id: str | None,
         plan: AgentPlan,
+        question: str = '',
+        history: str = '',
     ) -> str:
         # 一个 plan 里可能包含多个 tool call，例如“对比上月和本月”会产生两次查询。
         tool_results = []
@@ -360,37 +384,25 @@ class BookAgent:
         analysis_results = []
         if plan.analyses and all(item["ok"] for item in tool_results):
             today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+            catalogs = []
             for scope, queries in datasets.items():
-                for task in plan.analyses:
-                    bound = [(call, rows) for call, rows in queries
-                             if not task.queryIds or set(task.queryIds) & set(call.sourceIds or [call.id])]
-                    if not bound:
-                        continue
-                    filters = {(call.args.cost_type, call.args.remark) for call, _ in bound}
-                    if len(filters) > 1 and not task.queryIds:
-                        analysis_results.append({"mode": scope, "tool": task.tool, "evidence": {
-                            "sufficientData": False, "reason": "该分析尚未明确关联哪个分类或备注范围，需要确认查询范围。"}})
-                        continue
-                    records = merge_orders([rows for _, rows in bound])
-                    window = plan.analysisWindow if task.tool not in {"forecast", "scenario", "savings", "budget", "projection", "purchase", "runway", "optimization"} else None
-                    selected = records
-                    if window:
-                        selected = [order for order in records if _date(order) and window.startDate <= _date(order) <= window.endDate]
-                    result = run_analysis(
-                        task.tool, selected, as_of=today, metric=task.metric,
-                        target_month=task.targetMonth,
-                        changes=[change.model_dump() for change in task.changes],
-                        budget_amount=task.budgetAmount, starting_balance=task.startingBalance,
-                        target_amount=task.targetAmount, months=task.months,
-                        monthly_improvement=task.monthlyImprovement,
-                        purchase_amount=task.purchaseAmount, reserve_amount=task.reserveAmount,
-                        protected_categories=task.protectedCategories,
-                        window_start=window.startDate if window else None,
-                        window_end=window.endDate if window else None,
-                    )
-                    analysis_results.append({"mode": scope, "tool": task.tool, "queryIds": task.queryIds,
-                                             "filters": [{"category": category, "remark": remark} for category, remark in sorted(filters)],
-                                             "evidence": result})
+                records = merge_orders([rows for _, rows in queries])
+                # Reflection sees actual observed labels/remarks, never the raw account IDs.
+                catalogs.append({'mode': scope, **run_analysis('sources', records, as_of=today)})
+            initial_results = collect_analysis_results(plan, datasets, today)
+            if question and getattr(self, 'investigator', None):
+                decision, plan._investigation = await self.investigator.refine(question, history, plan, catalogs, results=initial_results)
+                if decision.sourceGroups:
+                    replaced = {key for group in decision.sourceGroups for key in group.sourceKeys}
+                    kept = [SourceGroup(label=group.label, sourceKeys=[key for key in group.sourceKeys if key not in replaced])
+                            for group in plan.sourceGroups if any(key not in replaced for key in group.sourceKeys)]
+                    plan.sourceGroups = (kept + decision.sourceGroups)[:30]
+                plan.analyses.extend(decision.additionalAnalyses[:max(0, 12 - len(plan.analyses))])
+                if decision.answerFocus:
+                    plan.finalInstruction += '\n基于现有证据的回答重点：' + decision.answerFocus
+                if decision.informationGaps:
+                    plan.finalInstruction += '\n需明确的真实信息缺口：' + '；'.join(decision.informationGaps)
+            analysis_results = collect_analysis_results(plan, datasets, today)
 
         return json.dumps(
             {
@@ -551,11 +563,12 @@ class BookAgent:
 
         lines = []
         for item in messages:
-            if item.get('role') != 'user':
+            if item.get('role') not in {'user', 'assistant'}:
                 continue
             content = str(item.get("content", "")).strip()
             if content:
-                lines.append(f"用户: {self._sanitize_history_content(content)}")
+                role = '用户' if item['role'] == 'user' else '助手'
+                lines.append(f"{role}: {self._sanitize_history_content(content)}")
 
         return "\n".join(lines) or "无历史消息。"
 

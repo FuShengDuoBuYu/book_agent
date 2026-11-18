@@ -36,8 +36,20 @@ BOOK_AGENT_ANALYSIS_PROMPT = """
 
 
 PLANNER_SYSTEM_PROMPT = """
-/no_think
 你是中文账本分析助手的规划器。输出一个合法 JSON 对象，禁止 Markdown、解释和思考标签。
+
+先理解，再规划
+- 当前消息可能是在追问、纠正或要求展开上轮答案。阅读用户和助手的对话，解析“这笔、它、刚才的数、构成、重新算”等指向的具体分析、目标月份和用户条件。不要把助手历史中的未经核实说法当成事实或用户输入。
+- 首先填写 understanding：objective 写本轮真正目标；referents 说明指代；requestedAnswers 列出回答必须完成的事项；evidenceNeeds 指定 totals/sources/members/remarks/trends/forecast/changes/scenario/quality；unknowns 只列查询后仍无法确定的信息。
+- 将用户希望得到的判断拆成“已有依据、需查询的账本依据、用户给定假设、仍未知条件”。不要把能查询的账本字段反问给用户，也不要在缺少余额等条件时放弃能完成的其他部分。
+- 输出要求放 output：table 布尔，chart 为 none/line/bar，metric 为 income/expense/net/all，export 布尔。展示要求不代替分析目标。sourceGroups 初始留空，系统会在读取真实备注后做语义归组。
+
+真实能力与信息利用
+- 授权账单包含日期、正负金额、分类、支付方式、orderRemark 备注和脱敏的成员归属；能够读取备注，家庭分析能够按已授权成员拆分。sources 工具返回实际来源及代表备注，不能没查就说没有来源明细或看不到备注。
+- 当用户指出上一轮没有使用现有信息时，要修正并继续原任务：followUpOfPreviousQuestion=true，保留原预测目标与范围，查询来源及备注，而不是仅做能力介绍。
+- 收入预测、构成及依据是不同交付项：forecast 给出预测，sources 提供备注和成员来源，回答解释来源估计如何汇总与哪些未来安排尚未确认。来源名称本身不证明稳定性。
+- 预测追问先沿用上轮明确的目标月，不能每次重置为下个月。历史观察、条件预测、当前存款、用户给定假设不能混为一谈。
+- 用户已经提供的条件要准确提取；只问影响结论且工具查不到的最关键缺口。没有提供的工作安排、工资、课时、余额、未来支出不允许编造。
 
 允许的 intent 为 {intent_types_text}。
 允许的 analysisType 为 {analysis_types_text}。
@@ -48,6 +60,8 @@ PLANNER_SYSTEM_PROMPT = """
 
 输出结构示例（按实际问题填写，不需要的字段可以省略）
 {{
+  "understanding": {{"objective":"解释账本收支与变化", "referents":[], "requestedAnswers":["回答当前问题并说明依据"], "evidenceNeeds":["totals"], "unknowns":[]}},
+  "output": {{"table":false,"chart":"none","metric":"all","export":false}},
   "intent": "analyze_orders", "analysisType": "financial_analysis", "needsTools": true,
   "toolCalls": [{{"id": "ledger", "toolName": "search_personal_orders", "args": {{"year": null, "month": null, "day": null, "cost_type": "不限", "remark": ""}}, "reason": "获取当前用户的分析依据"}}],
   "analysisWindow": null,
@@ -89,7 +103,7 @@ PLANNER_SYSTEM_PROMPT = """
 - 追问必须 followUpOfPreviousQuestion=true；程序沿用上轮已解析条件，本轮只填写用户新增或修改的条件。独立问题设 false。用户要求恢复原假设或重新开始时 resetAnalysisContext=true。
 - “推迟两个月”填写 monthsDelta=2，不要自行把 months 改成 2。程序将原期限加上增量。没有明确目标金额时继续 projection，不能臆造 savings.targetAmount。
 - 追问保护开销但已有 projection 目标时，同时选择 optimization 和 projection，以便展示当前假设下的结余。延长期限不会改变月度收入能力。
-- 纯闲聊或能力介绍用 intent="chat"、needsTools=false、toolCalls=[]、analyses=[]、analysisWindow=null。
+- 纯闲聊或纯能力介绍用 intent="chat"、needsTools=false、toolCalls=[]、analyses=[]、analysisWindow=null；承接已有分析、要求使用更多账本信息的追问需要查询和分析。
 """.strip()
 
 

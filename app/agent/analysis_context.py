@@ -7,8 +7,8 @@ import json
 from app.schemas.plan import AgentPlan, ScenarioChange, ToolCall
 
 FIELDS = ('months', 'startingBalance', 'targetAmount', 'monthlyImprovement',
-          'purchaseAmount', 'reserveAmount', 'targetMonth')
-DECISION_TOOLS = {'projection', 'scenario', 'savings', 'optimization', 'purchase', 'runway'}
+          'purchaseAmount', 'reserveAmount', 'targetMonth', 'budgetAmount')
+DECISION_TOOLS = {'forecast', 'projection', 'scenario', 'savings', 'optimization', 'purchase', 'runway', 'budget'}
 
 
 def latest_context(messages):
@@ -89,7 +89,7 @@ def resolve_context(plan: AgentPlan, previous: dict, book_mode='个人版') -> d
         if inherit and previous.get('ambiguous'):
             raise ValueError('上轮比较了多个情景，请明确要沿用的情景及条件')
         prior = previous if inherit else {}
-        alternatives = any(count > 1 for count in Counter(task.tool for task in tasks).values())
+        alternatives = any(count > 1 for count in Counter((task.tool, task.metric) for task in tasks).values())
         batches = [[task] for task in tasks] if alternatives else [tasks]
         states.extend(resolve_group(batch, prior, scope) for batch in batches)
     if len(states) == 1:
@@ -97,6 +97,10 @@ def resolve_context(plan: AgentPlan, previous: dict, book_mode='个人版') -> d
     elif states:
         state = {'ambiguous': True, 'scenarios': states}
     else:
-        state = deepcopy(previous) if plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext else {}
+        current_scope = [list(row) for row in sorted(set(sources.values()))]
+        inherit = (plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext
+                   and previous.get('scope') == current_scope)
+        state = deepcopy(previous) if inherit else {}
+        state['scope'] = current_scope
     plan._analysis_context = state
     return state

@@ -8,6 +8,7 @@ from app.core.config import get_settings
 from app.core.llm import get_structured_model
 from app.schemas.report import ReportDraft, ReportReview
 from pydantic import ValidationError
+from app.agent.artifacts import render_artifacts_markdown
 
 INPUT_NAMES = {'startingBalance': '当前可动用余额', 'targetAmount': '希望达到的存款目标',
                'months': '测算期限（月数）', 'changes': '收入减少的来源和幅度',
@@ -49,9 +50,15 @@ def build_facts(results):
                 add(f"查询期“{row['name']}”支出 {money(row['amount'])} 元，占查询期收入 {row['shareOfIncomePercent']}%。")
             add('分类占比反映已记录支出结构，不能单凭占比判断生活负担；资产与债务余额需要另行确认。')
         elif tool == 'trends':
-            complete = [row for row in e['months'] if not row['partial']]
-            add('已记录完整月份的支出：' + '；'.join(f"{r['month']} 为 {money(r['expenseTotal'])} 元" for r in complete[-6:]) + '。')
-            add(e['coverageNote'], True)
+            for row in e['months'][-6:]:
+                add(f"{row['month']} 已记收入 {money(row['incomeTotal'])} 元，支出 {money(row['expenseTotal'])} 元，结余 {money(row['netIncomeMinusExpense'])} 元。" + ('此月尚未完整覆盖，不能与整月直接比较。' if row['partial'] else ''))
+            add('有记录月份只能说明已记账收支；缺失月份未知，不能按零补齐。', True)
+        elif tool == 'sources':
+            for row in e.get('sources', [])[:8]:
+                label = '收入' if row['metric'] == 'income' else '支出'
+                add(f"{row.get('member', '归属未知')}的{label}来源“{row['source']}”已记录 {money(row['amount'])} 元，备注依据：{'；'.join(row.get('remarks', [])[:2])}。")
+            if e.get('omittedSourceCount'):
+                add(f"来源摘要另有 {e['omittedSourceCount']} 项未展开，不能据摘要断言不存在其他来源。", True)
         elif tool == 'changes':
             add(f"从 {e['from']} 到 {e['to']}，收入变化 {money(e['incomeChange'])} 元，支出变化 {money(e['expenseChange'])} 元，结余变化 {money(e['netChange'])} 元。", True)
             for direction, label in (('expense', '支出'), ('income', '收入')):
@@ -74,6 +81,12 @@ def build_facts(results):
         elif tool == 'forecast':
             label = {'income': '收入', 'expense': '支出', 'net': '结余'}[e['metric']]
             add(f"假设历史模式延续，{e['targetMonth']} 的月度{label}基准 {money(e['estimate'])} 元，历史情景范围 {money(e['lower'])}～{money(e['upper'])} 元。基准参考月份：{'、'.join(e['baselineMonths'])}。这是条件估计，历史范围不是保证或置信区间。", True)
+            if e.get('method'):
+                add('计算方法：' + e['method'])
+            for row in e.get('sourceForecasts', [])[:8]:
+                add(f"{row.get('member', '归属未知')}的“{row['source']}”条件估计 {money(row.get('estimate'))} 元。备注依据：{'；'.join(row.get('remarks', [])[:2])}。" + ('此项为已剔除的入账，不计入持续收入。' if row.get('excluded') else ''))
+            if e.get('excludedIncomeTotal'):
+                add(f"历史样本中按备注识别并剔除非持续性入账 {money(e['excludedIncomeTotal'])} 元；归类仍需核查。")
         elif tool == 'scenario':
             add(e['computedConclusion'], True)
         elif tool == 'savings':
@@ -150,12 +163,33 @@ def validate_draft(draft, facts):
         issues.append('factIds 遗漏必需证据编号：' + ','.join(sorted(missing)))
     for section in draft.sections:
         prose = section.title + section.analysis
-        if re.search(r'\d|[零〇一二两三四五六七八九十百千万亿半]+\s*(?:元|块|%|％|个月|月的|成)', prose):
-            issues.append('以下解释含自行书写的数量，请删除数值复述，仅保留不带数字的含义与建议：' + prose[:1000])
+        values = {row['id'] for row in value_catalog(facts)}
+        references = re.findall(r'\{\{(v\d+)\}\}', prose)
+        if set(references) - values:
+            issues.append('数量引用缺少账本依据')
+        remaining = re.sub(r'\{\{v\d+\}\}', '', prose)
+        if QUANTITY.search(remaining):
+            issues.append('数量必须使用 values 中的引用，不能自行计算或手抄：' + prose[:600])
+        unsupported = unsupported_assertion(expand_values(prose, facts), facts)
+        if unsupported:
+            issues.append(unsupported)
     return list(dict.fromkeys(issues))
 
 
 QUANTITY = re.compile(r'\d|一半|减半|翻倍|[零〇一二两三四五六七八九十百千万亿半]+\s*(?:元|块|%|％|个月|月的|成|分之)')
+
+
+def value_catalog(facts):
+    values = []
+    for fact in facts:
+        for found in re.finditer(r'\d{4}-\d{2}(?:-\d{2})?|[-+]?\d[\d,]*(?:\.\d+)?', fact['text']):
+            values.append({'id': f'v{len(values) + 1}', 'factId': fact['id'], 'display': found.group()})
+    return values
+
+
+def expand_values(text, facts):
+    values = {row['id']: row['display'] for row in value_catalog(facts)}
+    return re.sub(r'\{\{(v\d+)\}\}', lambda match: values.get(match[1], match[0]), text)
 
 
 def unsupported_assertion(text, facts):
@@ -200,24 +234,8 @@ def unsupported_assertion(text, facts):
 
 
 def prepare_draft(draft, facts):
-    """Keep numerical claims exclusively in the code-rendered evidence sentences."""
+    """Reject unsupported prose for repair; never silently erase a user's answer."""
     draft = draft.model_copy(deep=True)
-    removed = []
-    for section in draft.sections:
-        sentences = re.findall(r'[^。！？\n]+[。！？\n]?', section.analysis)
-        # Keep a complete, nonnumeric conditional action when a following
-        # "otherwise" clause merely repeats an unverified numerical outcome.
-        for index, sentence in enumerate(sentences):
-            parts = re.split(r'[，,](?=否则)', sentence, maxsplit=1)
-            if len(parts) == 2 and not QUANTITY.search(parts[0]) and QUANTITY.search(parts[1]):
-                sentences[index] = parts[0] + '。'
-                removed.append(parts[1])
-        removed.extend(sentence for sentence in sentences if QUANTITY.search(sentence) or unsupported_assertion(sentence, facts))
-        section.analysis = ''.join(sentence for sentence in sentences if not QUANTITY.search(sentence) and not unsupported_assertion(sentence, facts)).strip()
-        if QUANTITY.search(section.title) or unsupported_assertion(section.title, facts):
-            section.title = '分析与建议'
-    if not any(section.analysis for section in draft.sections):
-        raise ValueError('解释只重复了数字，请补充不带数值的含义、条件和建议')
     used = {key for section in draft.sections for key in section.factIds}
     # Conditions cannot disappear just because the model omitted a reference.
     missing = [row['id'] for row in facts if row['required'] and row['id'] not in used]
@@ -226,22 +244,27 @@ def prepare_draft(draft, facts):
         if target is None:
             raise ValueError('报告遗漏的必要条件过多，请合并相关证据')
         target.factIds.append(key)
-    return draft, {'removedUnsupportedSentences': removed, 'restoredReferences': missing}
+    issues = validate_draft(draft, facts)
+    if issues:
+        raise ValueError('；'.join(issues))
+    return draft, {'restoredReferences': missing}
 
 
 def render_report(draft, facts):
     by_id = {row['id']: row['text'] for row in facts}
-    return '\n\n'.join('**' + section.title + '**\n\n' + '\n'.join(by_id[key] for key in dict.fromkeys(section.factIds))
-                        + '\n\n' + section.analysis for section in draft.sections)
+    return '\n\n'.join('**' + expand_values(section.title, facts) + '**\n\n' + '\n'.join(by_id[key] for key in dict.fromkeys(section.factIds))
+                        + '\n\n' + expand_values(section.analysis, facts) for section in draft.sections)
 
 
-DRAFT_PROMPT = '''/no_think
+DRAFT_PROMPT = '''
 你是中文账本分析师。只输出 JSON 对象：sections，每段 title、factIds、analysis。
 如果有 previousReport 和 corrections，逐条修正原报告中的错误；不要重新生成相同错误的解释。
 先回答用户最关心的判断，再解释证据意味着什么，给出具体可执行的核查或调整方向；不要只复述统计。
 通常写一至三段，只选与当前问题直接相关的可选证据。追问支出变化时不扩写与变化无关的收入和消费评价。
 factIds 选择下面提供的证据，程序会原样显示这些完整句子。必须覆盖全部 required=true 的证据，可合并成少量段落。
-analysis 只写不带数字的含义、因果推测和建议，不重复抄写证据。标题也不写数字；金额、比例、期限一律通过 factIds 引用，程序会自动插入这些句子。
+先读取 understanding.requestedAnswers 和 instruction，逐项完成当前问题。history 中助手的上轮回答用于解析指代，不能当作本轮重新核实的事实。
+artifacts 是程序已经生成的表格和图表，会自动附在回答后面；解释其中的来源、备注和成员，不要声称无法读取这些信息，也不要再手抄同一张表。
+analysis 可以解释具体数量与条件：数量一律使用 values 的变量引用，例如“这个来源为{{v1}}元”；程序填入真实数字。不要手写数字、金额或百分比。factIds 引用所依据的完整事实句。
 示例：{"sections":[{"title":"收入来源集中","factIds":["f1","f2"],"analysis":"历史入账虽然平稳，但对主要来源依赖较大。建议确认后续工作安排，再分别测算减少和维持原状的情景。"}]}。不要在 analysis 写“收入为多少”或“已有几个完整月份”。
 用户问值得注意的问题时，也可以给出观察和待确认事项，不要强行编造问题。来源名称不证明兼职不稳定，支出占比不证明房租偏高，样本不足不证明漏记或健康风险。
 解释必须有事实依据，区分历史观察、用户假设和待确认原因。不得将备注“一次就诊”断定为未来不会发生。
@@ -253,7 +276,8 @@ analysis 只写不带数字的含义、因果推测和建议，不重复抄写�
 
 REVIEW_PROMPT = '''/no_think
 你是事实校对员，只查实质错误，不为反对而反对。只输出 JSON 对象: supported（布尔）、issues（字符串列表）。
-通过的报告必须 supported=true, issues=[]。不通过时，只引用报告中确实存在的错误原句并说明与哪项证据冲突，最多三项，不能举报你自己想象的结论。不要写轻微瑕疵或风格意见。
+通过的报告必须 supported=true, completed=true, issues=[]。同时检查 understanding.requestedAnswers、instruction 和当前问题是否被回答，结合会自动显示的 artifacts 判断。来源拆解不能只重复总额；成员归属不能遗漏；已有 remarks 不能说看不到备注；追问必须承接 history 中指向的内容。确实没完成则 completed=false 并指出遗漏。合理的数据限制不等于没完成。
+不通过时，只引用报告中确实存在的错误或确实遗漏的事项，最多三项，不能举报你自己想象的结论。不要写轻微瑕疵或风格意见。
 事实错误：算出的目标已能达成却说资金缺口；把月结余当存款；未知余额却断言买不起或抗风险弱；把历史中位数叫均值；将未知未来说成确定事实；遗漏用户明确限制。
 以下均应通过，不是事实错误：
 - 余额未知，建议先确认余额及近期支出。
@@ -288,10 +312,17 @@ class EvidenceReporter:
 
     async def _review(self, payload):
         review = await self._invoke(ReportReview, REVIEW_PROMPT, payload)
-        return [] if review.supported else (review.issues or ['解释未通过证据审查'])
+        return [] if review.supported and review.completed else (review.issues or ['解释未完成用户要求或缺少证据支持'])
 
-    async def answer(self, question, context, results):
+    async def answer(self, question, context, results, *, history='', instruction='', artifacts=None, understanding=None):
         facts = build_facts(results)
+        # Keep required conditions and a bounded selection of observations in the model context.
+        facts = [row for row in facts if row['required']] + [row for row in facts if not row['required']][:18]
+        artifacts = artifacts or []
+        artifact_preview = [{**row, 'rows': row['rows'][:12], 'totalRows': len(row['rows'])} for row in artifacts[:8]]
+        base_payload = {'question': question, 'history': history[-3200:], 'instruction': instruction,
+                        'understanding': understanding or {}, 'userConditions': {key: value for key, value in context.items() if key != 'conversation'},
+                        'artifacts': artifact_preview}
         previous = context.get('previousMonths')
         projection = next((row['evidence'] for row in results if row['tool'] == 'projection' and row['evidence'].get('sufficientData')), None)
         if previous and projection:
@@ -302,20 +333,23 @@ class EvidenceReporter:
         issues, attempts, previous = [], [], None
         for attempt in range(2):
             try:
-                draft = await self._draft({'question': question, 'userConditions': context, 'facts': facts,
+                draft = await self._draft({**base_payload, 'facts': facts, 'values': value_catalog(facts),
                                            'corrections': issues, 'previousReport': previous})
                 previous = draft.model_dump()
                 draft, repairs = prepare_draft(draft, facts)
                 issues = validate_draft(draft, facts)
                 if not issues:
-                    issues = await self._review({'question': question, 'userConditions': context, 'facts': facts, 'report': draft.model_dump()})
+                    issues = await self._review({**base_payload, 'facts': facts, 'report': render_report(draft, facts)})
                 attempts.append({'issues': issues, 'draft': draft.model_dump(), 'repairs': repairs})
                 if not issues:
-                    return render_report(draft, facts), {'status': 'reviewed', 'facts': facts, 'report': draft.model_dump(), 'attempts': attempts}
+                    reply = render_report(draft, facts)
+                    table_text = render_artifacts_markdown(artifacts)
+                    return reply + ('\n\n' + table_text if table_text else ''), {'status': 'reviewed', 'facts': facts, 'report': draft.model_dump(), 'attempts': attempts}
             except Exception as exc:
                 detail = '; '.join(f"{err['loc']}: {err['msg']}" for err in exc.errors()) if isinstance(exc, ValidationError) else (str(exc) if isinstance(exc, ValueError) else '')
                 issues = ['报告生成失败：' + type(exc).__name__ + ' ' + detail[:500]]
                 attempts.append({'issues': issues, 'draft': previous})
-        selected = [row['text'] for row in facts if row['required']] or [row['text'] for row in facts[:6]]
-        return ('当前可以确认的分析依据如下，进一步判断需要保留这些条件：\n\n' + '\n\n'.join(selected),
-                {'status': 'verified_facts_fallback', 'facts': facts, 'attempts': attempts})
+        selected = [row['text'] for row in facts[:12]]
+        table_text = render_artifacts_markdown(artifacts)
+        return ('以下是本次账本核算结果：\n\n' + '\n\n'.join(selected) + ('\n\n' + table_text if table_text else ''),
+                {'status': 'computed_fallback', 'facts': facts, 'attempts': attempts})

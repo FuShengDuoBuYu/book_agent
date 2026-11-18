@@ -157,9 +157,33 @@ class AnalysisWindow(BaseModel):
         return self
 
 
+class IntentUnderstanding(BaseModel):
+    objective: str = Field(default='', max_length=600, description='当前真正要解决的问题，追问须解析它指向上轮哪项结论')
+    referents: list[str] = Field(default_factory=list, max_length=8, description='这、它、刚才的金额等在当前对话中的明确含义；未确定就标记待确认')
+    requestedAnswers: list[str] = Field(default_factory=list, max_length=8, description='回答必须完成的具体事项，不是工具名称')
+    evidenceNeeds: list[Literal['totals', 'sources', 'members', 'remarks', 'trends', 'forecast', 'changes', 'scenario', 'quality']] = Field(default_factory=list, max_length=10)
+    unknowns: list[str] = Field(default_factory=list, max_length=6, description='完成用户目标仍缺的具体信息，已有账本可查询的信息不要求用户重新提供')
+
+
+class OutputRequest(BaseModel):
+    table: bool = False
+    chart: Literal['none', 'line', 'bar'] = 'none'
+    metric: Literal['income', 'expense', 'net', 'all'] = 'all'
+    export: bool = False
+
+
+class SourceGroup(BaseModel):
+    label: str = Field(min_length=1, max_length=100)
+    sourceKeys: list[str] = Field(min_length=1, max_length=60)
+
+
 class AgentPlan(BaseModel):
+    understanding: IntentUnderstanding = Field(default_factory=IntentUnderstanding)
+    output: OutputRequest = Field(default_factory=OutputRequest)
+    sourceGroups: list[SourceGroup] = Field(default_factory=list, max_length=30)
     _analysis_context: dict = PrivateAttr(default_factory=dict)
     _planning_issues: list = PrivateAttr(default_factory=list)
+    _investigation: dict = PrivateAttr(default_factory=dict)
     resetAnalysisContext: bool = False
 
     @model_validator(mode="before")

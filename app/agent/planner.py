@@ -68,6 +68,7 @@ class QueryPlanner:
                 if not data:
                     raise ValueError("Missing plan")
                 plan = AgentPlan.model_validate(data)
+                self._inherit_conversation(plan, previous_context or {})
                 self._normalize_explicit_conditions(plan, message)
                 self._coalesce_forecasts(plan)
                 resolve_context(plan, previous_context or {}, self._normalize_mode(book_mode))
@@ -140,6 +141,19 @@ class QueryPlanner:
     ) -> AgentPlan:
         # normalize 的目的，是把“不稳定的 LLM 输出”整理成“稳定的程序输入”。
         self._coalesce_forecasts(plan)
+        requirements = set(plan.understanding.evidenceNeeds)
+        required_tools = set()
+        if plan.output.chart != 'none' or 'trends' in requirements:
+            required_tools.add('trends')
+        if requirements & {'sources', 'members', 'remarks'}:
+            required_tools.add('sources')
+        if 'forecast' in requirements and not any(task.tool in HISTORY_BASED_TOOLS for task in plan.analyses):
+            required_tools.add('forecast')
+        if 'changes' in requirements:
+            required_tools.add('changes')
+        if required_tools:
+            plan.analyses.extend(AnalysisRequest(tool=tool, metric=plan.output.metric if plan.output.metric != 'all' else 'income')
+                                 for tool in sorted(required_tools) if not any(task.tool == tool for task in plan.analyses))
         if plan.analysisType == "financial_analysis" and not plan.analyses:
             plan.analyses = [AnalysisRequest(tool=name) for name in ("cashflow", "trends", "changes", "anomalies", "recurring")]
         if plan.analyses:
@@ -218,6 +232,23 @@ class QueryPlanner:
             plan.finalInstruction = "根据所有工具结果回答用户问题。"
 
         return plan
+
+    def _inherit_conversation(self, plan, previous):
+        """Only inherit a referent's range and grouping within its ledger/filter scope."""
+        conversation = previous.get('conversation', {})
+        if not (plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext and conversation):
+            return
+        scopes = sorted({(call.toolName, call.args.cost_type, call.args.remark) for call in plan.toolCalls})
+        if scopes and [list(row) for row in scopes] != previous.get('scope'):
+            return
+        if not plan.analyses and plan.intent == 'analyze_orders':
+            plan.analyses = [AnalysisRequest.model_validate(row) for row in conversation.get('analyses', [])]
+        if not plan.analysisWindow and conversation.get('analysisWindow') and not any(task.tool in HISTORY_BASED_TOOLS for task in plan.analyses):
+            from app.schemas.plan import AnalysisWindow
+            plan.analysisWindow = AnalysisWindow.model_validate(conversation['analysisWindow'])
+        if not plan.sourceGroups:
+            from app.schemas.plan import SourceGroup
+            plan.sourceGroups = [SourceGroup.model_validate(row) for row in conversation.get('sourceGroups', [])]
 
     def _coalesce_forecasts(self, plan):
         groups = {}

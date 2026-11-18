@@ -5,6 +5,7 @@ import json
 from uuid import uuid4
 
 from app.memory.mongo import get_memory_db
+from app.schemas.artifacts import public_artifacts
 
 
 def conversation_scope(mode: str, family_id: str | None) -> str:
@@ -92,11 +93,13 @@ class MongoMemoryStore:
         if not session:
             return None
         query = {"phoneNum": phone_num, "sessionId": session_id, **_page_filter(cursor, "createdAt")}
-        rows = await (db.agent_messages.find(query, {"_id": 1, "role": 1, "content": 1, "createdAt": 1})
+        rows = await (db.agent_messages.find(query, {"_id": 1, "role": 1, "content": 1, "createdAt": 1, "metadata.artifacts": 1})
                       .sort([("createdAt", -1), ("_id", -1)]).limit(limit + 1).to_list(limit + 1))
         return {"sessionId": session_id, "title": session.get("title") or "历史对话",
                 "messages": [{"id": row["_id"], "role": row["role"], "content": row["content"],
-                              "createdAt": row.get("createdAt")} for row in reversed(rows[:limit])],
+                              "createdAt": row.get("createdAt"),
+                              "artifacts": public_artifacts(row.get('metadata', {}).get('artifacts', []))}
+                             for row in reversed(rows[:limit])],
                 "nextCursor": _next_cursor(rows, limit, "createdAt")}
 
     async def add_message(
