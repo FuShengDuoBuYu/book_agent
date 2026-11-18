@@ -10,8 +10,10 @@ import re
 from calendar import monthrange
 from collections import Counter, defaultdict
 from datetime import date
+from decimal import Decimal
 from statistics import median, quantiles
 
+from app.tools.aggregate_analysis import aggregate_analysis
 from app.tools.order_calculations import (
     calculate_category_breakdown,
     calculate_order_summary,
@@ -33,6 +35,7 @@ from app.tools.source_analysis import (
 
 
 ANALYSIS_TOOLS = {
+    "aggregate": "按自选月份、年份、成员、来源、类别、支付方式、星期分组；筛选金额和备注、比较历史区间与统计每笔金额。",
     "sources": "按记账成员、原始备注归集收入和支出来源，给出分类、月度金额、剔除项和覆盖范围",
     "cashflow": "收入、支出、净现金流、笔数和分类结构",
     "trends": "按月和按日的趋势，区分本月未结束与完整月份",
@@ -177,22 +180,34 @@ def _changes(orders: list[dict], *, as_of: date, **kwargs) -> dict:
     result = {"sufficientData": True, "before": before, "after": after, **_change(before, after),
               "interpretation": f"变化只比较 {before['month']} 与 {after['month']} 两个完整月份。{as_of:%Y-%m} 尚未结束，无法据此断言趋势已恢复或未来将回落。"}
     for direction, positive in (("income", True), ("expense", False)):
-        amounts = []
+        periods = []
         for month in (before["month"], after["month"]):
-            groups = defaultdict(float)
+            groups = defaultdict(list)
             for order in buckets[month]:
-                money = float(order["money"])
-                if (money > 0) == positive and money != 0:
-                    groups[_source(order)] += abs(money)
-            amounts.append(groups)
-        result[direction + "Drivers"] = sorted([
-            {"name": name, "before": _round_money(amounts[0][name]),
-             "after": _round_money(amounts[1][name]),
-             "change": _round_money(amounts[1][name] - amounts[0][name]),
-             "afterRemarks": list(dict.fromkeys(str(row.get("orderRemark") or "") for row in buckets[after["month"]]
-                                                if _source(row) == name and (float(row["money"]) > 0) == positive))[:5]}
-            for name in amounts[0].keys() | amounts[1].keys()
-        ], key=lambda row: abs(row["change"]), reverse=True)[:20]
+                amount = float(order["money"])
+                if amount and (amount > 0) == positive:
+                    groups[_source(order)].append(order)
+            periods.append(groups)
+        drivers = []
+        for name in sorted(periods[0].keys() | periods[1].keys()):
+            first, second = (period.get(name, []) for period in periods)
+            a, b = (sum((abs(Decimal(str(row["money"]))) for row in items), Decimal(0)) for items in (first, second))
+            mean_a = a / len(first) if first else None
+            mean_b = b / len(second) if second else None
+            change = _round_money(float(b - a))
+            count_effect = mean_effect = None
+            if first and second:
+                count_effect = money((len(second) - len(first)) * (mean_a + mean_b) / 2)
+                # Assign the rounding remainder to the second component so their cents reconcile.
+                mean_effect = money(Decimal(str(change)) - Decimal(str(count_effect)))
+            drivers.append({"name": name, "before": _round_money(float(a)), "after": _round_money(float(b)),
+                            "change": change, "beforeCount": len(first), "afterCount": len(second),
+                            "meanAmountBefore": money(mean_a) if first else None,
+                            "meanAmountAfter": money(mean_b) if second else None,
+                            "countContribution": count_effect, "meanContribution": mean_effect,
+                            "afterRemarks": list(dict.fromkeys(str(row.get("orderRemark") or "") for row in second))[:5]})
+        result[direction + "Drivers"] = sorted(drivers, key=lambda row: abs(row["change"]), reverse=True)[:20]
+    result["driverMethod"] = "两期均有记录时，笔数贡献为笔数差乘两期每笔均额的均值；每笔均额贡献为剩余变化。仅分解已记录交易金额，不代表商品单价、购买次数或现实原因。"
     return result
 
 
@@ -402,6 +417,7 @@ def _savings(orders: list[dict], *, as_of: date, starting_balance=None, target_a
 
 
 _IMPLEMENTATIONS = {
+    "aggregate": aggregate_analysis,
     "sources": source_catalog, "cashflow": _cashflow, "trends": _trends, "changes": _changes,
     "anomalies": _anomalies, "recurring": _recurring, "forecast": _forecast, "scenario": _scenario,
     "budget": _budget, "savings": _savings,

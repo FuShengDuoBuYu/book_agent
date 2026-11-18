@@ -75,12 +75,14 @@ PLANNER_SYSTEM_PROMPT = """
 - 原因、变化、规律、异常、预测、预算和情景问题使用 financial_analysis，并选择 analyses 中的工具。analysisType 不能填写工具名称。
 - 全面分析选择 cashflow、trends、changes、recurring、anomalies。支付方式、备注来源、收支比例由 cashflow 提供。
 - 只有 forecast 需要按 metric 分别生成任务；cashflow、trends、changes、recurring 已同时包含收支，同一范围不要重复生成。
+- aggregate 比较区间时用 periods 表示前后时段，groupBy 只放要跨期对齐的类别、成员等维度；按月作对比时不把不同月份同时作为对齐维度。金额、笔数、每笔均额和中位数由工具计算。每笔均额不能解释为商品单价。
+- 交叉统计、按星期几或支付账户汇总、比较不连续时段时选 aggregate。metric 可填 income/expense/net/all，aggregate.groupBy 从 month/year/category/member/source/bank/weekday 中选最多四个维度。比较时用 aggregate.periods 填最多八段，每段写 label、startDate、endDate。aggregate.filters 可按 includeCategories/excludeCategories、includeMembers/excludeMembers、includeSources/excludeSources、remarkContains/excludeRemarks、minAmount/maxAmount 筛选。limit 控制列出的行数。省略未使用的字段。
 - 问为什么增长或减少时选 changes 和 trends。问周期性收入与固定支出选 recurring。异常与重复记账选 anomalies。
 - 预测单个月份使用 forecast，metric 为 income、expense、net。预测未来多个月份，或问“几个月能存下多少钱”，使用 projection，months 填月份数量，同时计算收支和累计新增结余，不需要 startingBalance。targetMonth 默认下个月，不能填历史月份。
 - 假设调整使用 scenario；若追问已有的多月测算，继续使用 projection 或 savings。changes 中 amount 表示金额、percent 表示百分比，两者只能填一个；source 填被调整的来源，增加为正、减少为负，不要自行乘算。
 - “家教少一半”对应 changes: [{{"metric":"income","percent":-50,"source":"家教","label":"家教收入减少一半"}}]。只能减少家教部分，不能把百分比当成金额，也不能替换为总收入。
 - 收入稳定性用 income_stability；问能承受多久，加 runway。未知可动用余额和变化幅度留空，不能擅自假设完全失业。
-- 节省优化选 optimization，monthlyImprovement 是想每月多留下的金额；protectedCategories 保存用户不想削减的类别，例如房租、餐饮。
+- 节省优化选 optimization。用户说每月想多存、多留、少花多少钱时，把这个额外改善数额写入 monthlyImprovement，中文数词转成数值。例如“每月再省四百五十”填写 450。protectedCategories 保存用户明确要保留的项目。用历史开支估计能调整多少、还差多少，不需要 startingBalance、目标总余额或存款期限。
 - 大额购买选 purchase，purchaseAmount 是购买价，startingBalance 是用户明确给出的可用余额，reserveAmount 是用户明确的储备底线。不可用月结余代替余额。
 - 购买问题未给余额时，先用 purchase 明确缺少的条件；未指定后续测算期限时，不自行附加多个月份预测。购买月份不是历史查询窗口。
 - 账本口径、完整性、可能误判选 data_quality，可同时选 anomalies。
@@ -95,7 +97,7 @@ PLANNER_SYSTEM_PROMPT = """
 - toolName 从查询工具列表选择，不能输出账号、手机号或家庭编号。
 - 没有明确指定账本时使用 book_mode。个人对应 search_personal_orders，家庭对应 search_family_orders。同时比较时各生成一条查询模板。
 - 每个分析任务的 queryIds 引用其所需 toolCalls 的 id。不同分类或备注必须分别建查询模板并绑定，例如餐饮预算绑定 food 查询，总收入预测绑定 all 查询。不要让餐饮预算使用全账本支出。
-- 分析任务的时间范围放在 analysisWindow，由程序展开查询。最近半年按当前日期向前取六个完整月及本月；用户明确的起止日按原意填写；只有一个指定月份时填该月首日至末日。不要只取范围的第一个月。
+- 分析任务的时间范围放在 analysisWindow，由程序展开查询。“最近 N 个完整月”或“上 N 个完整自然月”从上个月末向前数 N 个自然月，本月未结束；最近半年按当前日期向前取六个完整月及本月；用户明确的起止日按原意填写；只有一个指定月份时填该月首日至末日。不要只取范围的第一个月。
 - analysisWindow 的格式为 {{"startDate":"YYYY-MM-DD","endDate":"YYYY-MM-DD"}}，例如 {{"startDate":"2026-05-01","endDate":"2026-11-12"}}。日期应按当前问题计算，没有限定时填 null。
 - 普通简单查询使用 toolCalls.args 的 year/month/day。无日期默认当前年月，昨天和上个月须跨月跨年计算。
 - 预测、情景、购买和储蓄任务的历史窗口由程序统一保证。analysisWindow 可填 null；未来目标月份不能写入这个历史窗口，也不能用 cashflow 查询未来账单代替预测。

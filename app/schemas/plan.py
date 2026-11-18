@@ -4,6 +4,7 @@ from typing import Annotated, Literal, get_args
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, FiniteFloat, PrivateAttr, field_validator, model_validator
 
 from app.tools.financial_analysis import ANALYSIS_TOOLS
+from app.tools.aggregate_analysis import AggregateSpec
 
 
 
@@ -114,11 +115,14 @@ class AnalysisRequest(BaseModel):
         if isinstance(value, dict) and value.get("tool") != "forecast" and value.get("metric", "income") is None:
             value = dict(value)
             value.pop("metric")
+        if isinstance(value, dict) and value.get('tool') != 'aggregate':
+            value = {key: item for key, item in value.items() if key != 'aggregate'}
         return value
 
     tool: str
     queryIds: list[str] = Field(default_factory=list, max_length=24)
-    metric: Literal["income", "expense", "net"] = "income"
+    metric: Literal["income", "expense", "net", "all"] = "income"
+    aggregate: AggregateSpec | None = None
     targetMonth: str | None = Field(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
     changes: list[ScenarioChange] = Field(default_factory=list, max_length=20, description='用户给定的收支变化；全部收入中断对应 income、percent=-100、source为空')
     budgetAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False)
@@ -130,6 +134,14 @@ class AnalysisRequest(BaseModel):
     purchaseAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False)
     reserveAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False, description='购买后需保留的应急金或现金底线；还要留5000元应急钱对应5000')
     protectedCategories: list[str] = Field(default_factory=list, max_length=30)
+
+    @model_validator(mode='after')
+    def validate_analysis_arguments(self):
+        if self.tool == 'forecast' and self.metric == 'all':
+            raise ValueError('forecast 必须选择 income、expense 或 net 指标')
+        if self.tool == 'aggregate' and self.aggregate is None:
+            self.aggregate = AggregateSpec()
+        return self
 
     @field_validator("tool")
     @classmethod

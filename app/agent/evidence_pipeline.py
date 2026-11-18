@@ -1,8 +1,25 @@
 """Pure analysis over authorized query snapshots; reusable after investigation."""
 
+from calendar import monthrange
+from datetime import date
+
 from app.schemas.plan import AnalysisRequest
 from app.tools.financial_analysis import _date, merge_orders, run_analysis
 from app.tools.source_analysis import observed_source_key
+
+
+def query_intervals(bound):
+    ranges = []
+    for call, _ in bound:
+        args = call.args
+        # Only an actually unrestricted query can cover unrestricted dates.
+        if args.year is None:
+            return None
+        start = date(args.year, args.month or 1, args.day or 1)
+        end_month = args.month or 12
+        end = date(args.year, end_month, args.day or monthrange(args.year, end_month)[1])
+        ranges.append({'startDate': start.isoformat(), 'endDate': end.isoformat()})
+    return ranges
 
 
 def collect_analysis_results(plan, datasets, today):
@@ -31,6 +48,8 @@ def collect_analysis_results(plan, datasets, today):
                       for group in plan.sourceGroups if any(key in known_keys for key in group.sourceKeys)]
             result = run_analysis(
                 task.tool, selected, as_of=today, metric=task.metric,
+                aggregate=task.aggregate.model_dump(mode='json') if task.aggregate else None,
+                queried_intervals=query_intervals(bound),
                 catalog_metric=plan.output.metric,
                 source_groups=groups,
                 target_month=task.targetMonth,

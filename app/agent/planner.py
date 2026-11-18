@@ -1,7 +1,7 @@
 import asyncio
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -15,6 +15,7 @@ from app.agent.prompts import PLANNER_HUMAN_PROMPT, PLANNER_SYSTEM_PROMPT
 from app.schemas.plan import (
     AgentPlan,
     AnalysisRequest,
+    AnalysisWindow,
     ScenarioChange,
     SearchPersonalOrdersArgs,
     ToolCall,
@@ -26,6 +27,39 @@ from app.tools.order_search import normalize_cost_type
 from app.tools.financial_analysis import ANALYSIS_TOOLS, shift_month
 
 HISTORY_BASED_TOOLS = {'forecast', 'scenario', 'savings', 'projection', 'purchase', 'runway', 'optimization'}
+
+
+# A complete calendar month ends before the current local month begins.
+_COMPLETE_MONTHS = re.compile(r'(?:最近|上)\s*([0-9]+|[一二两三四五六七八九十]+)\s*个?\s*完整(?:自然)?月份?')
+_CHINESE_DIGITS = {char: number for number, char in enumerate('零一二三四五六七八九')} | {'两': 2}
+
+
+def explicit_complete_month_window(message, today):
+    matches = list(_COMPLETE_MONTHS.finditer(message))
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    remaining = message[:match.start()] + message[match.end():]
+    # Leave compound comparisons and explicitly anchored lookbacks to the planner.
+    month_ref = r'(?:本月|这个月|当月|上个月|\d{4}[-年/.]\d{1,2}|(?:\d{1,2}|[一二三四五六七八九十]+)月)'
+    if re.search(rf'截至|截止|(?:和|与|对比|相比|到|至)\s*{month_ref}|{month_ref}(?:至今)?\s*(?:和|与)', remaining):
+        return None
+    raw = match[1]
+    if raw.isascii():
+        count = int(raw)
+    elif raw.count('十') == 1:
+        tens, units = raw.split('十')
+        if (tens and tens not in _CHINESE_DIGITS) or (units and units not in _CHINESE_DIGITS):
+            return None
+        count = _CHINESE_DIGITS.get(tens, 1) * 10 + _CHINESE_DIGITS.get(units, 0)
+    else:
+        count = _CHINESE_DIGITS.get(raw)
+    if count is None:
+        return None
+    if not 1 <= count <= 24:
+        raise ValueError('完整自然月范围应为 1 至 24 个月')
+    current_month = today.replace(day=1)
+    return AnalysisWindow(startDate=shift_month(current_month, -count), endDate=current_month - timedelta(days=1))
 
 
 class QueryPlanner:
@@ -74,10 +108,17 @@ class QueryPlanner:
                     raise ValueError("Missing plan")
                 plan = AgentPlan.model_validate(data)
                 self._materialize_requirements(plan)
-                self._inherit_conversation(plan, previous_context or {})
+                requested_window = explicit_complete_month_window(message, now.date())
+                if requested_window and requested_window != plan.analysisWindow:
+                    plan.analysisWindow = requested_window
+                    plan._planning_issues.append({'type': 'normalized_complete_month_window',
+                        'window': requested_window.model_dump(mode='json')})
+                context = self._inherit_conversation(plan, previous_context or {})
                 self._normalize_explicit_conditions(plan, message)
                 self._coalesce_forecasts(plan)
-                resolve_context(plan, previous_context or {}, self._normalize_mode(book_mode))
+                resolve_context(plan, context, self._normalize_mode(book_mode))
+                if requested_window and plan.intent == 'analyze_orders' and not plan.analyses and plan.toolCalls:
+                    self._prepare_analysis_queries(plan, now, book_mode)
                 plan._planning_issues.extend(issues)
                 return self._normalize_plan(plan, now, message, book_mode)
             except (asyncio.TimeoutError, json.JSONDecodeError, ValidationError, ValueError) as exc:
@@ -239,7 +280,7 @@ class QueryPlanner:
         requirements = set(plan.understanding.evidenceNeeds)
         tools = set()
         future = any(task.tool in HISTORY_BASED_TOOLS for task in plan.analyses)
-        if ('trends' in requirements or plan.output.chart != 'none') and not future:
+        if ('trends' in requirements or (plan.output.chart != 'none' and not any(task.tool == 'aggregate' for task in plan.analyses))) and not future:
             tools.add('trends')
         if requirements & {'sources', 'members', 'remarks'}:
             tools.add('sources')
@@ -254,7 +295,7 @@ class QueryPlanner:
         """Only inherit a referent's range and grouping within its ledger/filter scope."""
         conversation = previous.get('conversation', {})
         if not (plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext and conversation):
-            return
+            return previous
         if not plan.toolCalls:
             templates = conversation.get('queries') or []
             if not templates and len(previous.get('scope', [])) == 1:
@@ -265,18 +306,25 @@ class QueryPlanner:
             restored = [ToolCall.model_validate(row) for row in templates]
             restored_scope = sorted({(call.toolName, call.args.cost_type, call.args.remark) for call in restored})
             if [list(row) for row in restored_scope] != previous.get('scope'):
-                return
+                return {}
             plan.toolCalls = restored
         scopes = sorted({(call.toolName, call.args.cost_type, call.args.remark) for call in plan.toolCalls})
         if [list(row) for row in scopes] != previous.get('scope'):
-            return
+            return {}
         if not plan.analyses and plan.intent == 'analyze_orders':
             plan.analyses = [AnalysisRequest.model_validate(row) for row in conversation.get('analyses', [])]
         active = previous.get('activeAnalyses') or [row for row in conversation.get('analyses', []) if row.get('tool') != 'sources']
         previous_window = previous.get('activeHistoryWindow', conversation.get('analysisWindow'))
         same_window = not plan.analysisWindow or plan.analysisWindow.model_dump(mode='json') == previous_window
-        if (plan.intent == 'analyze_orders' and plan.analyses and all(task.tool == 'sources' for task in plan.analyses)
-                and active and same_window):
+        if not plan.sourceGroups:
+            from app.schemas.plan import SourceGroup
+            plan.sourceGroups = [SourceGroup.model_validate(row) for row in conversation.get('sourceGroups', [])]
+        sources_only = bool(plan.analyses) and all(task.tool == 'sources' for task in plan.analyses)
+        if sources_only and not same_window:
+            # The explicit historical range establishes a new referent for future turns.
+            # Preserve the restored query scope, but drop the superseded decision conditions.
+            return {}
+        if plan.intent == 'analyze_orders' and sources_only and active:
             # Inspecting records is a subtask of the referenced analysis. Keep the
             # active calculation available when a later question asks how it worked.
             restored_tasks = [AnalysisRequest.model_validate(row) for row in active]
@@ -286,11 +334,8 @@ class QueryPlanner:
                     task.queryIds = sorted(known_ids)
             plan.analyses.extend(restored_tasks)
         if not plan.analysisWindow and conversation.get('analysisWindow'):
-            from app.schemas.plan import AnalysisWindow
             plan.analysisWindow = AnalysisWindow.model_validate(conversation['analysisWindow'])
-        if not plan.sourceGroups:
-            from app.schemas.plan import SourceGroup
-            plan.sourceGroups = [SourceGroup.model_validate(row) for row in conversation.get('sourceGroups', [])]
+        return previous
 
     def _coalesce_forecasts(self, plan):
         groups = {}
@@ -343,20 +388,33 @@ class QueryPlanner:
             start = plan.analysisWindow.startDate.replace(day=1)
             end = plan.analysisWindow.endDate.replace(day=1)
             length = (end.year - start.year) * 12 + end.month - start.month + 1
+            if length > 24 and any(task.tool == 'aggregate' for task in plan.analyses):
+                raise ValueError('汇总区间跨度不能超过 24 个自然月')
             requested_periods = [shift_month(start, offset) for offset in range(length)]
             periods = requested_periods
         for task in plan.analyses:
             if task.tool == "budget":
                 target = datetime.strptime(task.targetMonth, "%Y-%m").date() if task.targetMonth else now.date().replace(day=1)
                 periods = sorted(set(periods + [target]))
-        plan.toolCalls = [
-            ToolCall(id=f"analysis_{index}_{period:%Y%m}", toolName=tool,
-                     sourceIds=sources[(tool, category, remark)],
-                     args=SearchPersonalOrdersArgs(year=period.year, month=period.month, cost_type=category, remark=remark),
-                     reason="取得历史证据用于分析，区分完整月份和未完月份")
-            for index, (tool, category, remark) in enumerate(sources, start=1)
-            for period in periods
-        ]
+        calls = []
+        for index, ((tool, category, remark), identifiers) in enumerate(sources.items(), 1):
+            query_months = periods
+            if not plan.analysisWindow:
+                bound = [task for task in plan.analyses if not task.queryIds or set(identifiers).intersection(task.queryIds)]
+                explicit = [task for task in bound if task.tool == 'aggregate' and task.aggregate and task.aggregate.periods]
+                if explicit:
+                    ranges = [period for task in explicit for period in task.aggregate.periods]
+                    start = min(period.startDate for period in ranges).replace(day=1)
+                    end = max(period.endDate for period in ranges).replace(day=1)
+                    length = (end.year - start.year) * 12 + end.month - start.month + 1
+                    if length > 24:
+                        raise ValueError('汇总区间跨度不能超过 24 个自然月')
+                    aggregate_months = [shift_month(start, offset) for offset in range(length)]
+                    query_months = aggregate_months if len(explicit) == len(bound) else sorted(set(periods + aggregate_months))
+            calls.extend(ToolCall(id=f"analysis_{index}_{period:%Y%m}", toolName=tool, sourceIds=identifiers,
+                                  args=SearchPersonalOrdersArgs(year=period.year, month=period.month, cost_type=category, remark=remark),
+                                  reason="取得历史证据用于分析，区分完整月份和未完月份") for period in query_months)
+        plan.toolCalls = calls
 
     def _normalize_tool_call(
         self,

@@ -1,7 +1,10 @@
 import unittest
+from datetime import date
+from json import dumps
 
 from app.agent import evidence_report
 from app.agent.artifacts import build_artifacts, render_artifacts_markdown
+from app.tools.aggregate_analysis import aggregate_analysis
 
 
 def forecast_result():
@@ -32,6 +35,17 @@ def expense_forecast():
         'metric': 'expense', 'sufficientData': True, 'targetMonth': '2026-12',
         'estimate': 800, 'lower': 600, 'upper': 900,
     }}
+
+
+def aggregate_result(records, *, metric='all', queried_intervals=None, **spec):
+    return {'tool': 'aggregate', 'mode': '家庭版', 'evidence': aggregate_analysis(
+        records, as_of=date(2026, 11, 19), metric=metric, aggregate=spec, queried_intervals=queried_intervals,
+    )}
+
+
+def aggregate_order(year, amount, *, member_key='opaque-member-a', category='交通'):
+    return {'year': year, 'month': 1, 'day': 2, 'money': amount, 'costType': category,
+            'memberKey': member_key, 'memberName': '同名成员'}
 
 
 class ArtifactTests(unittest.TestCase):
@@ -164,6 +178,149 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(text.splitlines()[-1],
                          '| `` [账户](https://example.invalid/a) ![图](https://example.invalid/b) '
                          'https://example.invalid/c `内` \\| 末 下一行 `` | 42.25 |')
+
+    def test_aggregate_table_preserves_same_name_groups_without_publishing_opaque_keys(self):
+        result = aggregate_result([
+            aggregate_order(2025, -40),
+            aggregate_order(2025, -20, member_key='opaque-member-b'),
+            aggregate_order(2025, -2, member_key='opaque-member-c'),
+        ], groupBy=['member', 'source'], limit=2)
+        for row in result['evidence']['rows']:
+            row['sourceKey'] = 'opaque-source'
+        artifacts = build_artifacts([result], {'table': True})
+        self.assertEqual(len(artifacts), 1)
+        table = artifacts[0]
+        self.assertEqual(table['kind'], 'table')
+        self.assertEqual([(row['member'], row['source'], row['expense']) for row in table['rows']],
+                         [('同名成员', '交通', 40), ('同名成员', '交通', 20)])
+        keys = {column['key'] for column in table['columns']}
+        self.assertTrue(all(set(row) == keys for row in table['rows']))
+        self.assertNotIn('memberKey', keys)
+        self.assertNotIn('sourceKey', keys)
+        self.assertNotIn('opaque-', dumps(table))
+        self.assertTrue(any('1 个分组' in note for note in table['notes']))
+
+    def test_aggregate_export_shows_period_statistics_and_keeps_unknown_comparisons(self):
+        periods = [{'label': str(year), 'startDate': f'{year}-01-01', 'endDate': f'{year}-01-31'}
+                   for year in (2024, 2025, 2026)]
+        result = aggregate_result([
+            aggregate_order(2024, -10), aggregate_order(2024, -10), aggregate_order(2024, -40),
+            aggregate_order(2025, -80),
+        ], metric='expense', periods=periods)
+        artifacts = build_artifacts([result], {'export': True, 'table': False, 'chart': 'none'})
+        self.assertEqual(len(artifacts), 2)
+        table, comparison = artifacts
+        self.assertEqual((table['kind'], comparison['kind']), ('table', 'table'))
+        first = next(row for row in table['rows'] if row['period'] == '2024')
+        self.assertEqual(
+            tuple(first[key] for key in ('amount', 'count', 'meanTransactionAmount', 'medianTransactionAmount', 'sharePercent')),
+            (60, 3, 20, 10, 100),
+        )
+        before, missing = comparison['rows']
+        self.assertEqual((before['before'], before['after'], before['change'], before['changePercent']),
+                         (60, 80, 20, 33.33))
+        self.assertEqual(missing['afterPeriod'], '2026')
+        self.assertIsNone(missing['after'])
+        self.assertIsNone(missing['change'])
+        self.assertIsNone(missing['changePercent'])
+        self.assertTrue(any('2026-01-01' in note and '未知' in note for note in table['notes']))
+        self.assertTrue(any('占比' in note and '分母' in note for note in table['notes']))
+
+    def test_aggregate_enumeration_shows_every_bounded_group_without_output_flags(self):
+        result = aggregate_result([
+            aggregate_order(2025, -amount, category=f'分类{amount}') for amount in range(1, 13)
+        ], metric='expense', groupBy=['category'])
+        artifacts = build_artifacts([result], {'table': False, 'export': False})
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0]['kind'], 'table')
+        self.assertEqual(len(artifacts[0]['rows']), 12)
+
+    def test_aggregate_comparison_columns_use_comparison_dimensions_only(self):
+        periods = [{'label': str(year), 'startDate': f'{year}-01-01', 'endDate': f'{year}-01-31'}
+                   for year in (2024, 2025)]
+        records = [aggregate_order(2024, -30), aggregate_order(2025, -40)]
+        result = aggregate_result(records,
+                                  metric='expense', groupBy=['month', 'category'], periods=periods)
+        main, comparison = build_artifacts([result], {'table': True})
+        self.assertIn('month', {column['key'] for column in main['columns']})
+        keys = {column['key'] for column in comparison['columns']}
+        self.assertIn('category', keys)
+        self.assertNotIn('month', keys)
+        self.assertEqual(comparison['rows'][0]['category'], '交通')
+        self.assertEqual(comparison['rows'][0]['change'], 10)
+
+        result = aggregate_result(records, metric='expense', groupBy=['month'], periods=periods)
+        _, comparison = build_artifacts([result], {'table': True})
+        self.assertNotIn('month', {column['key'] for column in comparison['columns']})
+
+    def test_aggregate_discloses_partial_and_unqueried_periods(self):
+        result = aggregate_result([aggregate_order(2024, -20)], metric='expense', periods=[
+            {'label': '部分查询', 'startDate': '2024-01-01', 'endDate': '2024-01-31'},
+            {'label': '未查询', 'startDate': '2025-01-01', 'endDate': '2025-01-31'},
+        ], queried_intervals=[
+            {'startDate': '2024-01-01', 'endDate': '2024-01-08'},
+            {'startDate': '2024-01-15', 'endDate': '2024-01-22'},
+        ])
+        main, _ = build_artifacts([result], {'table': True})
+        partial_note, unqueried_note = main['notes'][:2]
+        self.assertIn('部分已查询', partial_note)
+        self.assertIn('2024-01-08', partial_note)
+        self.assertIn('2024-01-15', partial_note)
+        self.assertIn('找到 1 笔', partial_note)
+        self.assertIn('金额未知', partial_note)
+        self.assertIn('未查询', unqueried_note)
+        self.assertIn('金额未知', unqueried_note)
+        self.assertNotIn('缺少账单记录', partial_note + unqueried_note)
+
+    def test_aggregate_category_bar_chart_uses_the_requested_metric(self):
+        result = aggregate_result([
+            aggregate_order(2025, -50), aggregate_order(2025, 500),
+            aggregate_order(2025, -80, category='餐饮'),
+        ], groupBy=['category'])
+        artifacts = build_artifacts([result], {
+            'chart': 'bar', 'chartTarget': 'aggregate', 'metric': 'expense', 'table': False,
+        })
+        self.assertEqual({item['kind'] for item in artifacts}, {'table', 'bar'})
+        chart = next(item for item in artifacts if item['kind'] == 'bar')
+        self.assertEqual(chart['xKey'], 'category')
+        self.assertEqual(chart['series'], [{'key': 'expense', 'label': '支出'}])
+        self.assertEqual(chart['rows'], [{'category': '交通', 'expense': 50}, {'category': '餐饮', 'expense': 80}])
+
+    def test_aggregate_multidimensional_chart_request_retains_full_table(self):
+        result = aggregate_result([aggregate_order(2025, -50)], groupBy=['member', 'category'])
+        artifacts = build_artifacts([result], {
+            'chart': 'bar', 'chartTarget': 'aggregate', 'metric': 'all', 'table': False,
+        })
+        self.assertEqual([item['kind'] for item in artifacts], ['table'])
+        self.assertEqual((artifacts[0]['rows'][0]['member'], artifacts[0]['rows'][0]['category']),
+                         ('同名成员', '交通'))
+        self.assertTrue(any('一个分组维度' in note for note in artifacts[0]['notes']))
+
+    def test_aggregate_period_chart_keeps_unqueried_period_as_unknown(self):
+        periods = [{'label': str(year), 'startDate': f'{year}-01-01', 'endDate': f'{year}-01-31'}
+                   for year in (2024, 2025, 2026)]
+        result = aggregate_result([aggregate_order(2024, -20), aggregate_order(2026, -80)],
+                                  metric='expense', periods=periods, queried_intervals=[periods[0], periods[2]])
+        artifacts = build_artifacts([result], {'chart': 'line', 'chartTarget': 'aggregate'})
+        chart = next(item for item in artifacts if item['kind'] == 'line')
+        self.assertEqual(chart['rows'], [
+            {'period': '2024', 'expense': 20},
+            {'period': '2025', 'expense': None},
+            {'period': '2026', 'expense': 80},
+        ])
+        self.assertTrue(any('2025-01-01' in note and '未查询' in note for note in chart['notes']))
+
+    def test_aggregate_export_with_no_observed_group_keeps_amount_unknown(self):
+        result = aggregate_result([], groupBy=['category'], metric='net', periods=[
+            {'label': '缺账区间', 'startDate': '2026-01-01', 'endDate': '2026-01-31'},
+        ])
+        artifacts = build_artifacts([result], {'export': True})
+        self.assertEqual(len(artifacts), 1)
+        table = artifacts[0]
+        self.assertEqual(table['rows'][0]['period'], '缺账区间')
+        self.assertIsNone(table['rows'][0]['amount'])
+        self.assertIsNone(table['rows'][0]['count'])
+        self.assertIn('未知', render_artifacts_markdown([table]))
 
 
 if __name__ == '__main__':

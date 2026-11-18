@@ -54,6 +54,85 @@ class PlanningInheritanceTests(unittest.IsolatedAsyncioTestCase):
             'analyses': [{'tool': 'sources'}]}, previous, '只看上个月的入账来源')
         self.assertNotIn('forecast', {task.tool for task in plan.analyses})
 
+    async def test_complete_month_request_repairs_wrong_model_window_before_fetch(self):
+        draft = {'analysisWindow': {'startDate': '2026-10-01', 'endDate': '2026-11-19'},
+                 'analyses': [{'tool': 'changes'}]}
+        for wording, months in [('最近两个完整月', 2), ('上3个完整自然月', 3), ('最近十二个完整月份', 12)]:
+            with self.subTest(wording=wording):
+                plan = await self.planned(draft, {}, f'对照我{wording}，哪项开销把总支出拉高了？')
+                start_year, offset = divmod(2026 * 12 + 10 - months, 12)
+                self.assertEqual(plan.analysisWindow.startDate, date(start_year, offset + 1, 1))
+                self.assertEqual(plan.analysisWindow.endDate, date(2026, 10, 31))
+                self.assertEqual(len(plan.toolCalls), months)
+                self.assertEqual((plan.toolCalls[-1].args.year, plan.toolCalls[-1].args.month), (2026, 10))
+
+    async def test_simple_complete_month_query_expands_wrong_single_month_lookup(self):
+        plan = await self.planned({'analysisType': 'total_spending', 'toolCalls': [
+            {'id': 'expenses', 'toolName': 'search_personal_orders', 'args': {'year': 2026, 'month': 11}}]},
+            {}, '最近两个完整月总共花了多少？不含本月。')
+        self.assertEqual([(q.args.year, q.args.month) for q in plan.toolCalls], [(2026, 9), (2026, 10)])
+        self.assertEqual(plan.analysisWindow.endDate, date(2026, 10, 31))
+
+    async def test_forecast_target_does_not_override_explicit_complete_sample_months(self):
+        plan = await self.planned({'analysisWindow': {'startDate': '2026-10-01', 'endDate': '2026-11-19'},
+            'analyses': [{'tool': 'forecast', 'targetMonth': '2027-01'}]}, {},
+            '用最近两个完整月的记录，估计2027年1月收入')
+        self.assertEqual([q.args.month for q in plan.toolCalls], [9, 10])
+        self.assertEqual(plan.analyses[0].targetMonth, '2027-01')
+
+    async def test_rolling_and_compound_periods_keep_model_window(self):
+        draft = {'analysisWindow': {'startDate': '2026-09-20', 'endDate': '2026-11-19'},
+                 'analyses': [{'tool': 'trends'}]}
+        for question in ('最近两个月的收入', '比较最近两个完整月和本月至今',
+                         '比较最近两个完整月与最近三个完整月', '截至2025年1月的上两个完整月'):
+            with self.subTest(question=question):
+                plan = await self.planned(draft, {}, question)
+                self.assertEqual(plan.analysisWindow.model_dump(mode='json'), draft['analysisWindow'])
+
+    async def test_historical_pivot_replaces_the_saved_forecast_referent(self):
+        from app.agent.analysis_context import latest_context
+        from app.agent.book_agent import BookAgent
+        agent = BookAgent.__new__(BookAgent)
+        agent.memory = AsyncMock()
+
+        async def saved(plan):
+            await agent._save_assistant_reply('synthetic', 'local', '已核算', plan)
+            message = agent.memory.add_message.await_args.kwargs
+            return latest_context(json.loads(json.dumps([message], ensure_ascii=False)))
+
+        original = await self.planned({'analyses': [{'tool': 'forecast', 'targetMonth': '2027-01'}]}, {},
+                                      '预计明年一月收入')
+        for explicit_history in (True, False):
+            with self.subTest(explicit_history=explicit_history):
+                second_draft = {'followUpOfPreviousQuestion': True, 'analyses': [{'tool': 'sources'}]}
+                if explicit_history:
+                    second_draft['analysisWindow'] = {'startDate': '2026-10-01', 'endDate': '2026-10-31'}
+                second = await self.planned(second_draft, await saved(original),
+                                            '只看十月入账来源' if explicit_history else '列出刚才预测的来源')
+                third = await self.planned({'followUpOfPreviousQuestion': True, 'analyses': [{'tool': 'sources'}]},
+                                           await saved(second), '按刚才的口径列出每个来源的备注')
+                forecasts = [task for task in third.analyses if task.tool == 'forecast']
+                if explicit_history:
+                    self.assertEqual(forecasts, [])
+                    self.assertEqual(third.analysisWindow.model_dump(mode='json'), second_draft['analysisWindow'])
+                    self.assertNotIn('targetMonth', third._analysis_context)
+                else:
+                    self.assertEqual([task.targetMonth for task in forecasts], ['2027-01'])
+
+    async def test_aggregate_periods_fetch_the_enclosing_range_or_explicit_window(self):
+        periods = [{'label': '甲', 'startDate': '2025-02-11', 'endDate': '2025-02-27'},
+                   {'label': '乙', 'startDate': '2025-04-16', 'endDate': '2025-04-24'}]
+        draft = {'analyses': [{'tool': 'aggregate', 'metric': 'expense', 'aggregate': {'periods': periods}}]}
+        result = await self.planned(draft, {}, '比较这两个历史时段')
+        self.assertEqual([(q.args.year, q.args.month) for q in result.toolCalls], [(2025, 2), (2025, 3), (2025, 4)])
+        constrained = await self.planned({**draft, 'analysisWindow': {'startDate': '2025-04-01', 'endDate': '2025-04-30'}},
+                                         {}, '只算四月范围内的记录')
+        self.assertEqual([(q.args.year, q.args.month) for q in constrained.toolCalls], [(2025, 4)])
+        periods[0]['startDate'] = '2023-01-01'
+        too_long = await self.planned(draft, {}, '比较这些月份')
+        self.assertFalse(too_long.toolCalls)
+        self.assertTrue(any('24' in issue.get('detail', '') for issue in too_long._planning_issues))
+
     async def test_terse_followup_restores_the_referenced_family_query(self):
         previous = {'scope': [['search_family_orders', '不限', '']], 'startingBalance': 1000,
             'purchaseAmount': 700, 'conversation': {'analyses': [{'tool': 'purchase', 'queryIds': ['family'],

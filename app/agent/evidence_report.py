@@ -65,7 +65,58 @@ def build_facts(results):
             if tool == 'purchase' and e.get('purchaseAmount') is not None:
                 add(f"计划购买金额 {money(e['purchaseAmount'])} 元。月度结余不是现有存款，暂不能判断购买后是否影响生活。", True, values=[q('购买金额', e['purchaseAmount'])])
             continue
-        if tool == 'cashflow':
+        if tool == 'aggregate':
+            observed = any(row['observed'] for row in e['coverage'])
+            totals = e['totals']
+            labels = {'income': '收入', 'expense': '支出', 'net': '净额'}
+            measures = ('income', 'expense', 'net') if e['metric'] in {'all', 'net'} else (e['metric'],)
+            partial = any(row.get('queryCoverage', 'complete') != 'complete' for row in e['coverage'])
+            basis = '仅已查询部分' if partial else '所选区间并集'
+            if observed:
+                amounts = '、'.join(f"{labels[name]} {money(totals[name])} 元" for name in measures)
+                add(f"按{basis}与筛选条件去重后，已记{amounts}，共 {totals['count']} 笔；区间重叠的账单只在此总计中计入一次。", True,
+                    values=[q(name, totals[name]) for name in measures] + [q('纳入笔数', totals['count'], '笔')])
+            else:
+                add('所选区间完全没有已记录账单，实际收支未知，不能将空结果当成现实收支为零。', True)
+            if e.get('appliedFilters'):
+                audit = e['filterAudit']['excludedByFilters']
+                add(f"已应用筛选 {literal(json.dumps(e['appliedFilters'], ensure_ascii=False))}，由此排除 {audit['count']} 笔、其中支出 {money(audit['expense'])} 元、收入 {money(audit['income'])} 元。筛选后统计仅代表选中的账单。", True,
+                    values=[q('被条件排除的笔数', audit['count'], '笔'), q('被条件排除的支出', audit['expense']), q('被条件排除的收入', audit['income'])])
+            for coverage in e['coverage']:
+                query_status = coverage.get('queryCoverage', 'complete')
+                if query_status != 'complete':
+                    add(f"区间 {literal(coverage['period'])} 的查询覆盖为" + ('部分已查询，剩余日期尚未查询，不能当作缺账或零金额。' if query_status == 'partial' else '未查询，金额未知，不能当作没有记账。'), True)
+                add(f"区间 {literal(coverage['period'])}：{coverage['startDate']} 至 {coverage['endDate']}，" +
+                    (f"已查询部分记录 {coverage['recordCount']} 笔，其中 {coverage['matchedCount']} 笔符合所选指标和筛选；有记录仍不能证明全部现实交易都已记账。" if coverage['observed'] else
+                     '已查询范围内未见记录，金额和变化未知。' if query_status != 'complete' else '完整查询后未见账单，现实金额和变化仍未知。'),
+                    not coverage['observed'], values=[q('区间开始', coverage['startDate'], 'date'), q('区间结束', coverage['endDate'], 'date'),
+                        q('区间已记笔数', coverage['recordCount'], '笔'), q('筛选匹配笔数', coverage['matchedCount'], '笔')])
+            for row in e['rows'][:8]:
+                dimensions = '、'.join(f"{name}={literal(row[name])}" for name in e['dimensions'] if name in row) or '全部选中记录'
+                amounts = '，'.join(f"{labels[name]} {money(row[name])} 元" for name in measures)
+                values = [q(name, row[name]) for name in measures] + [q('账单笔数', row['count'], '笔')]
+                detail = ''
+                if row['meanTransactionAmount'] is not None:
+                    detail = f"，每笔金额均值 {money(row['meanTransactionAmount'])} 元，中位数 {money(row['medianTransactionAmount'])} 元"
+                    values.extend(q(name, row[name]) for name in ('meanTransactionAmount', 'medianTransactionAmount'))
+                if row['sharePercent'] is not None:
+                    detail += f"，占同区间筛选后该方向金额 {row['sharePercent']}%"
+                    values.append(q('同区间筛选后方向占比', row['sharePercent'], '%'))
+                if row.get('month'):
+                    values.append(q('月份', row['month'], 'month'))
+                add(f"{dimensions}：{amounts}，{row['count']} 笔{detail}。", values=values)
+            for row in e['comparisons'][:4]:
+                dimensions = '、'.join(f"{name}={literal(row[name])}" for name in e.get('comparisonDimensions', e['dimensions']) if name != 'period' and name in row) or '全部选中记录'
+                if row['change'] is None:
+                    add(f"{dimensions}，{literal(row['beforePeriod'])} 对比 {literal(row['afterPeriod'])}：至少一个区间未查全或没有已记账单，变化未知。", True)
+                else:
+                    add(f"{dimensions}，{literal(row['beforePeriod'])} 至 {literal(row['afterPeriod'])}的已记{labels[row['metric']]}从 {money(row['before'])} 元变为 {money(row['after'])} 元，变化 {money(row['change'])} 元。", True,
+                        values=[q(name, row[name]) for name in ('before', 'after', 'change')] + [q('变化率', row.get('changePercent'), '%')])
+            if e['omittedGroupCount'] or e['omittedComparisonCount']:
+                add(f"详细表省略 {e['omittedGroupCount']} 个分组、{e['omittedComparisonCount']} 项比较；总计仍覆盖完整筛选范围，不能把展示行当作全部数据。", True,
+                    values=[q('省略分组', e['omittedGroupCount'], '个'), q('省略比较', e['omittedComparisonCount'], '项')])
+            add('账单笔数和每笔均额是记账统计，不能据此断定商品单价、购买数量或现实消费频率；同名来源是否同一业务仍需结合备注核查。')
+        elif tool == 'cashflow':
             add(e['computedConclusion'], True)
             for row in e.get('incomeSources', [])[:3]:
                 add(f"查询期收入来源“{row['source']}”累计 {money(row['amount'])} 元，占查询期收入 {row['sharePercent']}%。", values=[q('金额', row['amount']), q('sharePercent', row['sharePercent'], '%')])
@@ -90,6 +141,10 @@ def build_facts(results):
             for direction, label in (('expense', '支出'), ('income', '收入')):
                 for row in [r for r in e[direction + 'Drivers'] if r['change']][:3]:
                     add(f"同期{label}变化来自“{row['name']}”：{money(row['before'])} → {money(row['after'])} 元，变化 {money(row['change'])} 元。记录备注：{'、'.join(row.get('afterRemarks', []))}。备注只能说明记录内容，不能确认现实原因或是否再次发生。", True, values=[q('前期金额', row['before']), q('后期金额', row['after']), q('金额变化', row['change'])])
+                    if row.get('countContribution') is not None:
+                        add(f"“{row['name']}”的账单笔数由 {row['beforeCount']} 笔变为 {row['afterCount']} 笔，每笔均额由 {money(row['meanAmountBefore'])} 元变为 {money(row['meanAmountAfter'])} 元；对称分解中笔数变化贡献 {money(row['countContribution'])} 元、每笔均额变化贡献 {money(row['meanContribution'])} 元。两项相加为上面的金额变化；这是记账层面的分解，不能推断商品单价或实际购买数量变化。",
+                            values=[q('前期笔数', row['beforeCount'], '笔'), q('后期笔数', row['afterCount'], '笔')] +
+                                [q(name, row[name]) for name in ('meanAmountBefore', 'meanAmountAfter', 'countContribution', 'meanContribution')])
         elif tool == 'recurring':
             for direction, label in (('income', '收入'), ('expense', '支出')):
                 for row in e.get(direction, [])[:4]:
@@ -285,6 +340,7 @@ factIds 选择下面提供的证据，程序会原样显示这些完整句子。
 先读取 understanding.requestedAnswers 和 instruction，逐项完成当前问题。history 中助手的上轮回答用于解析指代，不能当作本轮重新核实的事实。
 artifacts 是程序已经生成的表格和图表，会自动附在回答后面；解释其中的来源、备注和成员，不要声称无法读取这些信息，也不要再手抄同一张表。
 analysis 可以自然解释具体数量与条件，但只能引用本段 factIds 所包含的计算事实、相同指标和单位，不能从备注提取编号当作金额，不能自行计算新数字。日期可以按原有目标月和参考月表达。
+同一个总额如果在不同段落重复，每一段都必须引用包含该总额的 factId；不能仅引用分项证据却重复总额。日期优先使用明确的 YYYY-MM，避免省略年份造成歧义。解释算法时区分中位数和均值，不将历史条件估计称为已确定的未来收入。
 也可使用 values 变量，例如“这个来源为{{v1}}”；变量已经包含单位，不要再加元、天或百分号。每个变量所属 factId 必须在本段 factIds 中。代码生成的表格已经包含全部来源，不要手抄表格。
 示例：{"sections":[{"title":"收入来源与后续条件","factIds":["f1","f2"],"analysis":"这项估计延续已记录的来源和金额。应确认后续项目安排，再分别测算继续、减少和停止的情景。"}]}。
 用户问值得注意的问题时，也可以给出观察和待确认事项，不要强行编造问题。来源名称不证明兼职不稳定，支出占比不证明房租偏高，样本不足不证明漏记或健康风险。

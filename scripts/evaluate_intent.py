@@ -81,8 +81,12 @@ def dialogues(today):
         ]),
         "expense_decision": ("个人版", [
             ("change", "对照我最近两个完整月，哪项开销把总支出拉高了，增加了多少？"),
-            ("saving", "沿用刚才那组开销，房租和交通继续保留。我想每月多留三百，哪些地方可调整，还差多少？"),
+            ("saving", "沿用刚才这两个完整月的开销作参照，房租和交通继续保留。我想每月多留三百，哪些地方可调整，还差多少？"),
             ("buy", "按刚才讲的情况，我现在能直接拿七百元买扫描仪吗？还需要什么信息才能判断？"),
+        ]),
+        "cross_dimensions": ("个人版", [
+            ("aggregate", "对照上上个月和上个月，排除房租、交通后，我的支出按月份和类别列出金额、账单笔数和每笔均额，各类别增加多少？给表，不用画图。"),
+            ("weekday", "沿用这两个月的范围，只看展览，按星期几分组，哪天的已记支出最多？给金额和笔数。"),
         ]),
     }
 
@@ -162,9 +166,38 @@ def check_turn(kind, today, reply, metadata, lookups):
     if kind == "saving":
         optimization = evidence.get("optimization", {})
         checks.update({"protectedCosts": {"房租", "交通"} <= set(optimization.get("protectedCategories", [])),
-                       "targetGap": optimization.get("reviewableMonthlySpend") == 180
-                           and optimization.get("gapBeyondReviewableSpend") == 120,
-                       "candidateCommunicated": "展览" in visible and {180, 120} <= amounts})
+                       # The explicitly retained two-month sample has 180 and 440
+                       # in exhibition expenses; its median is 310, not the
+                       # six-month baseline of 180 used by an earlier assertion.
+                       "targetGap": optimization.get("reviewableMonthlySpend") == 310
+                           and optimization.get("monthlyImprovement") == 300
+                           and optimization.get("gapBeyondReviewableSpend") == 0,
+                       "candidateCommunicated": "展览" in visible and 310 in amounts})
+    if kind == "aggregate":
+        aggregate = evidence.get('aggregate', {})
+        rows = aggregate.get('rows', [])
+        categories = {r.get('category') for r in rows}
+        changes = aggregate.get('comparisons', [])
+        # A month grouping can also compare the displayed per-month values.
+        months = [shift_month(today, offset).strftime('%Y-%m') for offset in (-2, -1)]
+        exhibit = {r.get('month'): r for r in rows if r.get('category') == '展览'}
+        checked = any(r.get('category') == '展览' and r.get('change') == 260 for r in changes)
+        checked = checked or (exhibit.get(months[0], {}).get('expense') == 180
+                              and exhibit.get(months[1], {}).get('expense') == 440)
+        checks.update(filteredTotal=aggregate.get('totals', {}).get('expense') == 1060,
+                      categories=categories == {'餐饮', '展览'},
+                      perRecordStatistics=any(r.get('category') == '展览' and r.get('count') == 2
+                          and r.get('meanTransactionAmount') == 220 for r in rows),
+                      comparisonAvailable=checked,
+                      tableRendered=any(a.get('kind') == 'table' for a in artifacts),
+                      interpretedChange='展览' in visible and 260 in amounts)
+    if kind == "weekday":
+        aggregate = evidence.get('aggregate', {})
+        rows = aggregate.get('rows', [])
+        top = next((r for r in rows if r.get('weekday') == '星期一'), {})
+        checks.update(onlyExhibition=aggregate.get('totals', {}).get('expense') == 620,
+                      weekdayStatistic=top.get('expense') == 440 and top.get('count') == 2,
+                      answerUsesWeekday='星期一' in visible and 440 in amounts)
     if kind == "buy":
         purchase = evidence.get("purchase", {})
         checks.update({"purchaseValue": purchase.get("purchaseAmount") == 700,

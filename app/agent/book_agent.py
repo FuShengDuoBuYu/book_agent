@@ -200,7 +200,8 @@ class BookAgent:
                 results = self._safe_json_loads(orders_json).get('analysisResults', [])
                 needs = set(plan.understanding.evidenceNeeds)
                 chart_target = ('projection' if any(row['tool'] == 'projection' for row in results) else
-                                'forecast' if any(row['tool'] == 'forecast' for row in results) else 'trends')
+                                'forecast' if any(row['tool'] == 'forecast' for row in results) else
+                                'aggregate' if any(row['tool'] == 'aggregate' for row in results) else 'trends')
                 output = {**plan.output.model_dump(), 'chartTarget': chart_target,
                           'includeLineage': 'remarks' in needs,
                           'includeSources': bool(needs & {'sources', 'members', 'remarks'} or

@@ -1,0 +1,118 @@
+import unittest
+from datetime import date
+from unittest.mock import AsyncMock
+
+from pydantic import ValidationError
+
+from app.agent.evidence_pipeline import collect_analysis_results
+from app.agent.evidence_report import build_facts, validate_draft
+from app.schemas.plan import AgentPlan, AnalysisRequest
+from app.schemas.report import ReportDraft
+from tests.test_aggregate_analysis import row, period
+
+
+class AggregatePipelineTests(unittest.TestCase):
+    def test_plan_validates_bounded_aggregate_arguments_and_forecast_direction(self):
+        with self.assertRaises(ValidationError):
+            AnalysisRequest.model_validate({'tool': 'aggregate', 'aggregate': {'groupBy': ['sql']}})
+        with self.assertRaises(ValidationError):
+            AnalysisRequest(tool='forecast', metric='all')
+        task = AnalysisRequest.model_validate({'tool': 'aggregate', 'metric': 'all',
+            'aggregate': {'groupBy': ['member', 'category']}})
+        self.assertEqual(task.aggregate.groupBy, ['member', 'category'])
+
+    def test_query_bound_filters_periods_and_computed_values_reach_report(self):
+        plan = AgentPlan.model_validate({'toolCalls': [{'id': 'family', 'toolName': 'search_family_orders'}],
+            'output': {'table': True, 'metric': 'expense'}, 'analyses': [{'tool': 'aggregate',
+                'queryIds': ['family'], 'metric': 'expense', 'aggregate': {'groupBy': ['member', 'category'],
+                    'periods': [period('九月', '2026-09-01', '2026-09-30'),
+                                period('十月', '2026-10-01', '2026-10-31')],
+                    'filters': {'excludeCategories': ['房租']}}}]})
+        records = [row('2026-09-05', -10, '餐饮'), row('2026-10-05', -30, '餐饮'),
+                   row('2026-10-05', -900, '房租')]
+        data = collect_analysis_results(plan, {'家庭版': [(plan.toolCalls[0], records)]}, date(2026, 11, 19))
+        evidence = next(r['evidence'] for r in data if r['tool'] == 'aggregate')
+        self.assertEqual(evidence['totals']['expense'], 40)
+        self.assertEqual(evidence['comparisons'][0]['change'], 20)
+        facts = build_facts([data[0]])
+        text = '\n'.join(f['text'] for f in facts)
+        self.assertIn('餐饮', text)
+        self.assertIn('房租', text)
+        self.assertIn('20', text)
+        draft = ReportDraft.model_validate({'sections': [{'title': '区间比较',
+            'factIds': [f['id'] for f in facts], 'analysis': '餐饮已记支出增加20元；房租已按要求排除。'}]})
+        self.assertFalse(validate_draft(draft, facts))
+
+    def test_count_and_mean_changes_are_reported_as_ledger_statistics(self):
+        from app.tools.financial_analysis import run_analysis
+        records = [row('2026-09-05', -10, '票券'), row('2026-10-05', -10, '票券'),
+                   row('2026-10-06', -30, '票券')]
+        result = run_analysis('changes', records, as_of=date(2026, 11, 19),
+                              window_start=date(2026, 9, 1), window_end=date(2026, 10, 31))
+        facts = build_facts([{'tool': 'changes', 'evidence': result}])
+        text = '\n'.join(f['text'] for f in facts)
+        self.assertIn('笔数', text)
+        self.assertIn('每笔', text)
+        self.assertIn('单价', text)
+
+    def test_directional_facts_do_not_call_filtered_income_or_net_a_ledger_total(self):
+        from app.tools.financial_analysis import run_analysis
+        data = run_analysis('aggregate', [row('2026-10-05', 500, '收入'), row('2026-10-06', -70, '餐饮')],
+                            as_of=date(2026, 11, 19), metric='expense', aggregate={'groupBy': ['category']})
+        facts = build_facts([{'tool': 'aggregate', 'evidence': data}])
+        text = '\n'.join(f['text'] for f in facts)
+        self.assertNotIn('收入 0 元', text)
+        self.assertNotIn('净额 -70 元', text)
+        self.assertIn('支出 70 元', text)
+
+    def test_pipeline_marks_requested_periods_outside_actual_query_as_partial(self):
+        plan = AgentPlan.model_validate({'toolCalls': [{'id': 'ledger', 'toolName': 'search_personal_orders',
+                'args': {'year': 2026, 'month': 10}}], 'analyses': [{'tool': 'aggregate', 'metric': 'expense',
+                    'aggregate': {'periods': [period('两月', '2026-09-01', '2026-10-31')]}}]})
+        results = collect_analysis_results(plan, {'个人版': [(plan.toolCalls[0], [row('2026-10-05', -70, '餐饮')])]}, date(2026, 11, 19))
+        data = results[0]['evidence']
+        self.assertEqual(data['coverage'][0]['queryCoverage'], 'partial')
+        self.assertEqual(data['coverage'][0]['effectiveStartDate'], '2026-10-01')
+        text = '\n'.join(f['text'] for f in build_facts([results[0]]))
+        self.assertIn('部分', text)
+
+    def test_explicit_aggregate_window_respects_query_expansion_limit(self):
+        from datetime import datetime
+        from app.agent.planner import QueryPlanner
+        plan = AgentPlan.model_validate({'analyses': [{'tool': 'aggregate'}],
+            'analysisWindow': {'startDate': '2023-01-01', 'endDate': '2025-12-31'}})
+        with self.assertRaises(ValueError):
+            QueryPlanner.__new__(QueryPlanner)._normalize_plan(plan, datetime(2026, 11, 19), '按类别汇总这三年')
+
+    def test_categorical_chart_does_not_materialize_unrelated_monthly_trends(self):
+        from datetime import datetime
+        from app.agent.planner import QueryPlanner
+        plan = AgentPlan.model_validate({'analyses': [{'tool': 'aggregate', 'metric': 'expense',
+            'aggregate': {'groupBy': ['weekday']}}], 'output': {'chart': 'bar', 'metric': 'expense'}})
+        QueryPlanner.__new__(QueryPlanner)._normalize_plan(plan, datetime(2026, 11, 19), '按星期画图')
+        self.assertNotIn('trends', [task.tool for task in plan.analyses])
+
+    def test_declared_omission_units_are_checked_against_typed_facts(self):
+        from app.agent.report_values import numerical_issues
+        facts = [{'id': 'f1', 'values': [{'label': '省略分组', 'value': 4, 'unit': '个'},
+                                       {'label': '省略比较', 'value': 2, 'unit': '项'}]}]
+        self.assertFalse(numerical_issues('另有4个分组、2项比较未展示。', ['f1'], facts))
+        self.assertTrue(numerical_issues('另有5个分组。', ['f1'], facts))
+
+
+class AggregateInvestigationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_refiner_keeps_distinct_filter_analyses_and_rejects_foreign_query(self):
+        from app.agent.investigation import EvidenceInvestigator, InvestigationDecision
+        plan = AgentPlan.model_validate({'toolCalls': [{'id': 'ledger', 'toolName': 'search_personal_orders'}],
+            'analyses': [{'tool': 'aggregate', 'queryIds': ['ledger'], 'metric': 'expense',
+                          'aggregate': {'groupBy': ['category']}}]})
+        investigator = EvidenceInvestigator()
+        investigator._invoke = AsyncMock(return_value=InvestigationDecision.model_validate({
+            'additionalAnalyses': [
+                {'tool': 'aggregate', 'queryIds': ['ledger'], 'metric': 'expense',
+                 'aggregate': {'groupBy': ['weekday']}},
+                {'tool': 'aggregate', 'queryIds': ['foreign'], 'metric': 'income'}]}))
+        decision, audit = await investigator.refine('周末消费是否集中？', '', plan, [])
+        self.assertEqual(len(decision.additionalAnalyses), 1)
+        self.assertEqual(decision.additionalAnalyses[0].aggregate.groupBy, ['weekday'])
+        self.assertTrue(audit['issues'])
