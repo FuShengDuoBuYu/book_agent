@@ -16,6 +16,34 @@ class EvidenceReportTests(unittest.TestCase):
     def test_unknown_reference_rejected(self):
         self.assertTrue(validate_draft(self.draft(factIds=['fake']), self.facts))
 
+    def test_original_saving_plus_known_improvement_receives_its_currency_unit(self):
+        facts = [{'id': 'f1', 'text': '每月额外改善目标300元。', 'required': True,
+                  'values': [{'label': 'monthlyImprovement', 'value': 300, 'unit': '元'}]}]
+        prepared, repairs = prepare_draft(self.draft(analysis='目标是原结余 +300，仍需逐项核查。'), facts)
+        self.assertIn('原结余 +300 元', prepared.sections[0].analysis)
+        self.assertEqual(repairs['suppliedCurrencyUnits'], 1)
+        with self.assertRaises(ValueError):
+            prepare_draft(self.draft(analysis='目标是原结余 +3000。'), facts)
+
+    def test_unknown_cash_prevents_a_purchase_verdict_in_either_direction(self):
+        self.assertTrue(validate_draft(self.draft(analysis='目前无法直接购买，因为余额信息缺失。'), self.facts))
+        self.assertEqual(validate_draft(self.draft(analysis='目前无法判断能否购买，需要确认余额。'), self.facts), [])
+
+    def test_small_sample_does_not_authorize_asserting_missing_categories(self):
+        facts = [{'id': 'f1', 'text': '同类样本不足的类别包括医疗。', 'required': True}]
+        self.assertTrue(validate_draft(self.draft(analysis='账本只记流水不记分类。'), facts))
+        self.assertEqual(validate_draft(self.draft(analysis='医疗样本不足，不能判断是否异常。'), facts), [])
+
+    def test_forecast_period_does_not_borrow_the_as_of_month(self):
+        from datetime import date
+        from app.tools.financial_analysis import run_analysis
+        from tests.test_decision_analysis import ledger
+        result = run_analysis('projection', ledger(), as_of=date(2026, 11, 19), months=3, target_month='2026-12')
+        facts = build_facts([{'tool': 'projection', 'evidence': result}])
+        ids = [row['id'] for row in facts if row['required']]
+        self.assertTrue(validate_draft(self.draft(factIds=ids, analysis='预测期为2026-11至2027-01。'), facts))
+        self.assertEqual(validate_draft(self.draft(factIds=ids, analysis='预测期为2026-12至2027-02。'), facts), [])
+
     def test_unknown_balance_is_not_a_confirmed_shortage_even_in_a_mixed_risk_sentence(self):
         for text in ['最大的变数在于起始存款不足以及可能出现的大额支出。',
                      '当前可动用余额不足，建议推迟购买。']:
@@ -323,7 +351,7 @@ class EvidenceReviewTests(unittest.IsolatedAsyncioTestCase):
                 return ReportOutline(sections=[{'title': '条件与方案', 'answerGoal': payload['question'],
                                                 'factIds': [fact['id']]}])
             if schema is ReportComment:
-                quantity = next(q for q in payload['quantityReferences'] if q['label'] == '达标所需月数')
+                quantity = next(q for q in payload['quantityReferences'] if q['label'] == '达到目标所需月数')
                 self.assertEqual(quantity['unit'], '个月')
                 self.assertNotIn('value', quantity)
                 return ReportComment(analysis='若当前收支模式延续，约需' + quantity['reference'] + '达到目标；未来变动会改变进度。')

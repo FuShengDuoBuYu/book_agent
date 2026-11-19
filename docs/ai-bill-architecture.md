@@ -39,10 +39,11 @@ Agent 默认分支为 `main`，账本后端为 `python`，Android 为 `master`�
 
 正式环境由 `app-ai-bill-agent.service` 和 `app-ai-bill-ledger.service` 管理，需保持 enabled 和 active。Agent 环境位于 `/etc/ai-bill/agent.env`，凭据不进入仓库。新版本使用独立发布目录和 systemd drop-in 切换，保留旧发布目录及受限权限的配置备份用于回滚。
 
-以下命令仅用于在发布目录前台启动两项服务进行排障。两端使用各自的 Python 虚拟环境，MongoDB 配置从现有 Agent 环境读取；已经运行 systemd 服务时不要重复占用端口。
+服务统一通过 systemd 管理。旧的前台双进程启动脚本已移除，避免使用过时的兼容接口配置或漏掉会话与成员键环境。排障时检查现有单元及日志：
 
 ```sh
-agent/.venv/bin/python agent/deploy/run-home.py --existing-env /root/apps/book-agent/.env
+systemctl status app-ai-bill-agent.service app-ai-bill-ledger.service app-ollama.service --no-pager
+journalctl -u app-ai-bill-agent.service -n 80 --no-pager
 ```
 
 在 Cloudflare 的既有 Tunnel 下添加 Published application。主机名使用 `bill.fushengduobuyu.com`，Service 选择 HTTP，地址填 `127.0.0.1:18001`，Path 留空。域名生效后访问 `https://bill.fushengduobuyu.com/ready`，预期返回所选模型和 `status: ok`。

@@ -60,7 +60,8 @@ def get_planner_model() -> Runnable:
 
 
 @lru_cache
-def get_structured_model(schema: type, *, reasoning: bool | None = None, num_predict: int | None = None) -> Runnable:
+def get_structured_model(schema: type, *, reasoning: bool | None = None, num_predict: int | None = None,
+                         temperature: float | None = None) -> Runnable:
     settings = get_settings()
     if settings.llm_provider == "ollama":
         model = _ollama(settings, planner=True)
@@ -69,10 +70,14 @@ def get_structured_model(schema: type, *, reasoning: bool | None = None, num_pre
             options['reasoning'] = reasoning
         if num_predict is not None:
             options['num_predict'] = num_predict
+        if temperature is not None:
+            options['temperature'] = temperature
         return model.model_copy(update=options).bind(format=_execution_schema(schema.model_json_schema()))
     model = _compatible(settings, planner=True)
     if num_predict is not None:
         model = model.model_copy(update={'max_tokens': num_predict})
+    if temperature is not None:
+        model = model.model_copy(update={'temperature': temperature})
     return model.bind(response_format={"type": "json_object"})
 
 

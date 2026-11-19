@@ -651,6 +651,66 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(t.purchaseAmount, price)
                 self.assertIsNone(t.startingBalance)
 
+    async def test_savings_horizon_consumes_the_whole_duration(self):
+        for phrase, months in [('一年半', 18), ('两年', 24), ('一年零三个月', 15), ('半年', 6)]:
+            with self.subTest(phrase=phrase):
+                for draft_months in [months, None]:
+                    prepared = await self.plan(f'我现在有10000元，想在{phrase}内存到20000元。',
+                        {'analyses': [{'tool': 'savings', 'months': draft_months}]}, {})
+                    self.assertEqual(prepared.analyses[0].months, months)
+        previous_years = await self.plan('以往两年的收支作参考，现在有10000元，多久能存到20000元？',
+                                        {'analyses': [{'tool': 'savings', 'months': 24}]}, {})
+        self.assertIsNone(previous_years.analyses[0].months)
+
+    async def test_the_current_single_forecast_uses_the_requested_direction(self):
+        first = '按个人账本预计2027年1月能进账多少？同一项目的不同工序算一个收入来源。'
+        for question, raw, expected in [(first, 'net', 'income'), ('下个月会有多少开销？', 'income', 'expense'),
+                ('预计下个月的净收入是多少？', 'net', 'net')]:
+            with self.subTest(question=question):
+                plan = await self.plan(question, {'analyses': [{'tool': 'sources'},
+                    {'tool': 'forecast', 'metric': raw, 'targetMonth': '2027-01'}]}, {})
+                self.assertEqual(next(t for t in plan.analyses if t.tool == 'forecast').metric, expected)
+        separate = [{'tool': 'forecast', 'metric': metric} for metric in ('income', 'expense')]
+        for question in ('预计下个月收入和支出各是多少？', '两种情景分别预测下月收入。'):
+            plan = await self.plan(question, {'analyses': separate}, {})
+            self.assertEqual([t.metric for t in plan.analyses], ['income', 'expense'])
+
+    async def test_new_grouping_can_combine_contiguous_referenced_periods_without_widening_gaps(self):
+        for october, days_apart in [('2026-10', False), ('2026-11', True)]:
+            periods = [{'label': '甲', 'startDate': '2026-09-01', 'endDate': '2026-09-30'},
+                       {'label': '乙', 'startDate': october+'-01', 'endDate': october+('-30' if days_apart else '-31')}]
+            window = {'startDate': periods[0]['startDate'], 'endDate': periods[-1]['endDate']}
+            old = {'tool': 'aggregate', 'metric': 'expense', 'queryIds': ['ledger'], 'aggregate': {
+                'groupBy': ['category'], 'periods': periods}}
+            previous = {'scope': [['search_personal_orders', '不限', '']], 'conversation': {
+                'analysisWindow': window, 'analyses': [old], 'queries': [{'id': 'ledger', 'toolName': 'search_personal_orders'}]}}
+            for clause, by_period in [('按星期几分组，哪天最多？', False), ('分别按月比较各星期的支出。', True)]:
+                with self.subTest(october=october, clause=clause):
+                    raw = {'followUpOfPreviousQuestion': True, 'analyses': [{**old, 'aggregate': {
+                        'groupBy': ['weekday'], 'periods': [] if days_apart else periods,
+                        'filters': {'includeCategories': ['展览']}}}]}
+                    plan = await self.plan('沿用这两个月的范围，只看展览，'+clause, raw, previous)
+                    task = next(t for t in plan.analyses if t.tool == 'aggregate')
+                    self.assertEqual(task.aggregate.filters.includeCategories, ['展览'])
+                    self.assertEqual(task.queryIds, ['ledger'])
+                    self.assertEqual(plan.analysisWindow.model_dump(mode='json'), window)
+                    self.assertEqual([p.model_dump(mode='json') for p in task.aggregate.periods],
+                                     periods if by_period or days_apart else [])
+
+                    if not by_period and not days_apart:
+                        rows = [{'year': 2026, 'month': month, 'day': day, 'money': -amount, 'costType': '展览'}
+                                for month, day, amount in [(9, 5, 70), (10, 3, 90), (10, 4, 110)]]
+                        results = collect_analysis_results(plan, {'个人版': [(q, rows) for q in plan.toolCalls]}, date(2026, 11, 19))
+                        evidence = next(r['evidence'] for r in results if r['tool'] == 'aggregate')
+                        leader = max(evidence['rows'], key=lambda row: row['expense'])
+                        self.assertEqual((leader['weekday'], leader['expense'], leader['count']), ('星期六', 160, 2))
+        september_week = [{'label': '展期', 'startDate': '2026-09-07', 'endDate': '2026-09-13'}]
+        narrowed = await self.plan('沿用这两个月的范围，只看9月7日到13日的展览，按星期几分组。',
+            {'followUpOfPreviousQuestion': True, 'analysisWindow': window, 'analyses': [
+                {**old, 'aggregate': {'groupBy': ['weekday'], 'periods': september_week}}]}, previous)
+        actual = next(t for t in narrowed.analyses if t.tool == 'aggregate')
+        self.assertEqual([p.model_dump(mode='json') for p in actual.aggregate.periods], september_week)
+
     async def test_open_savings_duration_drops_invented_deadlines_and_keeps_grounded_ones(self):
         question = '现在有10000元，保持当前收支，多久能存到20000元？'
         draft = {'analyses': [{'tool': 'savings', 'months': 12}]}

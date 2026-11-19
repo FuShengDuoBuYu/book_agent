@@ -208,7 +208,7 @@ async def compose_report(payload, invoke, *, num_ctx=8192) -> ReportDraft:
     previous = prior.get('sections', []) if isinstance(prior, dict) else []
     limit, estimate = _prompt_budget(COMMENT_PROMPT, ReportComment, num_ctx, COMMENT_TOKENS)
     inventory = _evidence_inventory(facts)
-    delivered = [{'kind': row.get('kind'), 'title': row.get('title', ''),
+    delivered = [{'kind': row.get('kind'),
                   'columns': [column['label'] for column in row.get('columns', [])],
                   'hasRows': bool(row.get('totalRows', len(row.get('rows', []))))}
                  for row in payload.get('artifacts', [])]

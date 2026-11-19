@@ -423,6 +423,13 @@ def _check_conditions(analyses, plan, question, mode, previous, *, strip):
     if (strip and direction and len(scope) == 1 and len(structured) == len(set(structured))
             and not plan._analysis_context.get('ambiguous')):
         plan.output.metric = direction
+    forecast_request = any(_direction_request(clause)[1] == direction and
+                           re.search(r"预测|预计|预估|预期|未来|接下来|下下?个?月|明年", clause)
+                           and not re.search(r"(?:别|不必|不用|无需|不要)(?:再)?(?:预测|预估|考虑)", clause)
+                           for clause in CLAUSES.split(question)) if direction else False
+    single_forecast = (forecast_request and len(scope) == 1 and not plan._analysis_context.get('ambiguous')
+                       and [name for name in structured if name in DECISION_TOOLS] == ['forecast']
+                       and not re.search(r"两种情景|各个情景|不同情景|分别假设", question))
     # resolve_group shares horizon fields across decision tools on one logical
     # query. Check populated sibling horizons before they enter savings context.
     savings_scopes = {frozenset(_scope_for(t, plan, mode)) for t in analyses if t.tool == "savings"}
@@ -443,6 +450,10 @@ def _check_conditions(analyses, plan, question, mode, previous, *, strip):
             if task.monthsDelta is not None and (task.monthsDelta != explicit_month_delta(question) or not prior.get("months")):
                 issues.append({"type": "unsupported_user_condition", "tool": task.tool, "field": "monthsDelta"})
                 task.monthsDelta = None
+        if task and task.tool == "forecast" and single_forecast and task.metric != direction:
+            issues.append({"type": "unsupported_user_condition", "tool": "forecast", "field": "metric"})
+            if strip:
+                task.metric = direction
         if task and task.tool == "aggregate":
             issues.extend(_aggregate_constraints(task, plan, question, prior, mode, strip=strip,
                 literal_categories=literal_categories, direction=direction,
@@ -487,16 +498,31 @@ def _temporal_role(clause, match):
     return "future" if future >= 0 or re.match(r"\s*(?:之)?内", clause[match.end():]) else "unspecified"
 
 
+# Consume all units in one duration before interpreting it. A calendar year
+# such as 2027 exceeds the supported decision horizon and is discarded whole.
+_DURATION = re.compile(
+    rf"(?<![\d.零〇一二两三四五六七八九十百千万亿])"
+    rf"(?:(?P<years>{NUMBER})\s*年(?:\s*(?:又|零)?\s*(?:(?P<half>半)|(?P<extra>{NUMBER})\s*个?月))?"
+    rf"|(?P<halfyear>半年)|(?P<months>{NUMBER})\s*个\s*月)")
+
+
 def _duration_evidence(question):
     durations, offsets = {"future": set(), "unspecified": set()}, set()
     for clause in CLAUSES.split(question):
-        for match in re.finditer(rf"({NUMBER})\s*个\s*月|半年|一年", clause):
+        for match in _DURATION.finditer(clause):
             role = _temporal_role(clause, match)
             before, after = clause[:match.start()], clause[match.end():].lstrip()
-            if (role == "history" or re.search(r"每(?:隔)?\s*$|(?:过往|此前|之前|前|上)\s*$", before)
+            if (role == "history" or after.startswith(("前", "以前")) or re.search(r"每(?:隔)?\s*$|(?:过往|此前|之前|前|上)\s*$", before)
                     or re.match(r"(?:的(?:收支|收入|支出|账单))?(?:作为|作|为)?(?:参考|参照|样本)", after)):
                 continue
-            count = {"半年": 6, "一年": 12}.get(match[0]) or _number(match[1])
+            if match["years"]:
+                years = _number(match["years"])
+                extra = 6 if match["half"] else _number(match["extra"] or "0")
+                if years is None or extra is None:
+                    continue
+                count = 12 * years + extra
+            else:
+                count = 6 if match["halfyear"] else _number(match["months"])
             if count is not None and 1 <= count <= 600 and int(count) == count:
                 durations[role].add(int(count))
                 if after.startswith("后"):

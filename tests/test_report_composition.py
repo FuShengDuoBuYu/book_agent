@@ -82,7 +82,7 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
         fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'))
         await compose_fixture(payload, fake.invoke)
         delivered = fake.calls[-1][1]['deliveredArtifacts']
-        self.assertEqual(delivered, [{'kind': 'table', 'title': '分类比较',
+        self.assertEqual(delivered, [{'kind': 'table',
                                      'columns': ['分类', '支出'], 'hasRows': True}])
         self.assertNotIn('987654', repr(fake.calls[-1][1]))
 

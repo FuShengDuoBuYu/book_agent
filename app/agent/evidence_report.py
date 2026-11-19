@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 from datetime import date
+from decimal import Decimal
 
 from app.core.config import get_settings
 from app.core.llm import get_structured_model
@@ -23,6 +24,15 @@ INPUT_NAMES = {'startingBalance': '当前可动用余额', 'targetAmount': '希�
                'months': '测算期限（月数）', 'changes': '收入减少的来源和幅度',
                'source': '该来源的历史金额或明确变化金额', 'purchaseAmount': '购买金额',
                'reserveAmount': '需要保留的应急储备', 'budgetAmount': '预算金额'}
+QUANTITY_NAMES = {
+    'estimatedMonthsToTarget': '达到目标所需月数', 'cashAfterPurchase': '支付购买价后的现金余额，尚未扣除储备',
+    'reserveMargin': '买后现金超过应急储备底线的余量，不是买后现金余额',
+    'baselineMonthlySaving': '历史模式延续时的月结余基准', 'requiredMonthlySaving': '给定期限达标所需的每月新增结余',
+    'remainingToTarget': '当前余额距离目标的资金差额', 'projectedBalance': '考虑起始余额后的期末测算余额',
+    'monthlyImprovement': '用户希望每月额外改善的结余', 'goalMonthlyRequirement': '目标要求的每月结余',
+    'monthlyDeficit': '情景中每月支出超过收入的资金缺口', 'runwayMonths': '可用余额可覆盖月缺口的月数',
+    'monthlyIncome': '情景每月收入', 'monthlyExpense': '情景每月支出', 'monthlyNet': '情景每月结余',
+    'totalNet': '整个推演期间累计新增结余，未计起始余额'}
 
 
 class ReportEvidenceError(ValueError):
@@ -361,9 +371,6 @@ def build_facts(results):
     # Deduplicate repeated tool constraints without changing scope labels.
     seen = set()
     facts = [row for row in facts if not (row['text'] in seen or seen.add(row['text']))]
-    if facts:
-        facts[0]['calendars'] = sorted(set(facts[0].get('calendars', [])) | {value for row in results for value in
-            (row.get('evidence', {}).get('asOf', ''), row.get('evidence', {}).get('asOf', '')[:7]) if value})
     return facts
 
 
@@ -417,9 +424,22 @@ def unsupported_assertion(text, facts):
         prefix = re.split(r'[，；。！？\n]', text[:match.start()])[-1]
         if not known_balance and not re.search(r'如果|若|是否|可能|不能(?:认定|断言|确定)|无法(?:认定|断言|确定)', prefix):
             return '当前余额未知，不能断言存款或可动用现金不足'
+    if not known_balance:
+        for match in re.finditer(r'(?:无法|不能)(?:直接)?(?:购买|买|支付)', text):
+            prefix = re.split(r'[，；。！？\n]', text[:match.start()])[-1]
+            if not re.search(r'如果|若|是否|可能', prefix):
+                return '余额未知时只能说明无法判断能否购买，不能断言无法购买'
     remark_claim = re.sub(r'(?:未|没有|尚未)(?:发现|检测到|识别到|检出)?(?:任何)?(?:备注缺失|缺(?:少|失)备注)', '', text)
     if re.search(r'备注(?:缺失|缺少)|缺(?:少|失)备注', remark_claim) and not re.search(r'缺(?:少|失)备注\s*[1-9]|备注缺失\s*[1-9]', evidence_text):
         return '现有证据没有报告备注缺失，不能把其他缺失字段替换成备注缺失'
+    known_missing_categories = any(value.get('label') == 'missingCategoryCount' and
+        isinstance(value.get('value'), (int, float)) and value['value'] > 0
+        for fact in facts for value in fact.get('values', []))
+    if not known_missing_categories:
+        for clause in re.split(r'[，；。！？]', text):
+            if (re.search(r'(?:分类|类别)(?:缺失|没填)|缺(?:少|失)(?:分类|类别)|不记分类|缺乏.{0,16}归类', clause)
+                    and not re.search(r'是否|未发现|不能(?:证明|断定|认定)|无法(?:证明|断定|认定)', clause)):
+                return '同类样本不足不能证明缺少分类或明细归类'
     if re.search(r'section\.answerGoal|computedFacts|answerGoal|factIds|requestedAnswers|根据用户指令[，,]?我需要', text):
         return '请直接回答用户的财务问题，不介绍内部字段、任务或生成步骤。'
     duplicate_counts = re.findall(r'疑似重复组 (\d+) 组', evidence_text)
@@ -466,7 +486,18 @@ def prepare_draft(draft, facts):
     restored = []
     values = {row['id']: row for row in value_catalog(facts)}
     normalized_units = 0
+    supplied_currency_units = 0
     for section in draft.sections:
+        improvements = {Decimal(str(row['value'])) for row in values.values()
+                        if row['factId'] in section.factIds and row['label'] == 'monthlyImprovement' and row['unit'] == '元'}
+        def complete_input_unit(match):
+            nonlocal supplied_currency_units
+            if Decimal(match[2].replace(',', '')) in improvements:
+                supplied_currency_units += 1
+                return match[1] + match[2] + ' 元'
+            return match[0]
+        section.analysis = re.sub(r'(原结余\s*[+＋]\s*)(\d+(?:,\d{3})*(?:\.\d+)?)(?![\d.]|\s*元)',
+                                  complete_input_unit, section.analysis)
         def normalize_unit(match):
             nonlocal normalized_units
             row = values.get(match[1])
@@ -497,7 +528,8 @@ def prepare_draft(draft, facts):
     issues = validate_draft(draft, facts)
     if issues:
         raise ReportEvidenceError(issues)
-    return draft, {'restoredReferences': list(dict.fromkeys(restored + missing)), 'normalizedUnits': normalized_units}
+    return draft, {'restoredReferences': list(dict.fromkeys(restored + missing)), 'normalizedUnits': normalized_units,
+                   'suppliedCurrencyUnits': supplied_currency_units}
 
 
 def render_report(draft, facts):
@@ -522,7 +554,8 @@ class EvidenceReporter:
         generation_schema = outline_schema(payload) if schema is ReportOutline else schema.model_json_schema()
         if get_settings().llm_provider != 'ollama':
             system += '\n必须遵守的 JSON schema：' + json.dumps(generation_schema, ensure_ascii=False, separators=(',', ':'))
-        model = get_structured_model(schema, reasoning=False, num_predict=output_limit)
+        model = get_structured_model(schema, reasoning=False, num_predict=output_limit,
+                                     temperature=get_settings().llm_temperature if schema is ReportComment else None)
         if schema is ReportOutline and get_settings().llm_provider == 'ollama':
             model = model.bind(format=generation_schema)
         response = await asyncio.wait_for(model.ainvoke([
@@ -619,7 +652,7 @@ class EvidenceReporter:
                     current_payload, budget_stats['repair'] = repair_context(
                         payload, previous, issues, OUTLINE_PROMPT, ReportOutline, **budget_options)
                 references = [{'factId': row['factId'], 'reference': '{{' + row['id'] + '}}',
-                               'label': {'estimatedMonthsToTarget': '达标所需月数'}.get(row['label'], row['label']),
+                               'label': QUANTITY_NAMES.get(row['label'], row['label']),
                                'unit': row['unit']} for row in value_catalog(facts) if row['unit'] not in {'month', 'date'}]
                 draft = await self._draft({**current_payload, 'analysisFindings': analysis_findings,
                                           'quantityReferences': references})

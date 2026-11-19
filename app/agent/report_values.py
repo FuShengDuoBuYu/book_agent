@@ -213,6 +213,18 @@ def numerical_issues(text, fact_ids, facts):
     remainder = REFERENCE.sub('', text)
     calendars = {str(row['value']) for row in allowed if row['unit'] in {'month', 'date'}}
     calendars.update(value for fact in facts if fact['id'] in fact_ids for value in fact.get('calendars', []))
+    months = {int(value[:4]) * 12 + int(value[5:7]) - 1 for value in calendars
+              if re.fullmatch(r'\d{4}-\d{2}(?:-\d{2})?', value) and 1 <= int(value[5:7]) <= 12}
+    counts = {Decimal(str(row['value'])) for row in allowed if row['unit'] == '个月'}
+    if months and max(months) - min(months) + 1 == len(months):
+        counts.add(Decimal(len(months)))
+    def contextual_months(match):
+        count = _chinese_value(match[1]) if not match[1].isdigit() else Decimal(match[1])
+        if count not in counts:
+            issues.append('月份数量缺少本段引用的依据：' + match[0])
+        return ' ' * len(match[0])
+    remainder = re.sub(r'(?:这|上述|所选(?:的)?|延长|推迟|延后|提前|缩短)\s*([一二两三四五六七八九十]{1,3}|\d{1,2})\s*月(?!份|元)',
+                       contextual_months, remainder)
     remainder = _validate_calendars(remainder, calendars, issues)
     def quantity_range(match):
         first, last, unit = match.groups()

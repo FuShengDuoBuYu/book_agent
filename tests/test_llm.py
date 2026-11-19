@@ -12,6 +12,12 @@ from app.core.llm import get_chat_model, get_planner_model, get_structured_model
 
 
 class ModelConfigurationTests(unittest.IsolatedAsyncioTestCase):
+    def test_comment_sampling_can_be_tuned_without_changing_the_planner(self):
+        from app.agent.report_composition import ReportComment
+        with patch.dict(os.environ, {'LLM_PROVIDER': 'ollama'}, clear=True):
+            writer = get_structured_model(ReportComment, temperature=0.7, num_predict=768)
+            self.assertEqual(writer.bound._chat_params([])['options']['temperature'], 0.7)
+            self.assertEqual(get_planner_model().temperature, 0)
     def test_native_planner_schema_requires_execution_not_only_an_intent_description(self):
         from app.tools.financial_analysis import ANALYSIS_TOOLS
         from app.tools.registry import PLANNER_TOOL_BY_NAME

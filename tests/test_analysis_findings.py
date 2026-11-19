@@ -11,6 +11,41 @@ def group(tool, **evidence):
 
 
 class FindingTests(unittest.TestCase):
+    def test_real_runway_names_operands_and_handles_no_deficit(self):
+        records = [{'year': 2026, 'month': m, 'day': 1, 'money': value, 'costType': category}
+                   for m in (8, 9, 10) for value, category in [(1000, '工资'), (-600, '房租')]]
+        for change, deficit in [(-50, True), (-10, False)]:
+            e = run_analysis('runway', records, as_of=date(2026, 11, 19), starting_balance=800,
+                             changes=[{'metric': 'income', 'percent': change}])
+            found = group('runway', **e)
+            self.assertEqual(found['states']['hasDeficit'], deficit)
+            obs = ''.join(found['observations'])
+            self.assertIn('情景月支出减去情景月收入', obs)
+            self.assertIn('非负', obs)
+            if deficit:
+                self.assertIn('可动用余额除以月缺口', obs)
+            else:
+                self.assertIn('不能据此认定资金可无限期维持', obs)
+
+    def test_real_protected_expenses_and_projection_without_observed_changes(self):
+        records = [{'year': 2026, 'month': m, 'day': 1, 'money': amount, 'costType': category}
+                   for m in (8, 9, 10) for amount, category in [(1500, '工资'), (-100, '医疗'), (-60, '交通')]]
+        today = date(2026, 11, 19)
+        found = group('optimization', **run_analysis('optimization', records, as_of=today, monthly_improvement=70))
+        self.assertFalse(found['states']['hasCandidates'])
+        self.assertEqual(set(found['labels']['protected']), {'医疗', '交通'})
+        self.assertIn('未识别', ''.join(found['observations']))
+        self.assertNotIn('即使候选开销全部削减', ''.join(found['observations']))
+        e = run_analysis('projection', records, as_of=today, months=3)
+        projection = group('projection', **e)
+        self.assertNotIn('observedExpenseChanges', projection['labels'])
+        self.assertIn('工资', projection['labels']['incomeSources'])
+        self.assertIn('发生概率或重要性', ''.join(projection['limitations']))
+        records += [dict(r, costType='展览') for r in records if r['costType'] == '交通']
+        found = group('optimization', **run_analysis('optimization', records, as_of=today, monthly_improvement=70))
+        self.assertTrue(found['states']['hasCandidates'])
+        self.assertEqual(found['labels']['candidates'], ['展览'])
+
     def test_quality_names_only_fields_measured_and_found_missing(self):
         records = [{'year': 2026, 'month': 10, 'day': 5, 'money': -100, 'costType': '医疗',
                     'orderRemark': '门诊'}]

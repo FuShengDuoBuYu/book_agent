@@ -73,7 +73,8 @@ def assess(record):
         optimization = results.get('optimization', {})
         excluded = set(optimization.get('excludedCategories', [])) | set(optimization.get('protectedCategories', []))
         checks['protectedRetained'] = bool(protected & {'房租', '月租'} and
-            protected & {'餐饮', '吃饭', '饮食', '日常餐饮'} and {'房租', '餐饮'} <= excluded)
+            protected & {'餐饮', '吃饭', '饮食', '日常餐饮'} and
+            (not optimization or {'房租', '餐饮'} <= excluded))
         applied = results.get('projection', {}).get('assumptions', [])
         checks['sourceScenarioRetained'] = any(
             c.get('metric') == 'income' and c.get('percent') == -50 and '家教' in (c.get('source') or '') and

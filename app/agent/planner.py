@@ -326,6 +326,7 @@ class QueryPlanner:
                             task.aggregate.periods = relative_periods
                 self._preserve_referent_window(plan, previous_context or {}, message, now)
                 context = self._inherit_conversation(plan, previous_context or {})
+                self._normalize_referenced_periods(plan, context, message)
                 if len(modes) == 2 and plan.intent == 'analyze_orders':
                     queried = {PLANNER_TOOL_BY_NAME[call.toolName][0] for call in plan.toolCalls
                                if call.toolName in PLANNER_TOOL_BY_NAME}
@@ -971,6 +972,44 @@ class QueryPlanner:
         if not plan.analysisWindow and conversation.get('analysisWindow'):
             plan.analysisWindow = AnalysisWindow.model_validate(conversation['analysisWindow'])
         return previous
+
+    @staticmethod
+    def _normalize_referenced_periods(plan, previous, message):
+        """A referenced date range and a requested period comparison are separate choices."""
+        if (not plan.followUpOfPreviousQuestion or plan.resetAnalysisContext or not previous.get('conversation')
+                or not re.search(r"(?:沿用|仍用|仍按|继续用|还是按|相同|同一)[^，。；,;]{0,20}(?:范围|时间段|区间)", message)):
+            return
+        prior = previous['conversation']
+        for task in plan.analyses:
+            if task.tool != 'aggregate' or not task.aggregate:
+                continue
+            matches = [row.get('aggregate') or {} for row in prior.get('analyses', [])
+                       if row.get('tool') == 'aggregate' and set(row.get('queryIds', [])) == set(task.queryIds)]
+            if len(matches) != 1 or len(matches[0].get('periods', [])) < 2:
+                continue
+            old = [AggregatePeriod.model_validate(value) for value in matches[0]['periods']]
+            ranges = sorted((p.startDate, p.endDate) for p in old)
+            window = AnalysisWindow(startDate=ranges[0][0], endDate=max(end for _, end in ranges))
+            same_window = plan.analysisWindow == window or (plan.analysisWindow is None and len(plan.analyses) == 1)
+            if not same_window:
+                continue
+            plan.analysisWindow = window
+            continuous = all(start - end == timedelta(days=1) for (_, end), (start, _) in zip(ranges, ranges[1:]))
+            proposed = sorted((p.startDate, p.endDate) for p in task.aggregate.periods)
+            if proposed and proposed not in (ranges, [(window.startDate, window.endDate)]):
+                # A newly narrowed subperiod is not the old comparison's grouping.
+                covered = [(window.startDate, window.endDate)] if continuous else ranges
+                if all(any(a <= start <= end <= b for a, b in covered) for start, end in proposed):
+                    continue
+                raise ValueError("沿用原时间范围时，新分段须落在原区间内，请保留不连续日期之间的空档。")
+            compare = re.search(r"各月|每个?月|逐月|分月|按月|月份|每期|各期|逐期|分期|分别|对照|对比|比较.{0,8}(?:月|期)|环比|同比", message)
+            regroup = bool(task.aggregate.groupBy) and re.search(r"分组|按.{1,10}(?:汇总|统计|列出)|合计|总体", message)
+            if not continuous or compare:
+                # In particular, an empty list would include the gap between two
+                # nonadjacent reference periods. Keep their authorized dates.
+                task.aggregate.periods = old
+            elif regroup and not {'month', 'year'}.intersection(task.aggregate.groupBy):
+                task.aggregate.periods = []
 
     def _coalesce_forecasts(self, plan):
         groups = {}

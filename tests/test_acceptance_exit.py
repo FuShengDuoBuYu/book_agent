@@ -16,6 +16,8 @@ class AcceptanceEvidenceTests(unittest.TestCase):
                 {'tool': 'projection', 'evidence': {'assumptions': [{'metric': 'income', 'source': '家教课时费',
                      'percent': -50, 'sourceBaseline': 1600, 'totalChange': -800}]}}]}}}
         self.assertTrue(all(evaluate_acceptance.assess(record).values()))
+        record['metadata']['evidence']['analysisResults'].pop(0)
+        self.assertTrue(evaluate_acceptance.assess(record)['protectedRetained'])
         record['metadata']['analysisContext']['protectedCategories'] = []
         self.assertFalse(evaluate_acceptance.assess(record)['protectedRetained'])
         record['metadata']['analysisContext']['changes'][0]['source'] = ''

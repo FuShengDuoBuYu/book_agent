@@ -201,8 +201,11 @@ def _decision(e, out, tool, context):
         value = e.get('monthlyDeficit')
         if value is not None:
             states['hasDeficit'] = value > 0
-            obs.append('当前情景有月度资金缺口，需要以可动用余额弥补。' if value > 0 else
+            obs.append('月缺口按情景月支出减去情景月收入计算，只取非负值。')
+            obs.append('当前情景有月度资金缺口，覆盖时长按可动用余额除以月缺口计算。' if value > 0 else
                        '当前情景没有月度缺口，不能据此认定资金可无限期维持。')
+            if value > 0 and e.get('startingBalance') is not None and e['startingBalance'] < 0:
+                obs.append('可动用余额为负时按无可用资金计算。')
     elif tool in {'projection', 'scenario'}:
         changes = e.get('assumptions', e.get('baseline', {}).get('assumptions', []))
         states['assumptionsApplied'] = bool(changes)
@@ -233,18 +236,22 @@ def _decision(e, out, tool, context):
                 if drivers:
                     out['labels']['observedExpenseChanges'] = drivers
                     obs.append('最近完整月份已观察到' + '、'.join(r['category'] + '支出' + r['direction'] for r in drivers) + '。')
-                    out['limitations'].append('历史变动不能确定未来会否重现或哪项风险最大。')
         out['limitations'].append('情景只在所列假设延续时成立，新增结余不能代替起始存款。')
     elif tool == 'optimization':
         out['labels']['protected'] = list(dict.fromkeys(e.get('protectedCategories', []) + e.get('excludedCategories', [])))[:20]
         out['labels']['candidates'] = [r['category'] for r in e.get('candidates', [])[:12]]
-        if 'reviewableMonthlySpend' in e:
+        if 'candidates' in e:
+            states['hasCandidates'] = bool(e['candidates'])
+        if states.get('hasCandidates') is False:
+            obs.append('当前记录中未识别出保护项之外可核查的候选支出。保护项应继续保留。')
+        elif 'reviewableMonthlySpend' in e:
             obs.append('保护项已从候选中排除，候选总额是可核查的月度上界。')
         improvement, gap = e.get('monthlyImprovement'), e.get('gapBeyondReviewableSpend')
         if improvement == 0:
             obs.append('给定目标在当前情景下无需额外改善结余。')
         elif gap is not None and gap > 0:
-            obs.append('即使候选开销全部削减仍有缺口。若目标和期限固定，需要其他改善途径，例如增收。')
+            obs.append(('当前可核查支出无法填补目标缺口。' if states.get('hasCandidates') is False else
+                        '即使候选开销全部削减仍有缺口。') + '若目标和期限固定，需要其他改善途径，例如增收。')
         elif gap == 0 and improvement is not None and improvement > 0:
             obs.append('候选总额在金额上可覆盖所需改善，实际能否削减仍需逐项确认。')
         out['limitations'].append('可核查的上界不能当作可全部取消的支出。')
@@ -261,6 +268,8 @@ def build_analysis_findings(results, context=None):
         missing = [INPUTS[k] for k in e.get('missingInputs', []) if k in INPUTS]
         if missing:
             obs.append('尚缺' + '、'.join(missing) + '。')
+        if tool == 'projection':
+            limits.append('账本可供核查已观察的收支，却不足以按发生概率或重要性排列未来风险，不能断定哪项是最大变数。')
         if e.get('sufficientData') is False:
             limits.append('当前输入或已观察样本不足，无法确定所问结果。')
         elif tool in {'changes', 'aggregate'}:

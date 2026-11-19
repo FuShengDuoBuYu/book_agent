@@ -4,6 +4,13 @@ from app.agent.report_values import numerical_issues, quantity
 
 
 class CalendarProvenanceTests(unittest.TestCase):
+    def test_contextual_month_count_is_not_misread_as_february(self):
+        facts = [{'id': 'span', 'calendars': ['2026-09-01', '2026-10-31']}]
+        self.assertEqual(numerical_issues('这两月的账单已合并。', ['span'], facts), [])
+        self.assertTrue(numerical_issues('这三月的账单已合并。', ['span'], facts))
+        february = [{'id': 'span', 'calendars': ['2026-02']}]
+        self.assertEqual(numerical_issues('二月的账单已核查。', ['span'], february), [])
+        self.assertTrue(numerical_issues('这两月的账单已合并。', ['span'], february))
     def setUp(self):
         self.facts = [
             {"id": "f1", "values": [quantity("参考月份", month, "month") for month in
