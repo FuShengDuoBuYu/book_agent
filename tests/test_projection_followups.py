@@ -40,6 +40,60 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
         await agent._save_assistant_reply('synthetic', 'synthetic', '核算结果', plan, evidence=evidence)
         return latest_context(json.loads(json.dumps([agent.memory.add_message.await_args.kwargs])))
 
+    async def test_remark_audit_and_method_followup_keep_the_forecast_scope_sample_and_target(self):
+        query = {'id': 'ledger', 'toolName': 'search_personal_orders'}
+        groups = [{'label': '画册', 'sourceKeys': ['first', 'final']}]
+        forecast = {'tool': 'forecast', 'metric': 'income', 'targetMonth': '2027-01', 'queryIds': ['ledger']}
+        prior = {'scope': [['search_personal_orders', '不限', '']], 'targetMonth': '2027-01',
+                 'activeHistoryWindow': None, 'activeAnalyses': [forecast],
+                 'conversation': {'queries': [query], 'analyses': [forecast], 'sourceGroups': groups}}
+        wrong_window = {'startDate': '2026-01-01', 'endDate': '2026-12-31'}
+        check_query = {'id': 'audit', 'toolName': 'search_personal_orders', 'args': {'remark': '画册'}}
+        raw = {'followUpOfPreviousQuestion': True, 'analysisWindow': wrong_window, 'toolCalls': [check_query],
+               'analyses': [{'tool': 'sources', 'queryIds': ['audit']}], 'understanding': {
+                   'objective': '核查汇入画册项目的原始备注', 'evidenceNeeds': ['sources', 'remarks']}}
+        notes = await self.plan('你有没有看过备注？请现在查一下，列出你把哪些原始备注认作同一个项目。', raw, prior)
+        stored = await self.save(notes)
+        self.assertEqual(stored['scope'], prior['scope'])
+        self.assertEqual(stored.get('targetMonth'), '2027-01')
+        self.assertIsNone(notes.analysisWindow)
+        self.assertEqual({c.args.remark for c in notes.toolCalls}, {''})
+        method = '那刚才预测的那个月，到底拿哪几个月作参照？具体怎么从逐个项目算到总数，一次性的款项怎么处理？'
+        second = {'intent': 'unknown', 'analysisType': 'unknown', 'followUpOfPreviousQuestion': True,
+                  'analysisWindow': wrong_window, 'toolCalls': [{**query, 'id': 'explain'}],
+                  'understanding': {'objective': '解释基准月份、分项计算和一次性款项', 'evidenceNeeds': ['cashflow','income_stability']},
+                  'analyses': [{'tool': tool, 'queryIds': ['explain']} for tool in ('cashflow','income_stability')]}
+        final = await self.plan(method, second, stored)
+        self.assertIsNone(final.analysisWindow)
+        f, = [t for t in final.analyses if t.tool == 'forecast' and not t._supplemental]
+        self.assertEqual((f.metric, f.targetMonth), ('income', '2027-01'))
+        self.assertEqual([g.model_dump() for g in final.sourceGroups], groups)
+        self.assertTrue(all('explain' not in t.queryIds or all('explain' in c.sourceIds for c in final.toolCalls)
+                            for t in final.analyses))
+        filtered = await self.plan('另查2026年10月，只列出备注包含“画册”的账单。', raw, prior)
+        self.assertEqual({c.args.remark for c in filtered.toolCalls}, {'画册'})
+        self.assertFalse(any(t.tool == 'forecast' for t in filtered.analyses))
+
+        mixed = await self.plan('刚才的预测怎么算的？另外，现在花700元买扫描仪合适吗？',
+            {**second, 'intent': 'analyze_orders', 'analyses': [{'tool': 'forecast', 'targetMonth': '2027-01'},
+                                                              {'tool': 'purchase'}]}, stored)
+        self.assertIn('purchase', {t.tool for t in mixed.analyses if not t._supplemental})
+
+    async def test_purchase_price_before_the_verb_survives_an_unknown_header_and_is_not_a_balance_or_budget(self):
+        draft = {'intent': 'unknown', 'analysisType': 'unknown', 'followUpOfPreviousQuestion': True,
+                 'toolCalls': [{'id': 'ledger', 'toolName': 'search_personal_orders'}],
+                 'understanding': {'objective': '判断购买可行性', 'evidenceNeeds': ['cashflow','purchase']},
+                 'analyses': [{'tool': name, 'queryIds': ['ledger']} for name in ['cashflow', 'purchase']]}
+        for text, price, balance in [('按刚才讲的情况，我现在能直接拿七百元买扫描仪吗？还需要什么信息才能判断？', 700, None),
+                ('可以拿出七百块钱来购置设备吗？', 700, None),
+                ('预算七百元买扫描仪，具体售价还不知道，能判断吗？', None, None),
+                ('余额七百元，扫描仪没有报价，现在能判断是否合适买吗？', None, 700)]:
+            with self.subTest(text=text):
+                plan = await self.plan(text, draft, {})
+                purchase = next(t for t in plan.analyses if t.tool == 'purchase')
+                self.assertEqual((purchase.purchaseAmount, purchase.startingBalance), (price, balance))
+                self.assertEqual(plan._analysis_context.get('purchaseAmount'), price)
+
     async def test_named_shock_protected_expenses_and_extension_use_one_actual_projection(self):
         rows = [{'year': 2026, 'month': m, 'day': 4, 'money': value, 'costType': category, 'orderRemark': remark}
                 for m in (8, 9, 10) for value, category, remark in

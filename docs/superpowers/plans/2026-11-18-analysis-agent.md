@@ -4,7 +4,7 @@
 
 **Goal:** Fulfill real analytical questions and follow-ups with traceable calculations, useful explanations, tables, charts and exports.
 
-**Architecture:** Bounded planner/investigation and deterministic ledger tools produce scoped evidence and artifacts. A reference-based report explains those values; persisted artifacts survive history reloads.
+**Architecture:** Bounded planner/investigation and deterministic ledger tools produce scoped evidence and artifacts. A model-selected outline renders code-derived analysis findings; persisted artifacts survive history reloads.
 
 **Tech Stack:** Existing Python/FastAPI/Pydantic/unittest, Vue/Vite, native SVG and Node test runner.
 
@@ -31,8 +31,8 @@
 
 **Interfaces:** `run_analysis('sources', ...)` yields observed source catalog; forecast yields additive `sourceForecasts`. Records carry `memberKey` and `memberName`, never raw user IDs. Optional `source_groups` uses existing catalog keys only.
 
-- [ ] Add failing tests for safe member attribution, remark evidence, grouped source forecasts and reconciliation, missing months and exclusions.
-- [ ] Run new tests RED, implement data tools, run them GREEN and existing calculation/decision tests.
+- [x] Add failing tests for safe member attribution, remark evidence, grouped source forecasts and reconciliation, missing months and exclusions.
+- [x] Run new tests RED, implement data tools, run them GREEN and existing calculation/decision tests.
 
 ### Task 2: Structured artifact presentation
 
@@ -40,18 +40,20 @@
 
 **Interfaces:** Receives artifacts from SSE `{type:'artifacts', artifacts:[...]}` and history `message.artifacts`; renders table/line/bar using the spec contract. Exports CSV and PNG from local validated data.
 
-- [ ] Add failing tests for exact chart series, unknown gaps, formula escaping and malformed artifacts.
-- [ ] Implement validated SVG/table rendering, history hydration and downloads; run Node tests and Vite build.
+- [x] Add failing tests for exact chart series, unknown gaps, formula escaping and malformed artifacts.
+- [x] Implement validated SVG/table rendering, history hydration and downloads; run Node tests and Vite build.
 
-### Task 3: Investigation, conversation and reference-backed reports
+### Task 3: Investigation, conversation and computed reports
 
 **Files:** planner/schema/prompts, `app/agent/book_agent.py`, report/evidence/artifact modules, memory history projection, integration tests.
 
 **Interfaces:** Preserve existing financial tools, add source-aware investigation; reporter accepts history, final instructions and deterministic artifacts. Store public artifacts in assistant metadata and expose their validated projection in history.
 
-- [ ] Add failing synthetic historical replay tests and numeric-reference integrity tests.
-- [ ] Implement bounded refinement and scoped history/state; replace quantity stripping with reference-backed narrative and deterministic relevant fallback.
-- [ ] Persist and stream artifacts; test authenticated history and all suites.
+- [x] Add failing synthetic historical replay tests and fact/finding binding integrity tests.
+- [x] Implement bounded refinement and scoped history/state; replace free financial prose with code-derived observations, limitations, actions and relevant fallback.
+- [x] Persist and stream artifacts; test authenticated history and all suites.
+
+**Ruling (2026-11-19):** Configured-model replay and independent review showed material errors surviving the free writer and its model critic. Replace both with a single outline call plus exact scoped computed findings; remove obsolete repair code and tests. Tradeoff: expression is bounded by implemented analytical findings, so new analytical capabilities need tools/findings and real-model acceptance rather than unconstrained text.
 
 ### Task 4: Quality acceptance and release
 

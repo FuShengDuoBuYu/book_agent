@@ -4,8 +4,10 @@ from unittest.mock import AsyncMock
 
 from pydantic import ValidationError
 
+from app.agent.analysis_findings import build_analysis_findings
 from app.agent.evidence_pipeline import collect_analysis_results
-from app.agent.evidence_report import build_facts, validate_draft
+from app.agent.evidence_report import build_facts, render_report, validate_draft
+from app.agent.report_composition import grounded_analysis
 from app.schemas.plan import AgentPlan, AnalysisRequest
 from app.schemas.report import ReportDraft
 from tests.test_aggregate_analysis import row, period
@@ -104,11 +106,17 @@ class AggregatePipelineTests(unittest.TestCase):
         self.assertIn('餐饮', text)
         self.assertIn('房租', text)
         self.assertIn('20', text)
-        draft = ReportDraft.model_validate({'sections': [{'title': '区间比较',
-            'factIds': [f['id'] for f in facts[offset:offset + 8]],
-            'analysis': '餐饮已记支出增加20元；房租已按要求排除。' if offset == 0 else ''}
-            for offset in range(0, len(facts), 8)]})
-        self.assertFalse(validate_draft(draft, facts))
+        findings = build_analysis_findings([data[0]])
+        sections, seen = [], set()
+        for offset in range(0, len(facts), 8):
+            identifiers = [fact['id'] for fact in facts[offset:offset + 8]]
+            sections.append({'title': '统计口径', 'factIds': identifiers,
+                             'analysis': grounded_analysis(identifiers, facts, findings, seen)})
+        draft = ReportDraft(sections=sections)
+        self.assertFalse(validate_draft(draft, facts, findings))
+        reply = render_report(draft, facts)
+        self.assertIn('餐饮', reply)
+        self.assertIn('变化 20 元', reply)
 
     def test_count_and_mean_changes_are_reported_as_ledger_statistics(self):
         from app.tools.financial_analysis import run_analysis
@@ -159,22 +167,20 @@ class AggregatePipelineTests(unittest.TestCase):
         QueryPlanner.__new__(QueryPlanner)._normalize_plan(plan, datetime(2026, 11, 19), '按星期画图')
         self.assertNotIn('trends', [task.tool for task in plan.analyses])
 
-    def test_declared_omission_units_are_checked_against_typed_facts(self):
-        from app.agent.report_values import numerical_issues
-        facts = [{'id': 'f1', 'values': [{'label': '省略分组', 'value': 4, 'unit': '个'},
-                                       {'label': '省略比较', 'value': 2, 'unit': '项'}]}]
-        self.assertFalse(numerical_issues('另有4个分组、2项比较未展示。', ['f1'], facts))
-        self.assertTrue(numerical_issues('另有5个分组。', ['f1'], facts))
+    def test_group_and_comparison_omissions_keep_their_computed_values_and_units(self):
+        from app.tools.financial_analysis import run_analysis
 
-    def test_inline_internal_fact_markers_are_cleaned_without_erasing_quantities(self):
-        from app.agent.evidence_report import prepare_draft
-        facts = [{'id': 'f1', 'text': '计算收入100元', 'required': True,
-                  'values': [{'label': '收入', 'value': 100, 'unit': '元'}]}]
-        draft = ReportDraft.model_validate({'sections': [{'title': '来源', 'factIds': ['f1'],
-            'analysis': '这笔收入（f1）为100元，后续是否延续需确认。'}]})
-        prepared, _ = prepare_draft(draft, facts)
-        self.assertNotIn('f1', prepared.sections[0].analysis)
-        self.assertIn('100元', prepared.sections[0].analysis)
+        records = [row(f'2026-{month:02}-05', amount, category)
+                   for month in (9, 10) for amount, category in [(-20, '餐饮'), (-40, '交通')]]
+        evidence = run_analysis('aggregate', records, as_of=date(2026, 11, 19), metric='expense', aggregate={
+            'groupBy': ['category'], 'limit': 1,
+            'periods': [period('九月', '2026-09-01', '2026-09-30'),
+                        period('十月', '2026-10-01', '2026-10-31')],
+        })
+        facts = build_facts([{'tool': 'aggregate', 'evidence': evidence}])
+        omissions = {value['label']: (value['value'], value['unit']) for fact in facts
+                     for value in fact['values'] if value['label'] in {'省略分组', '省略比较'}}
+        self.assertEqual(omissions, {'省略分组': (3, '个'), '省略比较': (1, '项')})
 
 
 class AggregateInvestigationTests(unittest.IsolatedAsyncioTestCase):

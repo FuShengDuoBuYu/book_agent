@@ -67,7 +67,8 @@ def _amount_matches(clause, field):
     joins = r"[\s的是为约有现共需还要至少到达留设成作]*"
     patterns = [rf"{role}{joins}({NUMBER})", rf"({NUMBER})\s*(?:元|块)?{joins}{role}"]
     if field == "purchaseAmount" and re.search(r"买|购", clause):
-        patterns.append(rf"(?:花费?|付){joins}({NUMBER})")
+        patterns.extend([rf"(?:花费?|付){joins}({NUMBER})",
+                         rf"(?:拿出?|用|支付){joins}({NUMBER})\s*(?:元|块(?:钱)?)\s*(?:直接|去|来|用于)?(?:买|购)"])
     if field == "startingBalance":
         # A past snapshot is not proof of present cash. When the clause explicitly
         # transitions back to the present, examine only that current portion.
@@ -80,6 +81,12 @@ def _amount_matches(clause, field):
         # A savings target uses a future balance, not available cash.
         clause = re.sub(r"(?:目标(?:余额|存款)|存款目标|希望余额|想要余额)", "目标款项", clause)
     matches = (match for pattern in patterns for match in re.finditer(pattern, clause))
+    if field == "purchaseAmount":
+        # In “预算七百元买设备”, the number limits the budget. The verb that
+        # follows the amount does not convert a balance or budget into a price.
+        other_role = re.compile(r"(?:" + "|".join(ROLES[f] for f in ("budgetAmount", "startingBalance", "reserveAmount"))
+                                + r")" + joins + r"$")
+        matches = (m for m in matches if not other_role.search(clause[:m.start(1)]))
     # In 买一台电脑 the number counts objects. Only a price can supply a purchase amount.
     return {_number(m[1]) for m in matches if field != "purchaseAmount"
             or not re.match(r"\s*[台个辆部件套只张本份]", clause[m.end(1):])} - {None}

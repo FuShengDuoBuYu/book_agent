@@ -8,7 +8,7 @@ from scripts import evaluate_acceptance
 class AcceptanceEvidenceTests(unittest.TestCase):
     def test_canonical_source_and_user_food_alias_are_accepted_only_with_applied_evidence(self):
         record = {'case': 'chain_3', 'reply': '合成分析', 'metadata': {
-            'validation': {'status': 'reviewed'}, 'analysisContext': {
+            'validation': {'status': 'grounded'}, 'analysisContext': {
                 'protectedCategories': ['房租', '吃饭'],
                 'changes': [{'metric': 'income', 'source': '家教课时费', 'percent': -50}]},
             'evidence': {'analysisResults': [

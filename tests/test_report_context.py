@@ -1,9 +1,9 @@
 import unittest
 from copy import deepcopy
 
-from app.agent.report_context import build_report_context, repair_context
+from app.agent.report_context import build_report_context, _fit_evidence, _prompt_budget
 from app.agent.report_values import value_catalog
-from app.schemas.report import ReportDraft
+from app.agent.report_composition import ReportOutline
 
 
 SYSTEM = '只使用本轮账本证据作答。'
@@ -12,8 +12,7 @@ SCHEMA = {'type': 'object', 'properties': {'sections': {'type': 'array'}}}
 
 def fact(number, *, required, text, label='统计金额', value=1234):
     return {'id': f'f{number}', 'text': text, 'required': required,
-            'values': [{'label': label, 'value': value, 'unit': '元'}],
-            'calendars': ['2026-09', '2026-10']}
+            'values': [{'label': label, 'value': value, 'unit': '元'}]}
 
 
 def base_payload():
@@ -30,11 +29,12 @@ def base_payload():
 class ReportContextTests(unittest.TestCase):
     def test_model_projection_uses_a_single_compact_display_per_value(self):
         original = [fact(1, required=True, text='进账 1,234 元。', label='进账')]
-        payload, selected, stats = build_report_context(base_payload(), original, SYSTEM, ReportDraft)
-        self.assertEqual(payload['facts'], [{'id': 'f1', 'text': '进账 1,234 元。', 'required': True}])
+        original[0]['binding'] = {'scope': '个人版', 'resultGroup': 'g1', 'metric': 'income'}
+        payload, selected, stats = build_report_context(base_payload(), original, SYSTEM, ReportOutline)
+        self.assertEqual(payload['facts'], [{'id': 'f1', 'text': '进账 1,234 元。', 'required': True,
+                                            'binding': original[0]['binding']}])
         self.assertEqual(payload['values'], {'v1': 'f1 进账 = 1,234 元'})
         self.assertEqual(selected, original)
-        self.assertEqual(selected[0]['calendars'], ['2026-09', '2026-10'])
         self.assertEqual(stats['promptBudgetTokens'], 8192 - 2048 - 256)
 
     def test_compact_source_text_keeps_eight_sources_without_changing_internal_evidence(self):
@@ -50,7 +50,7 @@ class ReportContextTests(unittest.TestCase):
             for number in range(1, 9)
         ]
         original = [required, *sources]
-        payload, selected, stats = build_report_context(base, original, SYSTEM, ReportDraft)
+        payload, selected, stats = build_report_context(base, original, SYSTEM, ReportOutline)
 
         self.assertEqual(payload['question'], base['question'])
         self.assertEqual(payload['understanding'], base['understanding'])
@@ -91,9 +91,6 @@ class ReportContextTests(unittest.TestCase):
         self.assertEqual(stats['omittedOptionalFactCount'], 0)
         self.assertLessEqual(stats['estimatedPromptTokens'], stats['promptBudgetTokens'])
 
-        repaired, _ = repair_context(payload, None, ['补足汇总口径。'], SYSTEM, SCHEMA, **budget)
-        self.assertNotIn('values', repaired)
-        self.assertEqual(repaired['facts'], payload['facts'])
         self.assertEqual(base['values'], {'old': '历史变量目录。'})
 
     def test_pressure_keeps_question_instructions_required_facts_and_artifact_columns(self):
@@ -137,73 +134,19 @@ class ReportContextTests(unittest.TestCase):
         self.assertTrue(base['history'].endswith(payload['history']))
         self.assertLessEqual(stats['estimatedPromptTokens'], stats['promptBudgetTokens'])
 
-    def test_repair_excerpts_fit_without_changing_fact_ids_or_values(self):
-        selected_input = [fact(1, required=True, text='交通类变化最大。', value=88),
-                          fact(2, required=False, text='餐饮类第二。', value=72)]
-        budget = {'num_ctx': 1950, 'num_predict': 384}
-        payload, selected, _ = build_report_context(base_payload(), selected_input, SYSTEM, SCHEMA, **budget)
-        original = deepcopy(payload)
-        prior = {'sections': [
-            {'title': f'错误摘要{i}', 'factIds': ['f1', 'f2'], 'analysis': '待缩短的分析文字。' * 160}
-            for i in range(1, 7)
-        ]}
-        issues = ['第一段应纠正交通变化的方向。', '第二段应按账单证据核对笔数。']
-        repair, stats = repair_context(payload, prior, issues, SYSTEM, SCHEMA, **budget)
-        self.assertEqual(repair['facts'], payload['facts'])
-        self.assertEqual(repair['values'], {
-            row['id']: f"{row['factId']} {row['label']} = {row['display']}" for row in value_catalog(selected)
-        })
-        self.assertEqual(repair['question'], payload['question'])
-        self.assertEqual(repair['corrections'][0], issues[0])
-        self.assertEqual(repair['previousReport']['sections'][0]['title'], '错误摘要1')
-        self.assertEqual(repair['previousReport']['sections'][0]['factIds'], ['f1', 'f2'])
-        self.assertNotIn('analysis', repair['previousReport']['sections'][0])
-        self.assertLessEqual(stats['estimatedPromptTokens'], stats['promptBudgetTokens'])
-        self.assertEqual(payload, original)
-
-    def test_retry_makes_room_for_all_diagnostics_before_optional_context(self):
-        base = {**base_payload(), 'analysisScope': {'metric': 'expense', 'window': '前两个月'}}
-        base['history'] = '较早的回答片段。' * 22
-        base['artifacts'] = [{'id': 'a1', 'title': '分类支出', 'columns': [{'key': 'amount', 'label': '金额'}],
-                              'rows': [{'amount': i} for i in range(8)]}]
-        facts = [fact(1, required=True, text='只根据账单记录的支出。')] + [
-            fact(i, required=False, text='次要账单说明。' * 9) for i in range(2, 9)
-        ]
-        budget = {'num_ctx': 1600, 'num_predict': 384}
-        initial, _, _ = build_report_context(base, facts, SYSTEM, SCHEMA, **budget)
-        before = deepcopy(initial)
-        issues = [
-            f'第{i}段把账单笔数当作购买数量。请删除该推断并保留统计口径。' for i in range(1, 9)
-        ]
-        prior = {'sections': [{'title': '支出说明', 'factIds': ['f1'], 'analysis': '错误段落不应被再次照抄。'}]}
-        repaired, stats = repair_context(initial, prior, issues, SYSTEM, SCHEMA, **budget)
-        self.assertEqual(repaired['corrections'], issues)
-        self.assertLess(len(repaired['facts']), len(initial['facts']))
-        self.assertIn(initial['facts'][0], repaired['facts'])
-        for key in ('question', 'understanding', 'userConditions', 'analysisScope', 'instruction'):
-            self.assertEqual(repaired[key], base[key])
-        self.assertEqual(repaired['artifacts'][0]['columns'], base['artifacts'][0]['columns'])
-        self.assertNotIn('错误段落不应被再次照抄', str(repaired))
-        self.assertEqual(stats['correctionCount'], 8)
-        self.assertLessEqual(stats['estimatedPromptTokens'], stats['promptBudgetTokens'])
-        self.assertEqual(initial, before)
-
-    def test_retry_keeps_required_value_ids_when_optional_evidence_is_removed(self):
+    def test_outline_input_fit_keeps_required_ids_and_does_not_mutate_the_evidence(self):
         payload = {**base_payload(), 'facts': [
             {'id': 'f1', 'required': True, 'text': '总支出已核对。'},
-            {'id': 'f2', 'required': False, 'text': '次要的来源依据。' * 75},
-            {'id': 'f3', 'required': True, 'text': '本次忽略医疗支出。'},
-        ], 'values': {'v1': 'f1 已记支出 = 90 元', 'v2': 'f2 参考额 = 29 元', 'v3': 'f3 排除金额 = 12 元'}}
-        repaired, _ = repair_context(payload, None, ['第一段应保留医疗筛选。'], SYSTEM, SCHEMA,
-                                     num_ctx=1300, num_predict=384)
-        self.assertEqual([item['id'] for item in repaired['facts']], ['f1', 'f3'])
-        self.assertEqual(repaired['values'], {'v1': 'f1 已记支出 = 90 元', 'v3': 'f3 排除金额 = 12 元'})
-        self.assertIn('v2', payload['values'])
-
-    def test_retry_reports_overflow_instead_of_cutting_a_required_diagnostic(self):
-        initial, _, _ = build_report_context(base_payload(), [], SYSTEM, SCHEMA)
-        with self.assertRaisesRegex(ValueError, '预算'):
-            repair_context(initial, None, ['需保留的诊断。' * 1000], SYSTEM, SCHEMA)
+            {'id': 'f2', 'required': False, 'text': '次要的来源依据。' * 100},
+            {'id': 'f3', 'required': True, 'text': '本次忽略医疗支出。'}],
+            'answerGoals': ['保留医疗排除条件']}
+        original = deepcopy(payload)
+        limit, estimate = _prompt_budget(SYSTEM, SCHEMA, 1250, 384)
+        fitted = _fit_evidence(payload, estimate, limit)
+        self.assertLessEqual(estimate(fitted), limit)
+        self.assertEqual([r['id'] for r in fitted['facts']], ['f1', 'f3'])
+        self.assertEqual(fitted['answerGoals'], original['answerGoals'])
+        self.assertEqual(payload, original)
 
     def test_required_facts_or_critical_question_over_budget_raise(self):
         budget = {'num_ctx': 1200, 'num_predict': 384}
@@ -222,15 +165,6 @@ class ReportContextTests(unittest.TestCase):
         schema = {**SCHEMA, 'description': '结构说明。' * 200}
         with self.assertRaisesRegex(ValueError, '预算'):
             build_report_context(base_payload(), [], SYSTEM, schema, **budget)
-
-    def test_text_retry_context_preserves_prefix_and_budget(self):
-        budget = {'num_ctx': 1250, 'num_predict': 384}
-        initial, _, _ = build_report_context(base_payload(), [], SYSTEM, SCHEMA, **budget)
-        text = '重试需要保留当前结论。' + '较早详细解释。' * 350
-        repair, stats = repair_context(initial, text, [], SYSTEM, SCHEMA, **budget)
-        self.assertTrue(repair['previousReport'].startswith('重试需要保留当前结论。'))
-        self.assertLess(len(repair['previousReport']), len(text))
-        self.assertLessEqual(stats['estimatedPromptTokens'], stats['promptBudgetTokens'])
 
 
 if __name__ == '__main__':

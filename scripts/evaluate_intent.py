@@ -119,7 +119,7 @@ def check_turn(kind, today, reply, metadata, lookups):
                      and a["evidence"].get("metric") == "income"), {})
     target = shift_month(today, 2).strftime("%Y-%m")
     checks = {"answered": bool(reply.strip()),
-              "explanationReviewed": metadata.get('validation', {}).get('status') == 'reviewed',
+              "explanationGrounded": metadata.get('validation', {}).get('status') == 'grounded',
               "noPrivateIdentifiers": all(
         value not in visible for value in (OWNER, PARTNER, FAMILY))}
     if kind in {"forecast", "table", "method"}:

@@ -43,7 +43,7 @@ def assess(record):
     results = {row['tool']: row['evidence'] for row in metadata.get('evidence', {}).get('analysisResults', [])}
     name = record['case']
     checks = {'answered': bool(record.get('reply')) and not record.get('error'),
-              'interpretationReviewed': metadata.get('validation', {}).get('status') == 'reviewed'}
+              'interpretationGrounded': metadata.get('validation', {}).get('status') == 'grounded'}
     def has(tool, key, expected):
         return results.get(tool, {}).get(key) == expected
     if name == 'diagnosis':

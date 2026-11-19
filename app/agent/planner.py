@@ -288,6 +288,10 @@ class QueryPlanner:
                 if not data:
                     raise ValueError("Missing plan")
                 plan = AgentPlan.model_validate(data)
+                # Typed calculations already commit this plan to the analysis
+                # path in _normalize_plan. Resolve their inputs before execution.
+                if plan.analyses:
+                    plan.intent = 'analyze_orders'
                 if resolved_goal and not plan.understanding.objective:
                     plan.understanding = resolved_goal.model_copy(deep=True)
                 if resolved_goal:
@@ -324,6 +328,7 @@ class QueryPlanner:
                     for task in plan.analyses:
                         if task.aggregate:
                             task.aggregate.periods = relative_periods
+                self._restore_forecast_explanation(plan, previous_context, message, now.date())
                 self._preserve_referent_window(plan, previous_context or {}, message, now)
                 context = self._inherit_conversation(plan, previous_context or {})
                 self._normalize_referenced_periods(plan, context, message)
@@ -698,6 +703,54 @@ class QueryPlanner:
             return match[0] if (year, month) <= (now.year, now.month) else ''
         historical_message = re.sub(r'(\d{4})\s*[-年/]\s*(\d{1,2})\s*月?', historical_date, message)
         return bool(re.search(r'本月|这个月|当月|今天|昨天|前天|本周|这周|上周|上(?:上)?(?:个)?月|去年|前年|今年|本季度|上季度|最近|过去|\d{1,4}[-年/]\d{1,2}|(?:\d{1,2}|[一二三四五六七八九十]+)月', historical_message))
+
+    @staticmethod
+    def _restore_forecast_explanation(plan, previous, message, today):
+        """A request to explain a prior forecast reads the records of that forecast."""
+        if not plan.followUpOfPreviousQuestion or plan.resetAnalysisContext or previous.get('ambiguous'):
+            return
+        active = [t for t in previous.get('activeAnalyses', []) if t.get('tool') == 'forecast']
+        scope = previous.get('scope', [])
+        if len(active) != 1 or not active[0].get('targetMonth') or len(scope) != 1:
+            return
+        # A literal remark/category filter is a new selection. A question about
+        # which raw remarks were grouped asks for evidence across the original set.
+        if _explicit_history_sample(message, today) or re.search(
+                r"只(?:看|查|算|统计|列)|仅(?:看|查|限)|另查|排除|剔除|(?:备注|分类|类别)(?:包含|等于|为|叫)", message):
+            return
+        notes = re.search(r"备注", message) and re.search(r"同一|同个|合并|归并|归组|认作|归类", message)
+        if any(t.tool in HISTORY_BASED_TOOLS | {'budget'} and t.tool != 'forecast' for t in plan.analyses):
+            return
+        method = re.search(r"(?:刚才|上次|上轮|之前).{0,14}(?:预测|预计|估算|推演|测算|估计)|(?:这|那)个数|该预测", message) and re.search(
+            r"参照|参考|基准|依据|样本|计算方法|怎么.{0,12}(?:得|来|算)|如何.{0,12}(?:得|算)|一次性.{0,8}处理", message)
+        if not (notes or method):
+            return
+        tool, category, remark = scope[0]
+        if any(call.toolName != tool for call in plan.toolCalls):
+            return
+        for call in plan.toolCalls:
+            call.args.cost_type, call.args.remark = category, remark
+        if not plan.toolCalls:
+            plan.toolCalls = [ToolCall.model_validate(q) for q in previous.get('conversation', {}).get('queries', [])]
+        keys = [call.id for call in plan.toolCalls if call.id]
+        restored = AnalysisRequest.model_validate(active[0])
+        if keys and not set(restored.queryIds) <= set(keys):
+            restored.queryIds = keys
+        restored._supplemental = bool(notes and not method)
+        support = [t for t in plan.analyses if t.tool not in HISTORY_BASED_TOOLS | {'budget'}]
+        if notes and not any(t.tool == 'sources' for t in support):
+            support.append(AnalysisRequest(tool='sources', queryIds=keys))
+        for task in support:
+            if task.tool != 'sources':
+                task._supplemental = True
+        plan.analyses = [*support, restored]
+        conversation = previous.get('conversation', {})
+        window = previous.get('activeHistoryWindow', conversation.get('analysisWindow'))
+        plan.analysisWindow = AnalysisWindow.model_validate(window) if window else None
+        from app.schemas.plan import SourceGroup
+        plan.sourceGroups = [SourceGroup.model_validate(row) for row in conversation.get('sourceGroups', [])]
+        plan.output.metric = restored.metric
+        plan._planning_issues.append({'type': 'restored_forecast_evidence', 'targetMonth': restored.targetMonth})
 
     def _preserve_referent_window(self, plan, previous, message, now):
         if not (plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext and previous.get('conversation')):

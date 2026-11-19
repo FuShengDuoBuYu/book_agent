@@ -11,6 +11,57 @@ def group(tool, **evidence):
 
 
 class FindingTests(unittest.TestCase):
+    def test_direct_projection_names_only_applied_assumptions_and_distinguishes_extending_a_deadline(self):
+        records = [{'year': 2026, 'month': m, 'day': 2, 'money': n, 'costType': category,
+                    'orderRemark': remark} for m, expense in [(8, 100), (9, 100), (10, 1000)]
+                   for n, category, remark in [(3000, '收入', '校稿'), (-expense, '医疗', '门诊')]]
+        evidence = run_analysis('projection', records, as_of=date(2026, 11, 19), months=4,
+                                changes=[{'metric': 'income', 'source': '校稿', 'percent': -10}])
+        result = {'tool': 'projection', 'evidence': evidence}
+        first = build_analysis_findings([result])['g1']
+        self.assertNotIn('延长', ''.join(first['observations']))
+        applied, = [s for s in first['observations'] if '已应用' in s]
+        self.assertIn('校稿', applied)
+        self.assertNotIn('医疗', applied)
+        self.assertTrue(any('医疗' in s and '观察' in s for s in first['observations']))
+        later = build_analysis_findings([result], {'previousMonths': 2})['g1']
+        self.assertTrue(any('储蓄目标' in s and '无法比较' in s for s in later['limitations']))
+        self.assertTrue(any('累计结余增加' in s for s in later['observations']))
+        self.assertTrue(later['actions'])
+        goal = build_analysis_findings([result], {'previousMonths': 2, 'targetAmount': 6000})['g1']
+        self.assertFalse(any('未给出储蓄目标' in s for s in goal['limitations']))
+
+    def test_actions_distinguish_protected_spending_and_detected_quality_issues(self):
+        records = [{'year': 2026, 'month': m, 'day': 2, 'money': -30, 'costType': category, 'bankName': '现金'}
+                   for m in (8, 9, 10) for category in ('医疗', '交通')]
+        def find(tool):
+            return group(tool, **run_analysis(tool, records, as_of=date(2026, 11, 19), monthly_improvement=90))
+        empty = find('optimization')['actions']
+        self.assertIn('未分类', ''.join(empty))
+        self.assertIn('增收', ''.join(empty))
+        self.assertNotRegex(''.join(empty), '削减交通|削减医疗')
+        records.extend([dict(r, costType='季票') for r in records if r['costType'] == '交通'])
+        acts = find('optimization')['actions']
+        self.assertIn('季票', ''.join(acts))
+        self.assertIn('用途', ''.join(acts))
+        self.assertIn('可调整金额', ''.join(acts))
+        quality = find('data_quality')
+        self.assertEqual(quality['labels']['missingFields'], [])
+        self.assertIn('样本不足', ''.join(quality['limitations']))
+        unclassified = group('data_quality', **run_analysis('data_quality', [dict(records[0], costType='')], as_of=date(2026, 11, 19)))
+        self.assertIn('分类', unclassified['labels']['missingFields'])
+        self.assertNotIn('这些记录已有分类', ''.join(unclassified['limitations']))
+        self.assertLessEqual(len(acts), 3)
+
+    def test_cashflow_with_ledger_link_uses_inert_name_and_avoids_risk_rating(self):
+        name = '[工作室](https://example.invalid/abc)'
+        found = group('cashflow', incomeSources=[{'source': name, 'sharePercent': 75}],
+                      expenseCategories=[{'name': '交通', 'amount': 40}])
+        self.assertIn('` ' + name + ' `', ''.join(found['observations']))
+        self.assertIn('大部分', ''.join(found['observations']))
+        self.assertIn('债务', ''.join(found['limitations']))
+        self.assertIn('到账', ''.join(found['actions']))
+
     def test_real_runway_names_operands_and_handles_no_deficit(self):
         records = [{'year': 2026, 'month': m, 'day': 1, 'money': value, 'costType': category}
                    for m in (8, 9, 10) for value, category in [(1000, '工资'), (-600, '房租')]]
@@ -177,7 +228,7 @@ class FindingTests(unittest.TestCase):
                       assumptions=[{'source': '课程', 'metric': 'income', 'totalChange': -300}])
         self.assertTrue(found['states']['assumptionsApplied'])
         self.assertIn('课程', json.dumps(found, ensure_ascii=False))
-        self.assertIn('期限', ''.join(found['observations']))
+        self.assertNotIn('延长期限', ''.join(found['observations']))
         self.assertNotRegex(json.dumps(found, ensure_ascii=False), r'\d')
 
     def test_source_remarks_stay_attached_to_member_and_group(self):

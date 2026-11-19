@@ -1,6 +1,8 @@
-"""Qualitative findings derived from calculated evidence for the commentary writer."""
+"""Qualitative explanations for the report, derived from computed ledger evidence."""
 
 import re
+
+from app.agent.report_values import literal
 
 
 METRICS = {'income': '收入', 'expense': '支出', 'net': '结余'}
@@ -9,12 +11,17 @@ INPUTS = {'startingBalance': '当前可动用余额', 'reserveAmount': '应急�
           'targetAmount': '储蓄目标', 'months': '目标期限', 'budgetAmount': '预算金额'}
 CHANGE = ('下降', '持平', '上升')
 SIGN = ('为负', '持平', '为正')
-# Raw notes containing quantities stay in the evidence table. They cannot authorize numbers in prose.
+# Keep notes containing quantities in the evidence table, outside qualitative remark examples.
 QUANTITY = re.compile(r'[%％￥¥]|[\d零〇一二三四五六七八九十百千万两]+(?:[.,，\d]*\s*)(?:元|块|万|笔|次|成|个月|年|月|日)')
 
 
 def _direction(value, words):
     return words[(value > 0) - (value < 0) + 1]
+
+
+def _name(value):
+    text = str(value)
+    return literal(text) if re.search(r'[\[\]`*_~<>\\|\n\r]|://|www\.|@|\b[a-z0-9.-]+\.[a-z]{2,}\b', text, re.I) else text
 
 
 def _remark_examples(remarks):
@@ -31,8 +38,8 @@ def _aggregate_ranks(e, out):
     for covered in e.get('coverage', []):
         period = covered['period']
         if covered.get('matchedCount') == 0:
-            summaries.append(f'{period}的已查记录中没有可排名的匹配分组。' if covered.get('queryCoverage') != 'not_queried'
-                             else f'{period}未查询，分组排名未知。')
+            summaries.append(f'{_name(period)}的已查记录中没有可排名的匹配分组。' if covered.get('queryCoverage') != 'not_queried'
+                             else f'{_name(period)}未查询，分组排名未知。')
             continue
         slices = {}
         for row in e.get('rows', []):
@@ -51,9 +58,9 @@ def _aggregate_ranks(e, out):
                 tied = len(winners) > 1
                 ranks.append({'period': period, 'metric': metric, 'groups': groups, 'tied': tied,
                               'tiesOmitted': len(winners) > len(groups), 'visibleOnly': visible_only})
-                names = '、'.join('／'.join(g.values()) for g in groups)
+                names = '、'.join('／'.join(map(_name, g.values())) for g in groups)
                 scope = '已展示的已查分组' if visible_only else '有匹配记录的分组'
-                where = '／'.join([period, *map(str, dates)])
+                where = '／'.join(map(_name, [period, *dates]))
                 summaries.append(f'{where}的{scope}中，{names}' + ('等' if len(winners) > len(groups) else '')
                                  + f'的已记{METRICS[metric]}金额' + ('并列最高。' if tied else '最高。'))
     if ranks:
@@ -106,8 +113,9 @@ def _change_finding(e, out, tool):
                     leaders.append({'metric': metric, 'label': name, 'increased': top_change > 0,
                                     'previouslyRecorded': prior,
                                     'afterRemarks': _remark_examples(row.get('afterRemarks', []))})
-                obs.append(f"已列{METRICS[metric]}分组中，“{aligned[0][1]}”的同方向变化金额居首。")
+                obs.append(f"已列{METRICS[metric]}分组中，“{_name(aligned[0][1])}”的同方向变化金额居首。")
         for row, name in rows[:2]:
+            name = _name(name)
             # A zero net is not proof of an absent category. For a directional amount, zero
             # only establishes absence of a positive amount, unless a record count is known.
             earlier = row.get('beforeCount')
@@ -170,7 +178,7 @@ def _decision(e, out, tool, context):
     if uses_forecast:
         method = '月结余基准用各成员收入来源的月金额中位数之和，减去月支出总额的中位数'
         out['labels']['baselineMethod'] = method
-        obs.append(method + '；情景变化在此基础上应用。')
+        obs.append(method + '。')
     if tool == 'savings':
         projected, target = e.get('projectedBalance'), e.get('targetAmount')
         meets = projected >= target if projected is not None and target is not None else None
@@ -212,8 +220,10 @@ def _decision(e, out, tool, context):
         out['labels']['assumptions'] = [{'metric': c.get('metric'), 'source': c.get('source') or '该方向全部来源',
                                          'direction': _direction(c['totalChange'], CHANGE)}
                                         for c in changes[:8] if c.get('totalChange') is not None]
-        if changes:
-            obs.append('所列用户假设已计入本次情景，不能在结果上重复扣减或增加。')
+        applied = [f"{_name(c['source'])}的{METRICS[c['metric']]}{c['direction']}"
+                   for c in out['labels']['assumptions'] if c['metric'] in METRICS]
+        if applied:
+            obs.append('本次已应用的变化包括你指定的' + '、'.join(applied) + '。')
         value = e.get('totalNet' if tool == 'projection' else 'net')
         if value is not None:
             obs.append(('期间累计新增结余' if tool == 'projection' else '情景月结余') + _direction(value, SIGN) + '。')
@@ -224,18 +234,21 @@ def _decision(e, out, tool, context):
             if extended:
                 effect = _direction(e['monthlyNet'], ('累计缺口扩大', '累计结余不变', '累计结余增加'))
                 obs.append(f'相同假设下，本次延长期限后{effect}，每月结余能力保持相同。')
-            else:
-                obs.append('相同假设下，延长期限只延长累计期间，每月结余能力保持相同。')
+            if context.get('targetAmount') is None:
+                out['limitations'].append('未给出储蓄目标金额，无法比较不同期限下每月需要存下多少。')
+                if extended:
+                    out['actions'].append('如果要比较每月的储蓄压力，先确定希望在期末留存的金额。')
             if sources := baseline.get('incomeSources'):
                 out['labels']['incomeSources'] = list(dict.fromkeys(sources))[:4]
-                obs.append('历史完整月份重复出现的入账来源包括' + '、'.join(out['labels']['incomeSources']) + '。')
+                obs.append('历史完整月份重复出现的入账来源包括' + '、'.join(map(_name, out['labels']['incomeSources'])) + '。')
             latest = baseline.get('latestCompleteChange') or {}
             if latest.get('sufficientData') is True:
                 drivers = [{'category': row['name'], 'direction': _direction(row['change'], CHANGE)}
                            for row in latest.get('expenseDrivers', []) if row.get('name') and row.get('change')][:3]
                 if drivers:
                     out['labels']['observedExpenseChanges'] = drivers
-                    obs.append('最近完整月份已观察到' + '、'.join(r['category'] + '支出' + r['direction'] for r in drivers) + '。')
+                    obs.append('最近完整月份已观察到' + '、'.join(_name(r['category']) + '支出' + r['direction'] for r in drivers) + '。')
+                    out['actions'].append('可先核对这些历史支出变化是否对应已确定的后续安排，再决定是否单列新的支出假设。')
         out['limitations'].append('情景只在所列假设延续时成立，新增结余不能代替起始存款。')
     elif tool == 'optimization':
         out['labels']['protected'] = list(dict.fromkeys(e.get('protectedCategories', []) + e.get('excludedCategories', [])))[:20]
@@ -254,6 +267,13 @@ def _decision(e, out, tool, context):
                         '即使候选开销全部削减仍有缺口。') + '若目标和期限固定，需要其他改善途径，例如增收。')
         elif gap == 0 and improvement is not None and improvement > 0:
             obs.append('候选总额在金额上可覆盖所需改善，实际能否削减仍需逐项确认。')
+        if improvement != 0 and states.get('hasCandidates') is False:
+            out['actions'].append('保留受保护支出，先检查已有账单中是否还有未分类或用途不明的记录。')
+        elif improvement != 0 and states.get('hasCandidates'):
+            names = '、'.join(map(_name, out['labels']['candidates'][:3]))
+            out['actions'].append(f'先核对{names}的具体用途，再确定实际可调整金额。')
+        if gap is not None and gap > 0:
+            out['actions'].append('若目标和期限不变，可再核实可实现的增收；若期限可调整，再比较延后达标的安排。')
         out['limitations'].append('可核查的上界不能当作可全部取消的支出。')
 
 
@@ -264,7 +284,7 @@ def build_analysis_findings(results, context=None):
         tool, e = result['tool'], result.get('evidence') or {}
         obs, limits = [], []
         out = {'tool': tool, 'scope': result.get('mode', '当前账本'), 'observations': obs,
-               'limitations': limits, 'labels': {}, 'states': {'sufficientData': e.get('sufficientData')}}
+               'limitations': limits, 'actions': [], 'labels': {}, 'states': {'sufficientData': e.get('sufficientData')}}
         missing = [INPUTS[k] for k in e.get('missingInputs', []) if k in INPUTS]
         if missing:
             obs.append('尚缺' + '、'.join(missing) + '。')
@@ -289,9 +309,15 @@ def build_analysis_findings(results, context=None):
                 if names:
                     out['labels'][field] = names
             if out['labels']:
-                obs.append('列出的来源与支出类别是本次查询期内已记金额靠前的项目。')
+                for key, desc in [('incomeSources', '收入来源'), ('expenseCategories', '支出类别')]:
+                    if names := out['labels'].get(key):
+                        obs.append(f'查询期内已记金额靠前的{desc}有' + '、'.join(map(_name, names)) + '。')
+                majority = next((r['source'] for r in e.get('incomeSources', []) if (r.get('sharePercent') or 0) > 50), None)
+                if majority:
+                    obs.append(f'{_name(majority)}占查询期已记收入的大部分。')
+                    out['actions'].append(f'安排近期付款前，可先核实{_name(majority)}下次到账时间与必付账单到期日。')
                 limits.append('金额排名不能证明收入会持续，也不能据此判断支出负担或可削减性。')
-            limits.append('完整月份月均结余描述历史现金流，无法据此认定当前存款。')
+            limits.append('历史现金流不能说明目前可动用的余额和到期债务，单凭结余无法判断抗风险能力。')
         elif tool == 'budget':
             if e.get('hasRecords') is True and e.get('remaining') is not None:
                 remaining = e['remaining']
@@ -320,7 +346,7 @@ def build_analysis_findings(results, context=None):
             majority = [r['source'] for r in e.get('sources', []) if (r.get('sharePercent') or 0) > 50]
             if majority:
                 out['labels']['majoritySource'] = majority[0]
-                obs.append('“' + majority[0] + '”占所统计历史收入的大部分。')
+                obs.append('“' + _name(majority[0]) + '”占所统计历史收入的大部分。')
             limits.append('历史集中度和波动无法证明未来收入稳定或安全。')
         elif tool in {'data_quality', 'anomalies'}:
             if 'possibleDuplicates' in e:
@@ -335,6 +361,10 @@ def build_analysis_findings(results, context=None):
                 if fields:
                     names = '、'.join(fields)
                     obs.append('检测到的缺失字段为' + names + '，会影响按' + names + '归集；缺失本身不能证明合计有误。')
+                    out['actions'].append('优先核对账本中' + names + '空缺的记录，再按这些字段比较。')
+                if e.get('insufficientCategories'):
+                    names = '、'.join(_name(r['category']) for r in e['insufficientCategories'][:4])
+                    limits.append(f'{names}的同类记录样本不足，暂不能据此判断金额是否异常。分类是否缺失由单独的字段检查确认。')
                 if measured:
                     limits.append('字段缺失检测仅涵盖' + '、'.join(measured.values()) + '。')
             if e.get('nonrecurringIncomeCount'):

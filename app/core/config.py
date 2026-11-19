@@ -16,6 +16,7 @@ class Settings(BaseModel):
 
     app_name: str = "book_agent"
     app_version: str = "0.1.0"
+    release_revision: str | None = Field(default=None, pattern=r'^[0-9a-f]{40}$')
     bookkeeping_api_base_url: str = "https://autobookkeeping-fastapi.onrender.com"
     agent_mongodb_uri: str = ""
     agent_mongodb_db: str = "book_agent"
@@ -63,6 +64,7 @@ def get_settings() -> Settings:
         model = ""
 
     return Settings(
+        release_revision=os.getenv("AGENT_RELEASE_REVISION") or None,
         bookkeeping_api_base_url=os.getenv(
             "BOOKKEEPING_API_BASE_URL", defaults.bookkeeping_api_base_url
         ),

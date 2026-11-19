@@ -4,7 +4,7 @@ The user authorized a complete implementation after reviewing failures in real c
 
 ## Approach
 
-Use a bounded investigation workflow: understand the question and conversation; query authorized records; compute evidence and source/member breakdowns; refine semantic source grouping using only identifiers from the observed catalog; render requested artifacts; explain and review the result. Arithmetic and artifact values belong to code. The language model selects tools, interprets evidence and states uncertainties. A larger model alone cannot recover discarded data; unrestricted model-generated arithmetic cannot establish ledger accuracy.
+Use a bounded investigation workflow: understand the question and conversation; query authorized records; compute evidence and source/member breakdowns; refine semantic source grouping using only identifiers from the observed catalog; render requested artifacts; select a scoped outline and render computed findings. Arithmetic and artifact values belong to code. The language model interprets the user goal, selects tools and evidence, and investigates observed sources. Code renders financial judgments and uncertainties derived from calculated evidence. A larger model alone cannot recover discarded data; unrestricted model-generated arithmetic cannot establish ledger accuracy.
 
 ## Data and calculation contract
 
@@ -22,7 +22,9 @@ Persist artifacts with the assistant message. Return the same artifacts through 
 
 Include bounded user and assistant history, plus scoped structured state (time range, forecast target, requested output, conditions and source grouping). Old assistant text is conversational context, not fresh ledger evidence. Independent questions reset conditions; personal and family contexts cannot mix. Planner capabilities explicitly include remarks, member breakdowns, charts and exports; unsupported capabilities are stated accurately. A bounded refinement step can repair missing analysis tools or group observed sources, with schema checks and no arbitrary code or unrestricted network access.
 
-Replace blanket numeric deletion with evidence-backed references: narrative numerical values use exact code-rendered value references, and tables/charts are deterministic. Review both factual support and task completion. On model failure, preserve useful relevant tables/charts and computed findings; do not substitute unrelated warnings. Keep model errors, validation, selected tools, fulfillment checks, version and duration available for later tuning without exposing raw identifiers.
+Keep exact code-rendered facts and deterministic tables/charts. The model selects a bounded neutral outline bound to the current user's answer goals and scoped fact IDs; it cannot supply financial prose. Code renders observations, limitations and actions derived from each bound calculation group. Required evidence omitted by the outline is supplemented with its own computed interpretation. Never substitute old assistant amounts for user inputs.
+
+On outline failure, preserve relevant facts, computed interpretation and requested artifacts immediately. Keep errors, selected goals/tools, scope, calculation findings, call timing, analysis version and release SHA in private metadata for tuning; public history receives messages and validated artifacts only.
 
 ## Scope and constraints
 
@@ -32,16 +34,12 @@ No new Android native implementation or ledger schema migration is needed. No le
 
 Replay the real failure shapes using synthetic equivalent records: per-source forecast table with reconciled total; remark follow-up with an actual query; family member/source attribution; six-month income line chart with missing months represented as unknown; cross-turn breakdown preserving target month. Cover spending, changes, anomalies, savings, purchase, protected expenses and scenarios as held-out questions. Test prompt-like remarks, unknown members, invalid source aliases, missing data, model timeouts and chart/CSV injection. Run all backend tests, frontend tests/build, an independent code review, local model acceptance and authenticated deployed readiness/history checks before reporting release success.
 
-## Evidence-bound report composition (2026-11-19 refinement)
+## Computed report composition (2026-11-19 refinement)
 
-Actual-model replay exposed two distinct failures: unrelated evidence labels became primary decisions, and a monolithic writer mixed the meanings of correct amounts across facts. Evidence labels may add read-only observations; a new decision requires a recognizable current user goal or an explicit referent to an existing decision in the same scope.
+Actual-model replay exposed correct numbers paired with wrong financial interpretation: historical expense changes were presented as applied future assumptions; protected categories became suggested cuts; unchanged monthly earning capacity was confused with unchanged target pressure. Model self-review missed substantive errors. A model verdict is therefore not the grounding gate.
 
-Compose a report through an outline and sequential bounded comments. Freeze each section's answer goal, title and at most eight fact IDs before the comment call. The comment model receives qualitative findings derived from those calculation groups and relevant corrections. It cannot replace the title or citations. Code renders the cited numerical facts and tables. Omitted required facts become independent code-rendered sections, never additional citations in unrelated prose.
+Use one ReportOutline call to select only current user answer goals, neutral titles and fact IDs. Code validates references and decision headline dependencies, preserves all mandatory evidence, and renders analysisFindings observations, limitations and actions. Every finding is bound to the same result group, tool and ledger scope as its facts; each group is interpreted once. User-controlled source text is inert Markdown data, including strings resembling quantity variables. No ReportComment, free financial writer, quantity substitution, regex prose repair or final model critic remains.
 
-Review the assembled visible report for task completion and semantic mistakes. At most one correction round is allowed. Persist the explicit composition plan, call budgets, timing and diagnostics with private metadata; public history continues to expose only messages and validated artifacts. This separation improves auditability, but it does not prove free-text interpretations correct. Validate with the configured local model as well as deterministic regressions.
+This does not replace intent understanding with keyword extraction. IntentResolver, scoped conversation state, planning validation, source investigation and analytical tools continue to determine what must be answered. The release must evaluate wrong/missing tools, stale conditions, invented inputs and lost referents separately from report grounding. A correct computed report for the wrong question is still a failed answer.
 
-## Calculated findings for explanations
-
-Replay found a correctly calculated existing category increase described as new spending, even though both the typed-value validator and model critic accepted the amount. The explanation stage therefore receives program-derived qualitative findings: change direction and prior presence, observed source relationships, target feasibility, already-applied assumptions and missing prerequisites. Exact numbers and dates remain in the original code-rendered facts and artifacts. The writer has no raw result amounts or unrelated balances to recompute. Findings retain the calculation group and scope; only bound groups can inform that section.
-
-Verified user inputs may be repeated throughout their own calculation without treating computed values from unrelated evidence as inputs. Calendar shorthand needs a unique cited year. Model acceptance is one diagnostic signal; assess actual delivered facts, task completion and interpretation separately, including independent review.
+Private metadata uses analysisVersion=5, validation.status=grounded and compositionStatus=planned/fallback. Grounded means code consistency, not semantic acceptance. Capture releaseRevision and actual model settings so later tuning can reproduce a failure. Run configured-model replay and independent qualitative review before promotion.

@@ -12,12 +12,6 @@ from app.core.llm import get_chat_model, get_planner_model, get_structured_model
 
 
 class ModelConfigurationTests(unittest.IsolatedAsyncioTestCase):
-    def test_comment_sampling_can_be_tuned_without_changing_the_planner(self):
-        from app.agent.report_composition import ReportComment
-        with patch.dict(os.environ, {'LLM_PROVIDER': 'ollama'}, clear=True):
-            writer = get_structured_model(ReportComment, temperature=0.7, num_predict=768)
-            self.assertEqual(writer.bound._chat_params([])['options']['temperature'], 0.7)
-            self.assertEqual(get_planner_model().temperature, 0)
     def test_native_planner_schema_requires_execution_not_only_an_intent_description(self):
         from app.tools.financial_analysis import ANALYSIS_TOOLS
         from app.tools.registry import PLANNER_TOOL_BY_NAME
@@ -38,23 +32,23 @@ class ModelConfigurationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue({'groupBy', 'periods', 'filters'} <= set(schema['$defs']['AggregateSpec']['required']))
         self.assertTrue({'includeCategories', 'excludeCategories'} <= set(schema['$defs']['AggregateFilters']['required']))
 
-    def test_structured_writer_has_an_independent_actual_output_budget(self):
-        from app.schemas.report import ReportReview
+    def test_report_outline_has_an_independent_actual_output_budget(self):
+        from app.agent.report_composition import OUTLINE_TOKENS, ReportOutline
         with patch.dict(os.environ, {'LLM_PROVIDER': 'ollama', 'PLANNER_NUM_PREDICT': '4096'}, clear=True):
-            reviewer = get_structured_model(ReportReview, reasoning=False, num_predict=512)
+            outline = get_structured_model(ReportOutline, reasoning=False, num_predict=OUTLINE_TOKENS)
             planner = get_planner_model()
-        self.assertEqual(reviewer.bound.num_predict, 512)
-        self.assertFalse(reviewer.bound.reasoning)
+        self.assertEqual(outline.bound.num_predict, 768)
+        self.assertFalse(outline.bound.reasoning)
         self.assertEqual(planner.num_predict, 4096)
         self.assertFalse(planner.reasoning)
 
-    def test_native_report_keeps_natural_expression_with_a_grounding_contract(self):
-        from app.agent.report_composition import ReportComment
+    def test_native_report_asks_only_for_an_evidence_outline(self):
+        from app.agent.report_composition import ReportOutline
         with patch.dict(os.environ, {'LLM_PROVIDER': 'ollama'}, clear=True):
-            writer = get_structured_model(ReportComment, reasoning=False, num_predict=768)
-        fields = writer.kwargs['format']['properties']
-        self.assertIn('不重新计算', fields['analysis']['description'])
-        self.assertNotIn('pattern', fields['analysis'])
+            outline = get_structured_model(ReportOutline, reasoning=False, num_predict=768)
+        fields = outline.kwargs['format']['$defs']['OutlineSection']['properties']
+        self.assertEqual(set(fields), {'title', 'answerGoal', 'factIds'})
+        self.assertEqual(fields['factIds']['maxItems'], 8)
 
     def setUp(self):
         for factory in (get_settings, get_chat_model, get_planner_model, get_structured_model):
