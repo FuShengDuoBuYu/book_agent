@@ -73,7 +73,8 @@ def collect_analysis_results(plan, datasets, today):
                 window_start=window.startDate if window else None,
                 window_end=window.endDate if window else None,
             )
-            analysis_results.append({"mode": scope, "tool": task.tool, "queryIds": task.queryIds,
+            logical_ids = task.queryIds or sorted({key for call, _ in bound for key in call.sourceIds or [call.id] if key})
+            analysis_results.append({"mode": scope, "tool": task.tool, "queryIds": logical_ids,
                                      "supplemental": task._supplemental, "metric": computed_metric(task.tool, result),
                                      "requestedMetric": task.metric,
                                      "historyWindow": window.model_dump(mode='json') if window and task.tool != 'budget' else None,

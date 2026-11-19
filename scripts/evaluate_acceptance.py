@@ -69,8 +69,17 @@ def assess(record):
         checks['qualityAndSampleLimits'] = bool(results.get('data_quality', {}).get('insufficientCategories'))
     if name in {'chain_3', 'chain_4'}:
         context = metadata.get('analysisContext', {})
-        checks['protectedRetained'] = {'房租', '餐饮'} <= set(context.get('protectedCategories', []))
-        checks['sourceScenarioRetained'] = any(c.get('source') == '家教' and c.get('percent') == -50 for c in context.get('changes', []))
+        protected = set(context.get('protectedCategories', []))
+        optimization = results.get('optimization', {})
+        excluded = set(optimization.get('excludedCategories', [])) | set(optimization.get('protectedCategories', []))
+        checks['protectedRetained'] = bool(protected & {'房租', '月租'} and
+            protected & {'餐饮', '吃饭', '饮食', '日常餐饮'} and {'房租', '餐饮'} <= excluded)
+        applied = results.get('projection', {}).get('assumptions', [])
+        checks['sourceScenarioRetained'] = any(
+            c.get('metric') == 'income' and c.get('percent') == -50 and '家教' in (c.get('source') or '') and
+            any(a.get('metric') == 'income' and a.get('source') == c['source'] and a.get('percent') == -50
+                and a.get('sourceBaseline') == 1600 and a.get('totalChange') == -800 for a in applied)
+            for c in context.get('changes', []))
     if name == 'variant_source':
         checks['sourceSpecificArithmetic'] = has('projection', 'totalNet', 10560)
         checks['answerUsesProjection'] = '10560' in record.get('reply', '').replace(',', '')

@@ -64,6 +64,16 @@ class FakeComposition:
 
 
 class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_comment_can_reference_a_bound_quantity_without_receiving_its_raw_number(self):
+        payload = payload_for_composition()
+        payload['quantityReferences'] = [
+            {'factId': 'f1', 'reference': '{{v17}}', 'label': '达标所需月数', 'unit': '个月'},
+            {'factId': 'f3', 'reference': '{{v18}}', 'label': '另一账本余额', 'unit': '元'}]
+        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'))
+        await compose_fixture(payload, fake.invoke)
+        self.assertEqual(fake.calls[-1][1]['quantityReferences'],
+                         [{'reference': '{{v17}}', 'label': '达标所需月数', 'unit': '个月'}])
+
     async def test_delivered_table_columns_are_known_without_exposing_its_amounts(self):
         payload = payload_for_composition()
         payload['artifacts'] = [{'id': 'a1', 'kind': 'table', 'title': '分类比较',

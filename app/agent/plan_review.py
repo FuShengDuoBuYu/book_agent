@@ -423,8 +423,26 @@ def _check_conditions(analyses, plan, question, mode, previous, *, strip):
     if (strip and direction and len(scope) == 1 and len(structured) == len(set(structured))
             and not plan._analysis_context.get('ambiguous')):
         plan.output.metric = direction
+    # resolve_group shares horizon fields across decision tools on one logical
+    # query. Check populated sibling horizons before they enter savings context.
+    savings_scopes = {frozenset(_scope_for(t, plan, mode)) for t in analyses if t.tool == "savings"}
     for task in analyses or [None]:
         prior = _prior_for(task, plan, mode, previous)
+        if (strip and task and task.tool in DECISION_TOOLS and (task.tool == "savings" or
+                ((task.months is not None or task.monthsDelta is not None)
+                 and frozenset(_scope_for(task, plan, mode)) in savings_scopes))):
+            durations, _ = _duration_evidence(question)
+            allowed = _supported_horizons(question, prior, durations)
+            if task.months not in allowed:
+                corrected = next(iter(allowed)) if len(allowed) == 1 else None
+                if corrected != task.months:
+                    if task.months is not None:
+                        issues.append({"type": "normalized_savings_horizon", "tool": task.tool, "field": "months",
+                                       "previousValue": task.months, "value": corrected})
+                    task.months = corrected
+            if task.monthsDelta is not None and (task.monthsDelta != explicit_month_delta(question) or not prior.get("months")):
+                issues.append({"type": "unsupported_user_condition", "tool": task.tool, "field": "monthsDelta"})
+                task.monthsDelta = None
         if task and task.tool == "aggregate":
             issues.extend(_aggregate_constraints(task, plan, question, prior, mode, strip=strip,
                 literal_categories=literal_categories, direction=direction,
@@ -469,8 +487,34 @@ def _temporal_role(clause, match):
     return "future" if future >= 0 or re.match(r"\s*(?:之)?内", clause[match.end():]) else "unspecified"
 
 
+def _duration_evidence(question):
+    durations, offsets = {"future": set(), "unspecified": set()}, set()
+    for clause in CLAUSES.split(question):
+        for match in re.finditer(rf"({NUMBER})\s*个\s*月|半年|一年", clause):
+            role = _temporal_role(clause, match)
+            before, after = clause[:match.start()], clause[match.end():].lstrip()
+            if (role == "history" or re.search(r"每(?:隔)?\s*$|(?:过往|此前|之前|前|上)\s*$", before)
+                    or re.match(r"(?:的(?:收支|收入|支出|账单))?(?:作为|作|为)?(?:参考|参照|样本)", after)):
+                continue
+            count = {"半年": 6, "一年": 12}.get(match[0]) or _number(match[1])
+            if count is not None and 1 <= count <= 600 and int(count) == count:
+                durations[role].add(int(count))
+                if after.startswith("后"):
+                    offsets.add(int(count))
+    return durations["future"] or durations["unspecified"], offsets
+
+
+def _supported_horizons(question, prior, durations):
+    delta = explicit_month_delta(question)
+    if delta:
+        revised = prior["months"] + delta if prior.get("months") else None
+        return {revised} if revised is not None and 1 <= revised <= 600 else set()
+    return durations or ({prior["months"]} if prior.get("months") else set())
+
+
 def _time_evidence(question, today):
-    targets, durations = set(), {"future": set(), "unspecified": set()}
+    durations, offsets = _duration_evidence(question)
+    targets = {shift_month(today, offset).strftime("%Y-%m") for offset in offsets}
     month_date = rf"(?:(\d{{4}}\s*[-年/.]|明年|今年|去年)\s*)?({NUMBER})\s*月"
     for clause in CLAUSES.split(question):
         for match in re.finditer(month_date, clause):
@@ -491,16 +535,7 @@ def _time_evidence(question, today):
         for match in re.finditer(r"下下?个?月|这个月|本月", clause):
             if _temporal_role(clause, match) != "history":
                 targets.add(shift_month(today, match[0].count("下")).strftime("%Y-%m"))
-        for match in re.finditer(rf"({NUMBER})\s*个\s*月|半年|一年", clause):
-            role = _temporal_role(clause, match)
-            if role == "history":
-                continue
-            count = {"半年": 6, "一年": 12}.get(match[0]) or _number(match[1])
-            if count is not None and 0 <= count <= 600 and int(count) == count:
-                durations[role].add(int(count))
-                if clause[match.end():].lstrip().startswith("后"):
-                    targets.add(shift_month(today, int(count)).strftime("%Y-%m"))
-    return targets, durations["future"] or durations["unspecified"]
+    return targets, durations
 
 
 def explicit_projection_start(question, today):
@@ -596,8 +631,7 @@ def _binding_issue(decision, plan, logical_ids, question, today, mode, previous)
         delta = explicit_month_delta(question)
         if task.monthsDelta is not None and (delta != task.monthsDelta or not prior.get("months")):
             return "unsupported_monthsDelta"
-        horizons = ({prior["months"] + delta} if delta and prior.get("months")
-                    else durations or {prior.get("months")})
+        horizons = _supported_horizons(question, prior, durations)
         if task.tool in DECISION_TOOLS and task.months is not None and task.months not in horizons:
             return "unsupported_months"
     return None

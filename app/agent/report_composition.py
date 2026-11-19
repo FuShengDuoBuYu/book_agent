@@ -20,6 +20,7 @@ answerGoal 必须逐字选用 answerGoals 中用户已经要求的目标，不�
 只写有必要且有证据的段落，一段也可以。金额、日期和表格由程序展示。'''
 COMMENT_PROMPT = """你是记账助手，正在直接回复用户。question 是用户原话，section.answerGoal 是本段的回答重点；回答重点不能增加用户没问的目标、时间范围或评分。analysis 是给用户看的最终答复，用两至三句话先回答，再说明实际意义和有依据的下一步。
 findings 是程序从已核算结果得到的分析发现，包含变化方向、目标是否可达、缺少哪些条件及来源关系。具体金额、日期、笔数、完整备注和表格已核算并由程序展示；你解释含义，不另算数值。deliveredArtifacts 列出同时交付的表格或图及其列，不能声称没有这些数据或让用户另查已交付的表格。
+需要在解释中提及具体金额、比例或月数时，使用 quantityReferences 中相应指标的 reference，程序会填回已核算的数值及单位。例如达标所需月数已有引用时，直接引用它，不按原问题的金额重新估算。
 若有 section.answerGoals，合并回应。优先回答主计算结论，历史观察、用户假设和未来估计分别说明。availableEvidence 只说明其他部分证据的种类，不是本段结论的来源。只有 findings 已确认缺少的条件才需要询问，其他段缺少明细不表示整个账本没有。
 行动建议必须与已验证的发现相连。金额排名不等于必要性或生活负担，历史记录不能证明现实原因、未来规律或当前现金余额；只说明与本题有关的限制，不给无关的购买、健康或余额建议。不介绍内部字段或生成过程。
 corrections 只说明上一版的错误，须据此修正，不要把纠错意见抄成新的财务事实或用户要求。"""
@@ -224,6 +225,9 @@ async def compose_report(payload, invoke, *, num_ctx=8192) -> ReportDraft:
         comment = {'question': common.get('question', ''), 'section': section,
                    'findings': [findings[group] for group in groups],
                    'availableEvidence': inventory, 'deliveredArtifacts': delivered}
+        comment['quantityReferences'] = [
+            _subset(row, ('reference', 'label', 'unit')) for row in payload.get('quantityReferences', [])
+            if row.get('factId') in brief.fact_ids]
         diagnostics = _section_diagnostics(corrections, previous, brief)
         if diagnostics:
             comment['corrections'] = diagnostics

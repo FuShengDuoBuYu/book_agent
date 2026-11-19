@@ -651,6 +651,45 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(t.purchaseAmount, price)
                 self.assertIsNone(t.startingBalance)
 
+    async def test_open_savings_duration_drops_invented_deadlines_and_keeps_grounded_ones(self):
+        question = '现在有10000元，保持当前收支，多久能存到20000元？'
+        draft = {'analyses': [{'tool': 'savings', 'months': 12}]}
+        for text, proposed, expected in [(question, 12, None),
+                ('以过去12个月的收支为参考。'+question, 12, None),
+                ('我每3个月领一次奖金。'+question, 3, None),
+                ('现在有10000元，希望三个月内存到20000元。', 12, 3)]:
+            with self.subTest(text=text):
+                plan = await self.plan(text, {'analyses': [{'tool': 'savings', 'months': proposed}]}, {})
+                self.assertEqual(plan.intent, 'analyze_orders')
+                task = next(t for t in plan.analyses if t.tool == 'savings')
+                self.assertEqual((task.months, plan._analysis_context.get('months')), (expected, expected))
+                self.assertTrue(any(i.get('field') == 'months' for i in plan._planning_issues))
+        sibling = await self.plan(question, {'analyses': [{'tool': 'savings'},
+            {'tool': 'optimization', 'months': 12}]}, {})
+        self.assertIsNone(sibling._analysis_context.get('months'))
+        self.assertIsNone(next(t for t in sibling.analyses if t.tool == 'savings').months)
+        first = await self.plan('现在有10000元，希望三个月内存到20000元。',
+                                {'analyses': [{'tool': 'savings', 'months': 3}]}, {})
+        previous = await self.save(first)
+        follow = await self.plan('沿用原来的目标，再算一次。', {**draft, 'followUpOfPreviousQuestion': True}, previous)
+        self.assertEqual(next(t for t in follow.analyses if t.tool == 'savings').months, 3)
+
+    async def test_deadline_change_reports_the_active_goal_and_keeps_optimization_as_evidence(self):
+        for primary, amount in [('projection', None), ('savings', 20000)]:
+            with self.subTest(primary=primary):
+                old = {'tool': primary, 'months': 3, 'targetAmount': amount}
+                tasks = [old, {'tool': 'optimization', 'protectedCategories': ['房租']}]
+                prior = {'scope': [['search_personal_orders', '不限', '']], 'months': 3,
+                         'targetAmount': amount, 'activeAnalyses': tasks, 'protectedCategories': ['房租'],
+                         'conversation': {'analyses': tasks, 'queries': [{'id': 'ledger','toolName': 'search_personal_orders'}]}}
+                raw = {'followUpOfPreviousQuestion': True, 'analyses': [{'tool': 'optimization'}, {'tool': 'projection'}]}
+                plan = await self.plan('那把目标推迟两个月，压力能小多少？', raw, prior)
+                main = [t for t in plan.analyses if not t._supplemental]
+                self.assertEqual([t.tool for t in main], [primary])
+                self.assertEqual((main[0].months, main[0].targetAmount), (5, amount))
+                self.assertEqual(plan._analysis_context['previousMonths'], 3)
+                self.assertEqual(next(t for t in plan.analyses if t.tool == 'optimization').protectedCategories, ['房租'])
+
     async def test_savings_duration_is_the_decision_even_when_the_model_chose_only_forecast(self):
         draft = {'understanding': {'evidenceNeeds': ['cashflow', 'trends', 'forecast']},
                  'analyses': [{'tool': 'cashflow'}, {'tool': 'trends'}, {'tool': 'forecast'}]}

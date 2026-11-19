@@ -309,6 +309,32 @@ class EvidenceReportTests(unittest.TestCase):
 
 
 class EvidenceReviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_computed_goal_duration_can_be_quoted_through_the_complete_report(self):
+        from datetime import date
+        from app.tools.financial_analysis import run_analysis
+        from tests.test_decision_analysis import ledger
+        from app.agent.report_composition import ReportOutline, ReportComment
+        from app.schemas.report import ReportReview
+        evidence = run_analysis('savings', ledger(), as_of=date(2026, 11, 19),
+                                starting_balance=10000, target_amount=20000)
+        async def invoke(schema, system, payload):
+            if schema is ReportOutline:
+                fact = next(f for f in payload['facts'] if '约需' in f['text'])
+                return ReportOutline(sections=[{'title': '条件与方案', 'answerGoal': payload['question'],
+                                                'factIds': [fact['id']]}])
+            if schema is ReportComment:
+                quantity = next(q for q in payload['quantityReferences'] if q['label'] == '达标所需月数')
+                self.assertEqual(quantity['unit'], '个月')
+                self.assertNotIn('value', quantity)
+                return ReportComment(analysis='若当前收支模式延续，约需' + quantity['reference'] + '达到目标；未来变动会改变进度。')
+            return ReportReview(supported=True, completed=True, issues=[])
+        reporter = EvidenceReporter()
+        reporter._invoke = invoke
+        reply, result = await reporter.answer('多久能存到目标金额？', {}, [{'tool': 'savings', 'evidence': evidence}])
+        self.assertEqual(result['status'], 'reviewed')
+        self.assertIn('约需3 个月达到目标', reply)
+        self.assertNotIn('{{v', reply)
+
     async def test_report_runs_outline_bound_comment_and_global_review(self):
         from app.agent.report_composition import ReportOutline, ReportComment
         from app.schemas.report import ReportReview

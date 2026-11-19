@@ -16,7 +16,7 @@ from app.agent.intent_resolution import IntentResolver
 from app.agent.conversation_context import compact_user_context
 from app.agent.plan_parsing import repair_descriptive_arrays
 from app.agent.report_context import build_report_context
-from app.agent.plan_review import NUMBER, PlanReviewer, calendar_context, explicit_month_delta, explicit_projection_start, named_percent_changes, sanitize_user_conditions
+from app.agent.plan_review import NUMBER, PlanReviewer, _duration_evidence, calendar_context, explicit_month_delta, explicit_projection_start, named_percent_changes, sanitize_user_conditions
 from app.agent.prompts import PLANNER_HUMAN_PROMPT, PLANNER_SYSTEM_PROMPT
 from app.schemas.plan import (
     AgentPlan,
@@ -461,6 +461,27 @@ class QueryPlanner:
                 projection.targetMonth = prior.get('targetMonth') or projection.targetMonth
             if delta is not None and prior.get('months'):
                 projection.monthsDelta = delta
+        if delta and prior.get('months') and not conditions:
+            explicit, _ = self._decision_goals(message, plan, prior, book_mode)
+            if not explicit - {'savings', 'projection'}:
+                active_goals = {row.get('tool') for row in prior.get('activeAnalyses', [])}
+                primary = None
+                if 'savings' in active_goals and prior.get('targetAmount') is not None:
+                    primary = 'savings'
+                    savings = [t for t in plan.analyses if t.tool == 'savings']
+                    if not savings:
+                        savings = [AnalysisRequest(tool='savings')]
+                        plan.analyses.extend(savings)
+                    if len(savings) == 1:
+                        savings[0].monthsDelta = delta
+                elif len(active) == 1 and len(projections) == 1 and prior.get('targetAmount') is None:
+                    primary = 'projection'
+                if primary:
+                    # The amended goal owns the comparison. Supporting calculations
+                    # still execute with the same horizon and protected categories.
+                    for task in plan.analyses:
+                        if task.tool in {'projection', 'optimization'} and task.tool != primary and task.tool not in explicit:
+                            task._supplemental = True
         adjustable = [t for t in plan.analyses if t.tool in {'projection', 'scenario', 'runway', 'savings', 'optimization'}]
         if not adjustable or not conditions:
             return
@@ -574,10 +595,10 @@ class QueryPlanner:
                 if task.tool == "budget" and task.budgetAmount is None and re.search(r"预算\D{0,6}\d", message):
                     raise ValueError("budget.budgetAmount 未提取用户明确给出的预算")
                 if task.tool == "savings":
+                    if task.months is None and _duration_evidence(message)[0] and not explicit_month_delta(message):
+                        raise ValueError("savings.months 未提取用户明确给出的期限")
                     if task.targetAmount is None and re.search(r"(?:存到|达到|目标)\D{0,6}\d", message):
                         raise ValueError("savings.targetAmount 未提取用户明确给出的目标金额")
-                    if task.months is None and re.search(r"\d+\s*个月", message):
-                        raise ValueError("savings.months 未提取用户明确给出的期限")
             relative = set(re.findall(r"下下(?:个)?月|下(?:个)?月|本月|这个月|上(?:个)?月", message))
             explicit_month = re.search(r"\d{1,4}[-年/]\d{1,2}|\d{1,2}\s*月", message)
             if len(relative) == 1 and not explicit_month:
