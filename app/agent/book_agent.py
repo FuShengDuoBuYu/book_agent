@@ -13,7 +13,8 @@ from langsmith import traceable
 
 from app.agent.planner import HISTORY_BASED_TOOLS, QueryPlanner
 from app.agent.analysis_context import latest_context, logical_queries
-from app.agent.evidence_report import EvidenceReporter
+from app.agent.evidence_report import EvidenceReporter, money
+from app.agent.report_values import literal
 from app.agent.artifacts import build_artifacts
 from app.agent.investigation import EvidenceInvestigator, merged_source_groups
 from app.agent.source_grouping import grounded_source_groups
@@ -184,6 +185,8 @@ class BookAgent:
                 plan=plan,
                 orders_json=orders_json,
             )
+            if not deterministic_reply and not plan.analyses and (plan.needsTools or plan.intent != 'chat'):
+                deterministic_reply = self._computed_query_reply(self._safe_json_loads(orders_json))
             if deterministic_reply:
                 assistant_chunks.append(deterministic_reply)
                 yield {"type": "delta", "content": deterministic_reply}
@@ -194,6 +197,8 @@ class BookAgent:
                     plan=plan,
                     evidence=self._safe_json_loads(orders_json),
                     duration_ms=round((perf_counter() - started_at) * 1000),
+                    validation={'status': 'grounded', 'mechanism': 'computed_query_summary',
+                                'compositionStatus': 'fallback'},
                 )
                 yield {"type": "done", "content": ""}
                 return
@@ -234,7 +239,7 @@ class BookAgent:
                 yield {'type': 'done', 'content': ''}
                 return
 
-            # ThinkTagStreamParser 把模型流式输出拆成“思考”和“最终回答”两类事件。
+            # Only an explicit non-ledger chat may use a free-form response.
             think_parser = ThinkTagStreamParser()
             async for chunk in self.chain.astream(
                 {
@@ -287,6 +292,34 @@ class BookAgent:
             # Present one coherent analysis, without duplicate per-query amounts.
             data = {"analysisResults": data["analysisResults"]}
         return json.dumps(data, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def _computed_query_reply(data):
+        """Keep legacy query plans useful without sending finance to a free writer."""
+        rows = data.get('toolResults') or []
+        if not data.get('ok') or not rows:
+            return '本轮未得到可核算的账本证据，请明确查询范围后重试。'
+        paragraphs = []
+        for result in rows:
+            calculated = result.get('calculationToolResults') or {}
+            totals = calculated.get('summary') or {}
+            heading = literal(result.get('mode') or '当前账本') + ' ' + literal(result.get('summary') or '所选查询')
+            if not result.get('ok') or not totals:
+                paragraphs.append(heading + '：未取得完整统计，金额未知。')
+                continue
+            paragraphs.append(heading + f"：已记 {totals['orderCount']} 笔，收入 {money(totals['incomeTotal'])} 元，"
+                + f"支出 {money(totals['expenseTotal'])} 元，净额 {money(totals['netIncomeMinusExpense'])} 元。")
+            for key, label in [('expenseCategories', '支出类别'), ('incomeCategories', '收入类别')]:
+                for item in calculated.get('categoryBreakdown', {}).get(key, []):
+                    paragraphs.append(label + literal(item['name']) + f"：{money(item['amount'])} 元，{item['orderCount']} 笔。")
+            for key, label in [('topExpenses', '支出记录'), ('topIncomes', '收入记录')]:
+                for item in calculated.get(key, {}).get('orders', []):
+                    paragraphs.append(label + literal(item['date']) + ' ' + literal(item.get('costType') or '未分类')
+                        + f"：{money(item['amount'])} 元；备注：" + literal(item.get('orderRemark') or '无备注'))
+        if len(rows) > 1:
+            paragraphs.append('各查询分别统计，范围重叠时不能直接相加。')
+        paragraphs.append('以上为所选范围的已记收支，净额不能代替当前可动用余额，也不能证明未来安排。')
+        return '\n\n'.join(paragraphs)
 
     async def _save_assistant_reply(
         self,

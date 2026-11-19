@@ -765,6 +765,34 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
         actual = next(t for t in narrowed.analyses if t.tool == 'aggregate')
         self.assertEqual([p.model_dump(mode='json') for p in actual.aggregate.periods], september_week)
 
+    async def test_reusing_the_range_does_not_authorize_one_model_selected_period(self):
+        old = [{'label': '上上个月', 'startDate': '2026-09-01', 'endDate': '2026-09-30'},
+               {'label': '上个月', 'startDate': '2026-10-01', 'endDate': '2026-10-31'}]
+        window = {'startDate': old[0]['startDate'], 'endDate': old[1]['endDate']}
+        ledger = {'id': 'ledger', 'toolName': 'search_personal_orders'}
+        task = {'tool': 'aggregate', 'queryIds': ['ledger'], 'metric': 'expense',
+                'aggregate': {'groupBy': ['weekday'], 'periods': old[1:],
+                              'filters': {'includeCategories': ['展览'], 'excludeCategories': ['房租', '交通']}}}
+        prior = {'scope': [['search_personal_orders', '不限', '']], 'conversation': {'queries': [ledger],
+                 'analysisWindow': window, 'analyses': [{**task, 'aggregate': {'groupBy': ['category'], 'periods': old}}]}}
+        draft = {'followUpOfPreviousQuestion': True, 'toolCalls': [ledger], 'analyses': [task],
+                 'analysisWindow': {k: old[1][k] for k in ('startDate', 'endDate')}}
+        rows = [{'year': 2026, 'month': month, 'day': day, 'money': -amount, 'costType': category}
+                for month, day, amount, category in [(9, 5, 180, '展览'), (10, 5, 180, '展览'),
+                                                     (10, 12, 260, '展览'), (10, 14, 800, '交通')]]
+        for text, total, count in [
+            ('沿用这两个月的范围，只看展览，按星期几分组，哪天的已记支出最多？给金额和笔数。', 620, 3),
+            ('沿用9月和10月的范围，只看展览，按星期几分组。', 620, 3),
+            ('沿用这两个月的范围，但只看10月的展览，按星期几分组。', 440, 2)]:
+            with self.subTest(text=text):
+                plan = await self.plan(text, draft, prior)
+                result = collect_analysis_results(plan, {'个人版': [(q, rows) for q in plan.toolCalls]}, date(2026, 11, 19))
+                evidence = next(r['evidence'] for r in result if r['tool'] == 'aggregate')
+                self.assertEqual((evidence['totals']['expense'], evidence['totals']['count']), (total, count))
+                leader = max(evidence['rows'], key=lambda row: row['expense'])
+                self.assertEqual((leader['weekday'], leader['expense'], leader['count']), ('星期一', 440, 2))
+                self.assertEqual(evidence['appliedFilters'], task['aggregate']['filters'])
+
     async def test_open_savings_duration_drops_invented_deadlines_and_keeps_grounded_ones(self):
         question = '现在有10000元，保持当前收支，多久能存到20000元？'
         draft = {'analyses': [{'tool': 'savings', 'months': 12}]}

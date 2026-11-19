@@ -331,7 +331,7 @@ class QueryPlanner:
                 self._restore_forecast_explanation(plan, previous_context, message, now.date())
                 self._preserve_referent_window(plan, previous_context or {}, message, now)
                 context = self._inherit_conversation(plan, previous_context or {})
-                self._normalize_referenced_periods(plan, context, message)
+                self._normalize_referenced_periods(plan, context, message, now.date())
                 if len(modes) == 2 and plan.intent == 'analyze_orders':
                     queried = {PLANNER_TOOL_BY_NAME[call.toolName][0] for call in plan.toolCalls
                                if call.toolName in PLANNER_TOOL_BY_NAME}
@@ -1027,11 +1027,16 @@ class QueryPlanner:
         return previous
 
     @staticmethod
-    def _normalize_referenced_periods(plan, previous, message):
+    def _normalize_referenced_periods(plan, previous, message, today):
         """A referenced date range and a requested period comparison are separate choices."""
-        if (not plan.followUpOfPreviousQuestion or plan.resetAnalysisContext or not previous.get('conversation')
-                or not re.search(r"(?:沿用|仍用|仍按|继续用|还是按|相同|同一)[^，。；,;]{0,20}(?:范围|时间段|区间)", message)):
+        if not plan.followUpOfPreviousQuestion or plan.resetAnalysisContext or not previous.get('conversation'):
             return
+        reference = re.search(r"(?:沿用|仍用|仍按|继续用|还是按|相同|同一)[^，。；,;]{0,20}(?:范围|时间段|区间)", message)
+        if not reference:
+            return
+        # Dates in “沿用9月和10月的范围” identify the parent. Only an additional
+        # time selection can narrow it; category/member/source filters are independent.
+        new_time = _explicit_history_sample(message[:reference.start()] + message[reference.end():], today)
         prior = previous['conversation']
         for task in plan.analyses:
             if task.tool != 'aggregate' or not task.aggregate:
@@ -1044,17 +1049,19 @@ class QueryPlanner:
             ranges = sorted((p.startDate, p.endDate) for p in old)
             window = AnalysisWindow(startDate=ranges[0][0], endDate=max(end for _, end in ranges))
             same_window = plan.analysisWindow == window or (plan.analysisWindow is None and len(plan.analyses) == 1)
-            if not same_window:
+            if not same_window and (new_time or prior.get('analysisWindow') != window.model_dump(mode='json')):
                 continue
             plan.analysisWindow = window
             continuous = all(start - end == timedelta(days=1) for (_, end), (start, _) in zip(ranges, ranges[1:]))
             proposed = sorted((p.startDate, p.endDate) for p in task.aggregate.periods)
             if proposed and proposed not in (ranges, [(window.startDate, window.endDate)]):
-                # A newly narrowed subperiod is not the old comparison's grouping.
-                covered = [(window.startDate, window.endDate)] if continuous else ranges
-                if all(any(a <= start <= end <= b for a, b in covered) for start, end in proposed):
-                    continue
-                raise ValueError("沿用原时间范围时，新分段须落在原区间内，请保留不连续日期之间的空档。")
+                if new_time:
+                    covered = [(window.startDate, window.endDate)] if continuous else ranges
+                    if all(any(a <= start <= end <= b for a, b in covered) for start, end in proposed):
+                        continue
+                    raise ValueError("沿用原时间范围时，新分段须落在原区间内，请保留不连续日期之间的空档。")
+                task.aggregate.periods = old
+                plan._planning_issues.append({'type': 'preserved_referenced_periods', 'queryIds': task.queryIds})
             compare = re.search(r"各月|每个?月|逐月|分月|按月|月份|每期|各期|逐期|分期|分别|对照|对比|比较.{0,8}(?:月|期)|环比|同比", message)
             regroup = bool(task.aggregate.groupBy) and re.search(r"分组|按.{1,10}(?:汇总|统计|列出)|合计|总体", message)
             if not continuous or compare:
