@@ -10,7 +10,7 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError
 from pydantic_core import to_jsonable_python
 
-from app.agent.analysis_context import DECISION_TOOLS
+from app.agent.analysis_context import DECISION_TOOLS, source_direction_of
 from app.agent.conversation_context import compact_user_context
 from app.agent.report_context import build_report_context
 from app.core.config import get_settings
@@ -79,7 +79,10 @@ def _amount_matches(clause, field):
             clause = clause[past[-1].end()+current.start():]
         # A savings target uses a future balance, not available cash.
         clause = re.sub(r"(?:目标(?:余额|存款)|存款目标|希望余额|想要余额)", "目标款项", clause)
-    return {_number(raw) for pattern in patterns for raw in re.findall(pattern, clause)} - {None}
+    matches = (match for pattern in patterns for match in re.finditer(pattern, clause))
+    # In 买一台电脑 the number counts objects. Only a price can supply a purchase amount.
+    return {_number(m[1]) for m in matches if field != "purchaseAmount"
+            or not re.match(r"\s*[台个辆部件套只张本份]", clause[m.end(1):])} - {None}
 
 
 def _retracts(question, field, previous_value):
@@ -239,11 +242,14 @@ def _change_supported(change, question, prior, withdrawn):
         named = named_percent_changes(clause)
         if named and change.amount is not None and not re.search(r"元|块|￥|¥", context):
             continue
-        if named and change.percent is not None and not any(
+        observed = {source_direction_of(name, prior) for name, role, rate in named
+                    if role in (None, change.metric) and rate == change.percent}
+        matched_observation = (change.source, change.metric) in observed
+        if named and change.percent is not None and not matched_observation and not any(
                 (change.source == name or change.source == name + {"income": "收入", "expense": "支出"}[change.metric])
                 and metric in (None, change.metric) and change.percent == percent for name, metric, percent in named):
             continue
-        if change.source and change.source not in context:
+        if change.source and change.source not in context and not matched_observation:
             previous_sources = {c.get("source") for c in prior.get("changes", []) if c.get("metric") == change.metric}
             if previous_sources != {change.source} or not re.search(r"这项|该项|这个来源|它", context):
                 continue
@@ -296,11 +302,74 @@ def _direction_request(question):
     return literal, next(iter(choices)) if len(choices) == 1 else None
 
 
+_FILTER_DIMENSIONS = {
+    "includeCategories": "分类|类别", "excludeCategories": "分类|类别",
+    "includeMembers": "成员|用户", "excludeMembers": "成员|用户",
+    "includeSources": "来源", "excludeSources": "来源",
+    "remarkContains": "备注", "excludeRemarks": "备注",
+}
+_UNRESTRICTED = {"all", "any", "none", "null", "n/a", "*", "全部", "所有", "不限", "无限制", "无筛选", "不限制"}
+
+
+def _placeholder_is_literal(value, dimension, question):
+    """Require a naming/text predicate, so '全部成员' does not name a member."""
+    name = re.escape(value)
+    kind = rf"(?:{dimension})"
+    quoted = rf"""[“「『"']{name}[”」』"']"""
+    end = r"(?=$|[的、，,。；;？！?\s])"
+    named = rf"(?:名称|名字|名)?\s*(?:叫作?|叫做|命名为|等于|为|是|包含|含有|含|写着|[:：=])\s*"
+    return bool(re.search(rf"{kind}\s*(?:{named}(?:{quoted}|{name}{end})|{quoted})|{quoted}\s*(?:这个|这一)?{kind}", question))
+
+
+def canonicalize_aggregate_defaults(filters, question, prior_filters=None):
+    """Normalize empty native-schema fillers before planning or examining a review diff."""
+    changed = []
+    prior_filters = prior_filters or {}
+    for field, dimension in _FILTER_DIMENSIONS.items():
+        current = getattr(filters, field)
+        values = [current] if isinstance(current, str) else current
+        prior = prior_filters.get(field, ())
+        inherited = [prior] if isinstance(prior, str) else prior
+        allowed = [name for name in values if name.casefold() not in _UNRESTRICTED
+                   or _placeholder_is_literal(name, dimension, question)
+                   or name in inherited]
+        canonical = (allowed[0] if allowed else "") if isinstance(current, str) else allowed
+        if canonical != current:
+            setattr(filters, field, canonical)
+            changed.append(field)
+    # Bounds apply to absolute transaction amounts. A zero floor never removes
+    # a row, whereas a zero ceiling genuinely selects zero-amount transactions.
+    if filters.minAmount == 0:
+        filters.minAmount = None
+        changed.append("minAmount")
+    zero = r"(?:0+(?:\.0+)?|零)\s*(?:元|块)?"
+    if filters.maxAmount == 0 and not (prior_filters.get("maxAmount") == 0 or
+            re.search(rf"(?:零金额|(?:金额|上限)(?:为|是|等于|不超过|至多|最多|小于等于|[≤=])\s*{zero}(?![\d.])"
+                      rf"|(?:不超过|至多|最多|小于等于|≤)\s*{zero}(?![\d.])|{zero}(?:及以下|以下))", question)):
+        filters.maxAmount = None
+        changed.append("maxAmount")
+    return changed
+
+
+def _referenced_aggregate_filters(question, prior, task):
+    if not re.search(r"(?:沿用|保留|继续|仍按|还是按)[^，。；,;]{0,12}(?:筛选|过滤)", question):
+        return {}
+    rows = [row for row in prior.get("conversation", {}).get("analyses", []) if row.get("tool") == "aggregate"
+            and (not row.get("queryIds") or not task.queryIds or set(row["queryIds"]) == set(task.queryIds))]
+    if len(rows) != 1:
+        return {}
+    return (rows[0].get("aggregate") or {}).get("filters", {})
+
+
 def _aggregate_constraints(task, plan, question, prior, mode, *, strip, single_aggregate, literal_categories, direction):
     if not task.aggregate:
         return []
     issues = []
     filters = task.aggregate.filters
+    inherited_filters = _referenced_aggregate_filters(question, prior, task)
+    normalized = canonicalize_aggregate_defaults(filters, question, inherited_filters)
+    if strip:
+        issues.extend({"type": "normalized_aggregate_default", "tool": "aggregate", "field": field} for field in normalized)
     for field in ("includeCategories", "excludeCategories"):
         values = getattr(filters, field)
         allowed = [v for v in values if v not in DIRECTION_LABELS or v in literal_categories]
@@ -446,6 +515,30 @@ def explicit_projection_start(question, today):
     return next(iter(starts)) if len(starts) == 1 else None
 
 
+def _confirmed_amount_bounds(question, inherited):
+    bounds = {field: inherited[field] for field in ("minAmount", "maxAmount") if inherited.get(field) is not None}
+    operators = {
+        "minAmount": ("下限|最低金额", "不少于|不低于|至少|大于等于|>=|≥", "以上|及以上|起"),
+        "maxAmount": ("上限|最高金额", "不超过|不高于|至多|最多|小于等于|<=|≤", "以下|及以下|以内"),
+    }
+    cancel = r"(?:取消|撤销|去掉|删除|移除|放开|不再设|不设)(?:原有的?|原来的?)?"
+    for clause in CLAUSES.split(question):
+        if re.search(cancel + r"(?:全部)?金额(?:限制|筛选|过滤)|金额(?:不限|不设限)|不再按金额(?:筛选|过滤)", clause):
+            bounds.clear()
+        for field, (label, comparison, suffix) in operators.items():
+            if re.search(cancel + rf"(?:金额)?(?:{label})|(?:{label})(?:取消|不限)", clause):
+                bounds.pop(field, None)
+                continue
+            previous = rf"(?:从|由)\s*{NUMBER}\s*(?:元|块)?\s*"
+            update = r"(?:(?:调整|改|调|提高|降低|上调|下调|设)(?:为|到|至|成)|为|是)"
+            after = rf"(?:{comparison}|(?:{label})(?:{previous})?{update}?)\s*[￥¥]?\s*({NUMBER})"
+            before = rf"({NUMBER})\s*(?:元|块)?\s*(?:{suffix})"
+            values = {_number(raw) for raw in re.findall(after, clause) + re.findall(before, clause)}
+            if len(values) == 1:
+                bounds[field] = values.pop()
+    return bounds
+
+
 def _binding_issue(decision, plan, logical_ids, question, today, mode, previous):
     all_scopes = _scope_for(None, plan, mode)
     targets, durations = _time_evidence(question, today)
@@ -461,7 +554,36 @@ def _binding_issue(decision, plan, logical_ids, question, today, mode, previous)
         issues = _check_conditions([task], plan, question, mode, previous, strip=False)
         if issues:
             return "unsupported_" + issues[0]["field"]
+        # A replacement must retain a user's explicit selection on the same
+        # logical query even when the review simply omits the filter.
         prior = _prior_for(task, plan, mode, previous)
+        if task.tool == "aggregate":
+            matching = [old for old in original if old.aggregate and _scope_for(old, plan, mode) == scope]
+            if len(matching) == 1:
+                required = matching[0].aggregate.filters
+                inherited = _referenced_aggregate_filters(question, prior, task)
+                bounds = _confirmed_amount_bounds(question, inherited)
+                for field, limit in bounds.items():
+                    # Only protect a bound verified for this logical query. Another
+                    # query in the same comparison may have a different threshold.
+                    old = getattr(required, field)
+                    if limit == 0 and field == "minAmount":
+                        continue
+                    belongs_to_query = limit in (old, inherited.get(field)) or (
+                        len(all_scopes) == 1 and (old is not None or field in inherited))
+                    if belongs_to_query and (not task.aggregate or getattr(task.aggregate.filters, field) != limit):
+                        return "unsupported_" + field
+                constrained = re.search(r"只看|只统计|仅(?:看|限|统计)|排除|剔除|不含|不包括", question)
+                for field in _FILTER_DIMENSIONS if constrained else ():
+                    old = getattr(required, field)
+                    if not old:
+                        continue
+                    values = [old] if isinstance(old, str) else old
+                    named = {value for value in values if value in question and (
+                        value.casefold() not in _UNRESTRICTED or _placeholder_is_literal(value, _FILTER_DIMENSIONS[field], question))}
+                    new = getattr(task.aggregate.filters, field) if task.aggregate else []
+                    if named - ({new} if isinstance(new, str) else set(new)):
+                        return "unsupported_" + field
         prior_target = prior.get("budgetTargetMonth" if task.tool == "budget" else "targetMonth")
         target = task.targetMonth
         if target:

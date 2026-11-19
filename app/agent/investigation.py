@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.agent.source_grouping import grounded_source_groups
+from app.agent.plan_review import canonicalize_aggregate_defaults
 from app.core.config import get_settings
 from app.core.llm import get_structured_model
 from app.schemas.plan import SourceGroup
@@ -175,6 +176,9 @@ class EvidenceInvestigator:
                     continue
                 if task.tool == 'aggregate' and task.aggregate:
                     try:
+                        normalized = canonicalize_aggregate_defaults(task.aggregate.filters, question)
+                        if set(normalized) - {'minAmount'}:
+                            raise ValueError('补查筛选使用了未明确指名的占位值，已忽略此项补查')
                         _resolve_source_filters(task, mapping, catalogs, plan.toolCalls, applied_groups)
                     except ValueError as exc:
                         issues.append(str(exc))

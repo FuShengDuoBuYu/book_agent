@@ -108,20 +108,22 @@ async def run_case(agent, name, question, timeout):
 
 
 async def main(args):
+    records = []
     for name, question in QUESTIONS:
         if not args.case or name in args.case:
-            await run_case(make_agent(), name, question, args.timeout)
+            records.append(await run_case(make_agent(), name, question, args.timeout))
     if not args.case or "chain" in args.case:
         agent = make_agent()
         for name, question in FOLLOWUPS:
-            await run_case(agent, name, question, args.timeout)
+            records.append(await run_case(agent, name, question, args.timeout))
     for name, question in VARIANTS:
         if not args.case or 'variants' in args.case or name in args.case:
-            await run_case(make_agent(), name, question, args.timeout)
+            records.append(await run_case(make_agent(), name, question, args.timeout))
+    return 0 if records and all(record['automatedPass'] for record in records) else 1
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", action="append")
     parser.add_argument("--timeout", type=int, default=240)
-    asyncio.run(main(parser.parse_args()))
+    raise SystemExit(asyncio.run(main(parser.parse_args())))

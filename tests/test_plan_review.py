@@ -65,6 +65,41 @@ class PlanReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["previousContext"]["scope"], prior["scope"])
         self.assertIn("2026-09-30", json.dumps(audit))
 
+    async def test_placeholder_cleanup_cannot_turn_a_requested_selection_into_all_records(self):
+        task = {'tool': 'aggregate', 'metric': 'expense', 'aggregate': {'filters': {'includeCategories': ['展览']}}}
+        plan = AgentPlan(analyses=[task])
+        for values in [[], ['all']]:
+            changed = {**task, 'aggregate': {'filters': {'includeCategories': values, 'includeMembers': ['不限']}}}
+            result, audit, _ = await self.review(plan, '沿用这两个月，只看展览，按星期几比较支出。', [decision([changed])])
+            self.assertIsNone(result)
+            self.assertEqual(audit['error'], 'unsupported_includeCategories')
+
+    async def test_aggregate_review_preserves_confirmed_amount_bounds_and_allows_user_revisions(self):
+        def task(filters):
+            return {'tool': 'aggregate', 'metric': 'expense', 'queryIds': ['mine'],
+                    'aggregate': {'groupBy': ['category'], 'filters': filters}}
+        query = {'id': 'mine', 'toolName': 'search_personal_orders'}
+        old = {'minAmount': 20, 'maxAmount': 100}
+        previous = {'scope': [['search_personal_orders', '不限', '']],
+                    'conversation': {'analyses': [task(old)], 'queries': [query]}}
+        for text, new, error in [
+            ('只看金额不超过100元的支出，按类别汇总。', {}, 'maxAmount'),
+            ('按类别统计金额二十元以上的支出。', {'minAmount': 10}, 'minAmount'),
+            ('沿用刚才的金额筛选，按类别汇总支出。', {'minAmount': 20}, 'maxAmount'),
+            ('沿用刚才的金额筛选，金额上限改为200元。', {'minAmount': 20, 'maxAmount': 200}, None),
+            ('沿用刚才的金额筛选，把金额上限从100元调到200元。', {'minAmount': 20, 'maxAmount': 200}, None),
+            ('沿用刚才的金额筛选，金额上限改为200元。', {'minAmount': 20}, 'maxAmount'),
+            ('保留原来的金额筛选，取消金额上限。', {'minAmount': 20}, None),
+            ('取消金额筛选，按类别列出支出。', {}, None)]:
+            with self.subTest(text=text):
+                plan = AgentPlan(followUpOfPreviousQuestion=True, toolCalls=[query], analyses=[task(old)])
+                result, audit, _ = await self.review(plan, text, [decision([task(new)])], previous)
+                if error:
+                    self.assertIsNone(result)
+                    self.assertEqual(audit['error'], 'unsupported_' + error)
+                else:
+                    self.assertIsNotNone(result, audit)
+
     async def test_unknown_query_binding_never_reaches_executor(self):
         plan = AgentPlan.model_validate({"toolCalls": [{"id": "mine", "toolName": "search_personal_orders"}]})
         bad = decision([{"tool": "aggregate", "queryIds": ["foreign"]}])

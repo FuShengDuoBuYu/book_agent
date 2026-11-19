@@ -11,6 +11,68 @@ def group(tool, **evidence):
 
 
 class FindingTests(unittest.TestCase):
+    def test_quality_names_only_fields_measured_and_found_missing(self):
+        records = [{'year': 2026, 'month': 10, 'day': 5, 'money': -100, 'costType': '医疗',
+                    'orderRemark': '门诊'}]
+        quality = group('data_quality', **run_analysis('data_quality', records, as_of=date(2026, 11, 19)))
+        self.assertEqual(quality['labels']['missingFields'], ['支付方式'])
+        self.assertEqual(quality['labels']['checkedFields'], ['支付方式', '分类'])
+        self.assertNotIn('备注缺失', ' '.join(quality['observations']))
+        records[0]['bankName'] = '现金'
+        complete = group('data_quality', **run_analysis('data_quality', records, as_of=date(2026, 11, 19)))
+        self.assertEqual(complete['labels']['missingFields'], [])
+
+    def test_projection_retains_historical_drivers_and_binds_exact_decision_method(self):
+        records = [{'year': 2026, 'month': m, 'day': day, 'money': amount, 'costType': cat,
+                    'orderRemark': note} for m, cost in [(8, 100), (9, 100), (10, 1000)]
+                   for day, amount, cat, note in [(2, 5000, '收入', '校稿'), (3, -cost, '医疗', '门诊')]]
+        kwargs = {'as_of': date(2026, 11, 19), 'months': 3, 'starting_balance': 0, 'target_amount': 8000}
+        for tool in ('projection', 'scenario', 'savings'):
+            change = [{'metric': 'income', 'source': '校稿', 'percent': -10}] if tool == 'scenario' else []
+            found = group(tool, **run_analysis(tool, records, changes=change, **kwargs))
+            self.assertIn('中位数', found['labels']['baselineMethod'])
+            if tool == 'projection':
+                self.assertEqual(found['labels']['incomeSources'], ['校稿'])
+                self.assertEqual(found['labels']['observedExpenseChanges'], [{'category': '医疗', 'direction': '上升'}])
+                self.assertIn('医疗', ''.join(found['observations']))
+        budget = group('budget', **run_analysis('budget', records, budget_amount=900, **kwargs))
+        self.assertNotIn('baselineMethod', budget['labels'])
+
+    def test_recorded_peak_weekdays_and_payment_methods_remain_tied_within_their_period(self):
+        records = [{'year': 2026, 'month': 10, 'day': day, 'money': -amount, 'bankName': bank,
+                    'costType': '票券'} for day, amount, bank in [(5, 120, '现金'), (6, 120, '借记卡'),
+                                                            (7, 20, '现金'), (13, 400, '借记卡')]]
+        spec = {'groupBy': ['weekday', 'bank'], 'periods': [
+            {'label': '前段', 'startDate': '2026-10-05', 'endDate': '2026-10-11'},
+            {'label': '后段', 'startDate': '2026-10-12', 'endDate': '2026-10-18'}]}
+        result = run_analysis('aggregate', records, as_of=date(2026, 11, 19), metric='expense', aggregate=spec)
+        found = group('aggregate', **result)
+        first, last = found['labels']['leadingGroups']
+        self.assertEqual(first['period'], '前段')
+        self.assertEqual(first['groups'], [{'weekday': '星期一', 'bank': '现金'}, {'weekday': '星期二', 'bank': '借记卡'}])
+        self.assertTrue(first['tied'])
+        self.assertFalse(first['visibleOnly'])
+        self.assertEqual((last['period'], last['groups'], last['tied']), ('后段', [{'weekday': '星期二', 'bank': '借记卡'}], False))
+        self.assertIn('并列', ''.join(found['observations']))
+        self.assertNotIn('120', str(found))
+
+    def test_aggregate_rank_restricts_partial_or_truncated_evidence_and_handles_no_matches(self):
+        records = [{'year': 2026, 'month': 10, 'day': day, 'money': value, 'bankName': bank, 'costType': '服务'}
+                   for day, value, bank in [(1, -100, '现金'), (3, 40, '借记卡'), (7, 20, '钱包')]]
+        spec = {'groupBy': ['bank'], 'periods': [{'label': '查询期', 'startDate': '2026-10-01', 'endDate': '2026-10-31'}]}
+        def find(spec, metric='net', ranges=None):
+            return group('aggregate', **run_analysis('aggregate', records, as_of=date(2026, 11, 19), metric=metric,
+                                                     aggregate=spec, queried_intervals=ranges))
+        self.assertEqual(find(spec)['labels']['leadingGroups'][0]['groups'], [{'bank': '借记卡'}])
+        for found in (find({**spec, 'limit': 2}), find(spec, ranges=[{'startDate': '2026-10-01', 'endDate': '2026-10-05'}])):
+            self.assertTrue(found['labels']['leadingGroups'][0]['visibleOnly'])
+            self.assertIn('已展示', ''.join(found['observations']))
+        empty = find({**spec, 'filters': {'includeCategories': ['展览']}})
+        self.assertFalse(empty['labels'].get('leadingGroups'))
+        self.assertIn('没有可排名', ''.join(empty['observations']))
+        all_metrics = {r['metric']: r['groups'] for r in find(spec, metric='all')['labels']['leadingGroups']}
+        self.assertEqual(all_metrics, {'income': [{'bank': '借记卡'}], 'expense': [{'bank': '现金'}], 'net': [{'bank': '借记卡'}]})
+
     def test_real_projection_horizon_and_assumptions_and_goal_tools(self):
         today = date(2026, 11, 19)
         for expense, effect in [(50, '累计结余增加'), (100, '累计结余不变'), (150, '累计缺口扩大')]:

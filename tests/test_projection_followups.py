@@ -34,10 +34,10 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
             clock.now.return_value = datetime(2026, 11, 19)
             return await planner.create_plan(text, '', '个人版', previous)
 
-    async def save(self, plan):
+    async def save(self, plan, evidence=None):
         agent = BookAgent.__new__(BookAgent)
         agent.memory = AsyncMock()
-        await agent._save_assistant_reply('synthetic', 'synthetic', '核算结果', plan)
+        await agent._save_assistant_reply('synthetic', 'synthetic', '核算结果', plan, evidence=evidence)
         return latest_context(json.loads(json.dumps([agent.memory.add_message.await_args.kwargs])))
 
     async def test_named_shock_protected_expenses_and_extension_use_one_actual_projection(self):
@@ -45,7 +45,9 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
                 for m in (8, 9, 10) for value, category, remark in
                 [(5000, '工资', '工资'), (1600, '收入', '翻译稿费'), (-2600, '房租', '房租')]]
         first = await self.plan('未来三个月能存多少？', {'analyses': [{'tool': 'projection', 'months': 3}]}, {})
-        previous = await self.save(first)
+        previous = await self.save(first, {'ok': True, 'analysisResults': [{'mode': '个人版', 'tool': 'sources',
+            'queryIds': [], 'evidence': {'sources': [{'source': '翻译稿费', 'metric': 'income'}],
+                                         'catalogMetric': 'all', 'omittedSourceCount': 0}}]})
         turns = [
             ('翻译稿费可能会少一半，重新算一下。', {'analyses': [{'tool': 'scenario', 'metric': 'net'}],
                 'understanding': {'objective': '将翻译稿费收入减少一半，重算累计结余'}}, 3),
@@ -65,6 +67,40 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
             previous = await self.save(plan)
         self.assertEqual(previous['previousMonths'], 3)
         self.assertEqual(previous['protectedCategories'], ['房租'])
+
+    async def test_source_shorthand_on_a_projection_uses_scoped_computed_catalog_evidence(self):
+        question = '家教可能会少一半，重新算一下。'
+        home = 'search_family_orders'
+        personal = 'search_personal_orders'
+        for scope, ids, rows, expected in [
+            (personal, ['ledger'], [('家教课时费', 'income')], 'income'),
+            (personal, ['ledger'], [('家教课时费', 'expense')], 'expense'),
+            (home, ['other'], [('家教课时费', 'income')], None),
+            (personal, ['other'], [('家教课时费', 'income')], None),
+            (personal, ['ledger'], [('家教课时费', 'income'), ('家教课时费', 'expense')], None)]:
+            with self.subTest(scope=scope, ids=ids, rows=rows):
+                query = {'id': 'ledger', 'toolName': personal, 'args': {'cost_type': '不限'}}
+                other = {'id': 'other', 'toolName': scope, 'args': {'cost_type': '餐饮'}}
+                projection = {'tool': 'projection', 'months': 3, 'metric': 'net', 'queryIds': ['ledger']}
+                ctx = {'scope': [[personal, '不限', '']], 'months': 3, 'activeAnalyses': [projection],
+                       'targetMonth': '2026-12', 'conversation': {'queries': [query], 'analyses': [projection]}}
+                source_rows = [{'source': name, 'metric': metric, 'amount': 2500, 'memberKey': 'private'}
+                               for name, metric in rows]
+                meta = {'analysisContext': ctx, 'evidence': {'ok': True, 'analysisResults': [{
+                    'tool': 'sources', 'mode': '家庭版' if scope == home else '个人版', 'queryIds': ids,
+                    'evidence': {'sources': source_rows, 'catalogMetric': 'net', 'omittedSourceCount': 0}}]},
+                    'plan': {'toolCalls': [query, other]}}
+                previous = latest_context([{'role': 'assistant', 'content': '家教课时费收入', 'metadata': meta}])
+                plan = await self.plan(question, {'followUpOfPreviousQuestion': True, 'analyses': [projection],
+                    'understanding': {'objective': '沿用上次情景重新推演'}}, previous)
+                if expected:
+                    task = next(t for t in plan.analyses if t.tool == 'projection')
+                    self.assertEqual(task.months, 3)
+                    self.assertEqual([(c.source, c.metric, c.percent) for c in task.changes],
+                                     [('家教课时费', expected, -50)])
+                    self.assertNotIn('private', str(previous))
+                else:
+                    self.assertFalse(plan.toolCalls)
 
     async def test_review_must_not_widen_named_income_or_expense_to_every_source(self):
         for question, metric in [('绘图收入可能减少30%，重算', 'income'), ('培训支出将减半，重新算', 'expense')]:
@@ -315,6 +351,46 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
         self.assertIn('2026-09',descriptions)
         self.assertIn('笔数',descriptions)
 
+    async def test_placeholder_filters_do_not_zero_a_weekday_followup_or_overall_diagnosis(self):
+        from app.tools.financial_analysis import run_analysis
+        rows = [{'year': 2026, 'month': 10, 'day': 7, 'money': -amount, 'costType': category,
+                 'memberName': '春枝'} for category, amount in [('展览', 180), ('交通', 20), ('外食', 40)]]
+        for question, filters, applied, expense in [
+            ('沿用这两个月的范围，只看展览，按星期几分组，哪天的已记支出最多？',
+             {'includeCategories': ['展览'], 'excludeCategories': ['交通'], 'includeMembers': ['不限'], 'minAmount': 0},
+             {'includeCategories': ['展览'], 'excludeCategories': ['交通']}, 180),
+            ('综合看看最近半年的财务情况，按星期列出总额。',
+             {'includeCategories': ['all'], 'includeMembers': ['ALL'], 'includeSources': ['all'],
+              'excludeCategories': ['不限'], 'excludeMembers': ['无筛选'], 'excludeSources': ['全部'],
+              'remarkContains': 'none', 'excludeRemarks': ['null'], 'minAmount': 0, 'maxAmount': 0},
+             {}, 240)]:
+            with self.subTest(question=question):
+                draft = {'toolCalls': [{'id': 'mine', 'toolName': 'search_personal_orders'}],
+                         'analyses': [{'tool': 'aggregate', 'metric': 'all', 'queryIds': ['mine'],
+                                      'aggregate': {'groupBy': ['weekday'], 'filters': filters}}]}
+                plan = await self.plan(question, draft, {})
+                task = next(t for t in plan.analyses if t.tool == 'aggregate')
+                self.assertEqual(task.aggregate.filters.model_dump(exclude_defaults=True), applied)
+                self.assertEqual(task.queryIds, ['mine'])
+                result = run_analysis('aggregate', rows, as_of=date(2026, 11, 19), metric=task.metric,
+                                      aggregate=task.aggregate.model_dump())
+                self.assertEqual(result['totals']['expense'], expense)
+
+    async def test_placeholder_names_are_literal_only_in_the_dimension_the_user_named(self):
+        for question, raw, expected in [
+            ('只看分类名称为“全部”的账单，所有成员都要统计。',
+             {'includeCategories': ['全部'], 'includeMembers': ['全部']}, {'includeCategories': ['全部']}),
+            ('只统计来源叫 all、备注包含“none”的账单。',
+             {'includeSources': ['all'], 'remarkContains': 'none', 'includeMembers': ['all']},
+             {'includeSources': ['all'], 'remarkContains': 'none'}),
+            ('排除“none”类别后，按成员列出。',
+             {'excludeCategories': ['none'], 'excludeMembers': ['none']}, {'excludeCategories': ['none']}),
+            ('仅统计金额为零的账单。', {'maxAmount': 0}, {'maxAmount': 0})]:
+            with self.subTest(question=question):
+                plan = await self.plan(question, {'analyses': [{'tool': 'aggregate',
+                    'aggregate': {'groupBy': ['member'], 'filters': raw}}]}, {})
+                self.assertEqual(plan.analyses[0].aggregate.filters.model_dump(exclude_defaults=True), expected)
+
     async def test_reviewer_cannot_add_unrequested_category_whitelist(self):
         original={'tool':'aggregate','metric':'expense','aggregate':{'groupBy':['category'],'filters':{'excludeCategories':['通勤']}}}
         changed=json.loads(json.dumps(original))
@@ -563,6 +639,28 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
                 plan=await self.plan(question,{**draft,'analyses':[{'tool':'trends'}],**extra},saved)
                 self.assertIn('forecast',{t.tool for t in plan.analyses})
                 self.assertNotIn('budget',{t.tool for t in plan.analyses})
+
+    async def test_an_existing_purchase_task_recovers_the_explicit_price_but_not_a_unit_count(self):
+        for question, price in [
+            ('我下个月想买一台6000元的电脑，会不会影响日常生活？', 6000),
+            ('我想买一台电脑，能承受吗？', None),
+            ('去年花6000元买过电脑。现在想买一台新电脑，能承受吗？', None)]:
+            with self.subTest(question=question):
+                p = await self.plan(question, {'analyses': [{'tool': 'purchase', 'purchaseAmount': None}]}, {})
+                t = next(t for t in p.analyses if t.tool == 'purchase')
+                self.assertEqual(t.purchaseAmount, price)
+                self.assertIsNone(t.startingBalance)
+
+    async def test_savings_duration_is_the_decision_even_when_the_model_chose_only_forecast(self):
+        draft = {'understanding': {'evidenceNeeds': ['cashflow', 'trends', 'forecast']},
+                 'analyses': [{'tool': 'cashflow'}, {'tool': 'trends'}, {'tool': 'forecast'}]}
+        question = '现在有10000元，保持当前收支，多久能存到20000元？'
+        plan = await self.plan(question, draft, {})
+        self.assertEqual({t.tool for t in plan.analyses}, {'cashflow', 'trends', 'savings'})
+        goal = next(t for t in plan.analyses if t.tool == 'savings')
+        self.assertEqual((goal.startingBalance, goal.targetAmount), (10000, 20000))
+        both = await self.plan(question+'另外预测下个月收入。', draft, {})
+        self.assertIn('forecast', {t.tool for t in both.analyses})
 
     async def test_stated_purchase_is_computed_even_when_both_model_tool_lists_miss_it(self):
         question='我下个月想花6000元买电脑，现在买合适吗？会影响后面的生活吗？'

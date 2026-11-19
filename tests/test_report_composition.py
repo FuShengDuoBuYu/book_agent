@@ -64,6 +64,41 @@ class FakeComposition:
 
 
 class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_delivered_table_columns_are_known_without_exposing_its_amounts(self):
+        payload = payload_for_composition()
+        payload['artifacts'] = [{'id': 'a1', 'kind': 'table', 'title': '分类比较',
+            'columns': [{'key': 'category', 'label': '分类'}, {'key': 'expense', 'label': '支出', 'unit': '元'}],
+            'rows': [{'category': '展览', 'expense': 987654}]}]
+        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'))
+        await compose_fixture(payload, fake.invoke)
+        delivered = fake.calls[-1][1]['deliveredArtifacts']
+        self.assertEqual(delivered, [{'kind': 'table', 'title': '分类比较',
+                                     'columns': ['分类', '支出'], 'hasRows': True}])
+        self.assertNotIn('987654', repr(fake.calls[-1][1]))
+
+    async def test_unrelated_windows_do_not_become_commentary_date_authority(self):
+        payload = payload_for_composition()
+        payload['facts'][2] = bound_fact('f3', '另一段的收入资料。', 'g3', 'cashflow',
+            window={'startDate': '2021-01-01', 'endDate': '2024-12-31'})
+        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'))
+        await compose_fixture(payload, fake.invoke)
+        self.assertNotIn('2021', repr(fake.calls[-1][1]))
+        self.assertNotIn('2024', repr(fake.calls[-1][1]))
+
+    async def test_identical_explicit_query_bindings_share_the_primary_decision(self):
+        payload = payload_for_composition()
+        payload['facts'] = [
+            bound_fact('f1', '每月改善目标已经确认。', 'g1', 'optimization', headline=True,
+                       window=None, queryIds=['ledger'], filters=[{'category': '不限', 'remark': ''}]),
+            bound_fact('f2', '保护项已排除。', 'g1', 'optimization', headline=True,
+                       window=None, queryIds=['ledger'], filters=[{'category': '不限', 'remark': ''}]),
+            bound_fact('f3', '该账本的历史收支结构。', 'g2', 'cashflow',
+                       window=None, queryIds=['ledger'], filters=[{'category': '不限', 'remark': ''}])]
+        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f3'))
+        draft = await compose_fixture(payload, fake.invoke)
+        self.assertEqual(set(draft.sections[0].factIds), {'f1', 'f2', 'f3'})
+        self.assertEqual({r['tool'] for r in fake.calls[-1][1]['findings']}, {'cashflow', 'optimization'})
+
     async def test_missing_qualitative_findings_cannot_silently_restore_raw_amounts(self):
         fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'))
         with self.assertRaisesRegex(ValueError, '分析发现'):

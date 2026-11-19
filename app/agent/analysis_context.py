@@ -11,11 +11,77 @@ FIELDS = ('months', 'startingBalance', 'targetAmount', 'monthlyImprovement',
 DECISION_TOOLS = {'forecast', 'projection', 'scenario', 'savings', 'optimization', 'purchase', 'runway', 'budget'}
 
 
+def _observed_source_directions(metadata, context):
+    # A complete all-direction catalog can disambiguate income from expense.
+    # Do not transfer an unbound result from another ledger or filtered query.
+    from app.tools.order_search import normalize_cost_type
+    from app.tools.registry import PLANNER_TOOL_BY_NAME
+
+    scopes = context.get('scope') or []
+    evidence = metadata.get('evidence') or {}
+    if len(scopes) != 1 or not evidence.get('ok') or context.get('ambiguous'):
+        return {}
+    expected = tuple(scopes[0])
+    mode = PLANNER_TOOL_BY_NAME.get(expected[0], (None,))[0]
+    if not mode:
+        return {}
+    queries = (metadata.get('plan') or {}).get('toolCalls') or context.get('conversation', {}).get('queries', [])
+    bindings = defaultdict(set)
+    for query in queries:
+        tool = query.get('toolName')
+        if PLANNER_TOOL_BY_NAME.get(tool, (None,))[0] != mode:
+            continue
+        args = query.get('args') or {}
+        scope = (tool, normalize_cost_type(args.get('cost_type')), args.get('remark') or '')
+        for key in query.get('sourceIds') or [query.get('id')]:
+            bindings[key].add(scope)
+    found = defaultdict(set)
+    for result in evidence.get('analysisResults', []):
+        if result.get('tool') != 'sources' or result.get('mode') != mode:
+            continue
+        keys = result.get('queryIds') or bindings.keys()
+        if not keys or any(bindings.get(key) != {expected} for key in keys):
+            continue
+        catalog = result.get('evidence') or {}
+        if catalog.get('catalogMetric') not in {'all', 'net'} or catalog.get('omittedSourceCount') != 0:
+            continue
+        for row in catalog.get('sources', []):
+            label, metric = row.get('source'), row.get('metric')
+            if isinstance(label, str) and 0 < len(label) <= 160 and metric in {'income', 'expense'}:
+                found[label].add(metric)
+        if len(found) > 100:
+            return {}
+    return {name: sorted(roles) for name, roles in found.items()}
+
+
 def latest_context(messages):
     for message in reversed(messages):
         if message.get('role') == 'assistant':
-            return message.get('metadata', {}).get('analysisContext', {})
+            metadata = message.get('metadata') or {}
+            context = deepcopy(metadata.get('analysisContext') or {})
+            context.pop('observedSourceDirections', None)
+            directions = _observed_source_directions(metadata, context)
+            if directions:
+                context['observedSourceDirections'] = directions
+            return context
     return {}
+
+
+def source_direction_of(name, prior):
+    # Prefer an exact ledger label. A shorthand can identify exactly one observed
+    # label in one direction, or one source already bound in the user's scenario.
+    candidates = defaultdict(set)
+    for label, roles in prior.get('observedSourceDirections', {}).items():
+        if name in label:
+            candidates[label].update(roles)
+    for change in prior.get('changes', []):
+        label, role = change.get('source'), change.get('metric')
+        if label and name in label and role in {'income', 'expense'}:
+            candidates[label].add(role)
+    if name in candidates:
+        candidates = {name: candidates[name]}
+    matches = [(label, role) for label, roles in candidates.items() for role in roles]
+    return matches[0] if len(matches) == 1 else None
 
 
 def remove_withdrawn_changes(context, keys):

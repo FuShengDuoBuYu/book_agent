@@ -16,6 +16,43 @@ class EvidenceReportTests(unittest.TestCase):
     def test_unknown_reference_rejected(self):
         self.assertTrue(validate_draft(self.draft(factIds=['fake']), self.facts))
 
+    def test_unknown_balance_is_not_a_confirmed_shortage_even_in_a_mixed_risk_sentence(self):
+        for text in ['最大的变数在于起始存款不足以及可能出现的大额支出。',
+                     '当前可动用余额不足，建议推迟购买。']:
+            with self.subTest(text=text):
+                self.assertTrue(validate_draft(self.draft(analysis=text), self.facts))
+        for text in ['如果起始存款不足，需要调整安排。', '先核查当前余额是否不足。',
+                     '不能认定当前余额不足。']:
+            with self.subTest(text=text):
+                self.assertEqual(validate_draft(self.draft(analysis=text), self.facts), [])
+
+    def test_a_suggestion_cannot_invent_missing_remark_records(self):
+        facts = [{'id': 'f1', 'text': '缺少支付方式 36 笔，缺少分类 0 笔。', 'required': True}]
+        self.assertTrue(validate_draft(self.draft(analysis='建议重点核查备注缺失的交易。'), facts))
+        self.assertEqual(validate_draft(self.draft(analysis='建议核查这些记录的备注是否完整。'), facts), [])
+        no_missing = [{'id': 'f1', 'text': '缺失备注 0 笔。', 'required': True}]
+        self.assertEqual(validate_draft(self.draft(analysis='本次未发现备注缺失。'), no_missing), [])
+
+    def test_other_ledger_cash_cannot_authorize_an_unknown_family_balance_claim(self):
+        facts = [{'id': 'personal', 'text': '个人余额由用户提供。', 'required': False,
+                  'values': [{'label': '当前可动用余额', 'value': 12000, 'unit': '元'}],
+                  'binding': {'scope': '个人版', 'resultGroup': 'g1'}},
+                 {'id': 'family', 'text': '家庭可动用余额未知。', 'required': True,
+                  'binding': {'scope': '家庭版', 'resultGroup': 'g2'}}]
+        self.assertTrue(validate_draft(self.draft(factIds=['family'], analysis='家庭当前余额不足。'), facts))
+
+    def test_decision_median_baseline_is_not_renamed_average_cashflow(self):
+        from datetime import date
+        from app.tools.financial_analysis import run_analysis
+        from tests.test_decision_analysis import ledger
+        result = run_analysis('savings', ledger(), as_of=date(2026, 11, 19),
+                              starting_balance=10000, target_amount=20000, months=3)
+        facts = build_facts([{'tool': 'savings', 'evidence': result}])
+        ids = [row['id'] for row in facts if row['required']]
+        self.assertTrue(validate_draft(self.draft(factIds=ids, analysis='这一结论仅基于现有记录的平均现金流。'), facts))
+        self.assertEqual(validate_draft(self.draft(factIds=ids, analysis='本测算采用预测基准，不是平均现金流。'), facts), [])
+        self.assertEqual(validate_draft(self.draft(factIds=ids, analysis='预测基准与历史平均现金流口径不同。'), facts), [])
+
     def test_same_unit_after_a_typed_variable_is_normalized_without_changing_its_value(self):
         facts = [{'id': 'f1', 'required': True, 'text': '历史样本入账 8,000 元。',
                   'values': [{'label': '样本', 'value': 8000, 'unit': '元'}]}]

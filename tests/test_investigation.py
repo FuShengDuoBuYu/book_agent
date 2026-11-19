@@ -122,6 +122,18 @@ class InvestigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(accepted[1].includeSources, ['observed_c'])
         self.assertEqual(len(audit['issues']), 2)
 
+    async def test_supplemental_aggregate_does_not_widen_a_requested_filter_with_a_placeholder(self):
+        from app.agent.investigation import EvidenceInvestigator, InvestigationDecision
+        plan = AgentPlan(toolCalls=[{'id': 'ledger', 'toolName': 'search_personal_orders'}],
+                         analyses=[{'tool': 'aggregate', 'aggregate': {'filters': {'includeCategories': ['展览']}}}])
+        agent = EvidenceInvestigator()
+        agent._invoke = AsyncMock(return_value=InvestigationDecision(additionalAnalyses=[
+            {'tool': 'aggregate', 'queryIds': ['ledger'], 'aggregate': {
+                'groupBy': ['weekday'], 'filters': {'includeCategories': ['all'], 'includeMembers': ['不限']}}}]))
+        decision, audit = await agent.refine('只看展览，按星期核对。', '', plan, [])
+        self.assertEqual(decision.additionalAnalyses, [])
+        self.assertTrue(audit['issues'])
+
     async def test_aggregate_dates_are_json_safe_in_model_payload_and_saved_audit(self):
         import json
         from app.agent.investigation import EvidenceInvestigator, InvestigationDecision

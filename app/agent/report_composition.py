@@ -18,10 +18,10 @@ COMMENT_TOKENS = 768
 OUTLINE_PROMPT = '''根据本轮问题、用户条件和账本证据拟定简短提纲。
 answerGoal 必须逐字选用 answerGoals 中用户已经要求的目标，不能将自己的判断变成新目标。title 选择中性标题，factIds 只绑定真实的事实编号，a 开头的表格编号不能作事实引用。
 只写有必要且有证据的段落，一段也可以。金额、日期和表格由程序展示。'''
-COMMENT_PROMPT = """你是记账助手，正在直接回复用户。本段要回答的问题是 section.answerGoal。analysis 就是给用户看的最终答复，请用两至三句话先回答问题，再说明对用户的实际意义，需要时给出具体核查或调整建议。
-findings 是程序从已核算结果得到的分析发现，包含变化方向、目标是否可达、缺少哪些条件及来源关系。具体金额、日期、笔数、完整备注和表格由程序在你的解释前原样展示，你只解释其含义和实际行动，不重新计算或编造数值，不介绍内部字段或生成过程。
-若有 section.answerGoals，合并回应所列目标。主计算结论优先，历史观察、用户假设和未来估计分别说明。availableEvidence 说明其他部分已有何种证据，本段没列明细不表示整个账本没有。
-账本说明已记录的变化，不证明未来收入稳定、医疗以后不再发生、生活负担过高或记录完整。未知余额时先确认余额和近期支出，不据月结余判断买得起。
+COMMENT_PROMPT = """你是记账助手，正在直接回复用户。question 是用户原话，section.answerGoal 是本段的回答重点；回答重点不能增加用户没问的目标、时间范围或评分。analysis 是给用户看的最终答复，用两至三句话先回答，再说明实际意义和有依据的下一步。
+findings 是程序从已核算结果得到的分析发现，包含变化方向、目标是否可达、缺少哪些条件及来源关系。具体金额、日期、笔数、完整备注和表格已核算并由程序展示；你解释含义，不另算数值。deliveredArtifacts 列出同时交付的表格或图及其列，不能声称没有这些数据或让用户另查已交付的表格。
+若有 section.answerGoals，合并回应。优先回答主计算结论，历史观察、用户假设和未来估计分别说明。availableEvidence 只说明其他部分证据的种类，不是本段结论的来源。只有 findings 已确认缺少的条件才需要询问，其他段缺少明细不表示整个账本没有。
+行动建议必须与已验证的发现相连。金额排名不等于必要性或生活负担，历史记录不能证明现实原因、未来规律或当前现金余额；只说明与本题有关的限制，不给无关的购买、健康或余额建议。不介绍内部字段或生成过程。
 corrections 只说明上一版的错误，须据此修正，不要把纠错意见抄成新的财务事实或用户要求。"""
 SECTION_DIAGNOSTIC = re.compile(r'^第\s*(\d+)\s*段')
 SCOPE_FIELDS = ('scope', 'historyWindow', 'filters', 'queryIds')
@@ -73,7 +73,7 @@ def _evidence_inventory(facts):
         binding = fact.get('binding', {})
         if not binding.get('tool'):
             continue
-        item = _subset(binding, ('tool', 'scope', 'historyWindow', 'metric', 'aggregation'))
+        item = _subset(binding, ('tool', 'scope', 'metric', 'aggregation'))
         entry = records.setdefault(_serialized(item), item)
         if binding.get('source') or binding.get('sourceKey'):
             entry['sourceBreakdown'] = True
@@ -100,7 +100,7 @@ def _headline_dependencies(facts):
             continue
         candidates = [(key, head) for key, head in headlines if head['resultGroup'] == group
                       and head['tool'] == binding['tool'] and _same_scope(head, binding)]
-        if (not candidates and len(primary_tools) == 1 and binding.get('historyWindow') and
+        if (not candidates and len(primary_tools) == 1 and (binding.get('historyWindow') or binding.get('queryIds')) and
                 binding['tool'] not in DECISION_TOOLS):
             candidates = [(key, head) for key, head in headlines if _same_scope(head, binding)]
         if len({head['resultGroup'] for _, head in candidates}) == 1:
@@ -207,6 +207,10 @@ async def compose_report(payload, invoke, *, num_ctx=8192) -> ReportDraft:
     previous = prior.get('sections', []) if isinstance(prior, dict) else []
     limit, estimate = _prompt_budget(COMMENT_PROMPT, ReportComment, num_ctx, COMMENT_TOKENS)
     inventory = _evidence_inventory(facts)
+    delivered = [{'kind': row.get('kind'), 'title': row.get('title', ''),
+                  'columns': [column['label'] for column in row.get('columns', [])],
+                  'hasRows': bool(row.get('totalRows', len(row.get('rows', []))))}
+                 for row in payload.get('artifacts', [])]
     comment_inputs = []
     for brief in briefs:
         groups = list(dict.fromkeys(bound_facts[key].get('binding', {}).get('resultGroup') for key in brief.fact_ids))
@@ -219,7 +223,7 @@ async def compose_report(payload, invoke, *, num_ctx=8192) -> ReportDraft:
             section['answerGoals'] = list(brief.goals)
         comment = {'question': common.get('question', ''), 'section': section,
                    'findings': [findings[group] for group in groups],
-                   'availableEvidence': inventory}
+                   'availableEvidence': inventory, 'deliveredArtifacts': delivered}
         diagnostics = _section_diagnostics(corrections, previous, brief)
         if diagnostics:
             comment['corrections'] = diagnostics

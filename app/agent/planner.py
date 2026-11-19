@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 from app.core.config import get_settings
 from app.core.llm import get_planner_model
-from app.agent.analysis_context import remove_withdrawn_changes, resolve_context
+from app.agent.analysis_context import remove_withdrawn_changes, resolve_context, source_direction_of
 from app.agent.intent_resolution import IntentResolver
 from app.agent.conversation_context import compact_user_context
 from app.agent.plan_parsing import repair_descriptive_arrays
@@ -472,20 +472,24 @@ class QueryPlanner:
                            for t in adjustable for c in t.changes) for source, role, rate in conditions):
                 raise ValueError('每个明确的来源变化必须绑定到对应情景，不能作为所有收入或支出的变化')
             return
-        name, metric, percent = conditions[0]
-        if any(c.percent == percent and c.source in {name, name+'收入', name+'支出'} for t in adjustable for c in t.changes):
-            return
+        literal, metric, percent = conditions[0]
+        name = literal
         if not metric:
-            hints = ' '.join([intent, *plan.understanding.referents])
-            terms = {'income': '收入|income', 'expense': '支出|expense'}
-            roles = [key for key, term in terms.items() if re.search(
-                re.escape(name) + rf"""[’'"”」)\s(的]*(?:{term})""", hints, re.I)]
-            if len(roles) != 1:
-                raise ValueError(f'请明确「{name}」的变化属于收入还是支出，并将该来源和比例绑定到情景计算')
-            metric = roles[0]
+            observation = source_direction_of(literal, prior)
+            if observation:
+                name, metric = observation
+            elif re.search(r'不是.{1,32}?(?:，|,|而)是', message):
+                # A correction of only the source carries the role of the user's
+                # single retracted input (e.g. the income in the original cut).
+                roles = {i['metric'] for i in plan._planning_issues if i.get('type') == 'withdrawn_source_assumption'}
+                if len(roles) == 1:
+                    metric = roles.pop()
+            if not metric:
+                raise ValueError(f'请明确「{literal}」的变化属于收入还是支出，并将该来源和比例绑定到情景计算')
         change = ScenarioChange(metric=metric, source=name, percent=percent)
         for task in adjustable:
-            task.changes = [c for c in task.changes if (c.metric, c.source) != (metric, name)] + [change]
+            task.changes = [c for c in task.changes if c.source not in {name, literal, literal+'收入', literal+'支出'}
+                            or c.percent != percent and c.metric != metric] + [change]
         plan._planning_issues.append({'type': 'normalized_explicit_condition', 'field': 'changes', 'source': name})
 
     def _normalize_explicit_conditions(self, plan, message):
@@ -820,7 +824,13 @@ class QueryPlanner:
             required_input = {'budget': 'budgetAmount', 'savings': 'targetAmount', 'runway': 'changes',
                               'purchase': 'purchaseAmount', 'scenario': 'changes'}
             def unrelated_empty(task):
-                if task.tool in grounded or task.tool not in required_input:
+                if task.tool in grounded:
+                    return False
+                if primary in {'purchase', 'savings'} and task.tool == 'forecast':
+                    # These decisions calculate their own baseline. An independent
+                    # forecast needs a requested outlook or a referred previous goal.
+                    return True
+                if task.tool not in required_input:
                     return False
                 value = getattr(task, required_input[task.tool])
                 return value is None or value == []
@@ -862,17 +872,6 @@ class QueryPlanner:
             if len(plan.analyses) >= 12:
                 raise ValueError('请求的证据超过十二项分析，请合并重复任务并保留必要的决策与查询绑定。')
             args = {'metric': 'income' if tool == 'forecast' and plan.output.metric == 'all' else plan.output.metric}
-            # A missing calculation can use a literal, role-checked user input.
-            # Never derive balances, goals or shocks from the text of the plan.
-            for field in amount_roles.get(tool, ()):
-                candidates = {value for clause in CLAUSES.split(message)
-                              if not NEGATED.search(clause) and not HISTORY_WORDS.search(clause)
-                              and not _explicit_history_sample(clause, today)
-                              for value in _amount_matches(clause, field)}
-                if len(candidates) == 1:
-                    value = candidates.pop()
-                    if _explicit_amount(message, field, value):
-                        args[field] = value
             if tool in {'savings', 'projection'}:
                 horizon_text = re.sub(rf"每(?:隔)?(?:{NUMBER}\s*个?月|半年|一年)", "", message)
                 _, durations = _time_evidence(horizon_text, today)
@@ -881,6 +880,23 @@ class QueryPlanner:
                     if count > 0:
                         args['months'] = count
             plan.analyses.append(AnalysisRequest(tool=tool, **args))
+        # The user supplies the same typed conditions whether the model chose the
+        # calculation itself or the planner had to add it. Multiple alternatives
+        # require an explicit binding for a price or balance to a particular task.
+        if len(bindings) <= 1:
+            current_clauses = [clause for clause in CLAUSES.split(message)
+                               if not NEGATED.search(clause) and not HISTORY_WORDS.search(clause)
+                               and not _explicit_history_sample(clause, today)]
+            for tool, fields in amount_roles.items():
+                tasks = [task for task in plan.analyses if task.tool == tool]
+                if len(tasks) != 1:
+                    continue
+                for field in fields:
+                    if getattr(tasks[0], field) is not None:
+                        continue
+                    values = {v for clause in current_clauses for v in _amount_matches(clause, field)}
+                    if len(values) == 1 and _explicit_amount(message, field, next(iter(values))):
+                        setattr(tasks[0], field, values.pop())
 
     def _inherit_conversation(self, plan, previous):
         """Only inherit a referent's range and grouping within its ledger/filter scope."""

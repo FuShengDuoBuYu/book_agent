@@ -121,6 +121,8 @@ def build_facts(results):
                             'projection': 'conditional_period_projection', 'aggregate': 'filtered_aggregation',
                             'changes': 'recorded_period_comparison'}.get(tool, 'computed_evidence'),
         }.items() if value is not None}
+        if e.get('baseline', {}).get('sufficientData') and tool in {'projection', 'scenario', 'savings', 'optimization', 'runway'}:
+            base_binding['baselineAggregation'] = 'source_month_medians'
         filters = result.get('filters') or []
         narrowed = [f"{row.get('category', '不限')}／{row.get('remark') or '全部备注'}" for row in filters
                     if row.get('category') not in (None, '不限') or row.get('remark')]
@@ -369,7 +371,17 @@ def validate_draft(draft, facts):
     for index, section in enumerate(draft.sections, 1):
         prose = section.title + '\n' + section.analysis
         issues.extend(f'第{index}段：{issue}' for issue in numerical_issues(prose, section.factIds, facts))
-        unsupported = unsupported_assertion(expand_values(prose, facts), facts)
+        if any(row.get('binding', {}).get('baselineAggregation') == 'source_month_medians'
+               for row in facts if row['id'] in section.factIds):
+            for clause in re.split(r'[，；。！？]', section.analysis):
+                if re.search(r'(?:基于|采用|根据|按).{0,15}(?:平均现金流|(?:平均|均值)(?:的)?月(?:度)?(?:收入|支出|结余))', clause) and not re.search(
+                        r'不是|不等于|不能(?:称为|当作|替换)|并非', clause):
+                    issues.append(f'第{index}段：本决策采用来源月金额中位数等预测基准，不能改称平均现金流')
+        bound_groups = {(row['binding'].get('scope'), row['binding']['resultGroup']) for row in facts
+                        if row['id'] in section.factIds and row.get('binding', {}).get('resultGroup')}
+        related = [row for row in facts if row['id'] in section.factIds or
+                   (row.get('binding', {}).get('scope'), row.get('binding', {}).get('resultGroup')) in bound_groups]
+        unsupported = unsupported_assertion(expand_values(prose, facts), related)
         if unsupported:
             issues.append(f'第{index}段：{unsupported}')
     return list(dict.fromkeys(issues))
@@ -388,6 +400,18 @@ def unsupported_assertion(text, facts):
     recurrence, or affordability benchmarks. Conditional questions remain valid.
     """
     evidence_text = ' '.join(row['text'] for row in facts)
+    known_balance = any(value.get('value') is not None and value.get('label') in {
+        '当前可动用余额', '用户提供的可动用余额', 'startingBalance'}
+        for fact in facts for value in fact.get('values', []))
+    # A later hypothetical in the same sentence does not qualify an earlier
+    # assertion that an unknown cash balance is already insufficient.
+    for match in re.finditer(r'(?:起始|当前|现有|可动用)?(?:存款|余额|现金)(?:明显|已经|仍然|仍)?不足', text):
+        prefix = re.split(r'[，；。！？\n]', text[:match.start()])[-1]
+        if not known_balance and not re.search(r'如果|若|是否|可能|不能(?:认定|断言|确定)|无法(?:认定|断言|确定)', prefix):
+            return '当前余额未知，不能断言存款或可动用现金不足'
+    remark_claim = re.sub(r'(?:未|没有|尚未)(?:发现|检测到|识别到|检出)?(?:任何)?(?:备注缺失|缺(?:少|失)备注)', '', text)
+    if re.search(r'备注(?:缺失|缺少)|缺(?:少|失)备注', remark_claim) and not re.search(r'缺(?:少|失)备注\s*[1-9]|备注缺失\s*[1-9]', evidence_text):
+        return '现有证据没有报告备注缺失，不能把其他缺失字段替换成备注缺失'
     if re.search(r'section\.answerGoal|computedFacts|answerGoal|factIds|requestedAnswers|根据用户指令[，,]?我需要', text):
         return '请直接回答用户的财务问题，不介绍内部字段、任务或生成步骤。'
     duplicate_counts = re.findall(r'疑似重复组 (\d+) 组', evidence_text)
