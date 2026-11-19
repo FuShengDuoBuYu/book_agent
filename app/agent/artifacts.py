@@ -5,7 +5,7 @@ from datetime import date
 
 from app.schemas.artifacts import public_artifacts
 from app.tools.financial_analysis import shift_month
-from app.tools.source_analysis import REMARK_LIMIT, money
+from app.tools.source_analysis import CATALOG_LIMIT, REMARK_LIMIT, money
 
 
 METRIC_LABELS = {'income': '收入', 'expense': '支出', 'net': '结余'}
@@ -19,6 +19,7 @@ SOURCE_STATUS_LABELS = {
     'excluded': '已从持续性收入预测中剔除',
 }
 REMARK_COVERAGE = f'每个来源展示至多 {REMARK_LIMIT} 条去重备注，较长备注保留前 160 字。'
+REMARK_MAPPING_LIMIT = CATALOG_LIMIT * REMARK_LIMIT
 
 
 def cell(value, *, literal=False):
@@ -58,6 +59,24 @@ def render_artifacts_markdown(artifacts):
 def _project_rows(rows, columns):
     keys = [key for key, _, _ in columns]
     return [{key: row.get(key) for key in keys} for row in rows]
+
+
+def _remark_mapping(sources, notes, *, default_metric=None):
+    columns = [('remark', '原始备注', ''), ('member', '成员', ''), ('source', '对应来源', ''), ('direction', '收支方向', '')]
+    rows, omitted = [], 0
+    for source in sources:
+        direction = source.get('metric', default_metric)
+        remarks = dict.fromkeys(text[:160] for text in source.get('remarks', []) if text and text.strip())
+        for index, text in enumerate(remarks):
+            if index >= REMARK_LIMIT or len(rows) >= REMARK_MAPPING_LIMIT:
+                omitted += 1
+                continue
+            rows.append({'remark': text, 'member': source.get('member') or '归属未知',
+                         'source': source['source'], 'direction': METRIC_LABELS.get(direction, '未知')})
+    notes = [*notes, f'本表最多展示 {REMARK_MAPPING_LIMIT} 条对应关系。每行是一条已观察的去重备注，金额按来源汇总。']
+    if omitted:
+        notes.append(f'已取得的备注对应关系中，另有 {omitted} 条因展示上限而省略。')
+    return columns, rows, notes
 
 
 def _aggregate_dimensions(names):
@@ -182,6 +201,7 @@ def build_artifacts(results, output=None, window=None):
     include_trends = output.get('includeTrends', chart_target == 'trends')
     include_lineage = output.get('includeLineage', False)
     forecast_scopes = {row.get('mode', '当前账本') for row in results if row['tool'] == 'forecast'}
+    catalog_scopes = {row.get('mode', '当前账本') for row in results if row['tool'] == 'sources'}
 
     def add(title, columns, rows, *, kind='table', x_key=None, series=None, notes=None):
         if rows:
@@ -232,18 +252,30 @@ def build_artifacts(results, output=None, window=None):
                     rows, notes=[e.get('method', ''), REMARK_COVERAGE,
                                  '历史入账包含已剔除来源在观察期内的记录。',
                                  '全月缺少账单时金额未知。未来工作安排需由用户确认。'])
+            if include_lineage and scope not in catalog_scopes and e.get('sourceForecasts') and metric in {'all', 'income', 'net'}:
+                columns, mapped, notes = _remark_mapping(e['sourceForecasts'], [REMARK_COVERAGE], default_metric='income')
+                add(f"{scope} {e['targetMonth']} 预测样本原始备注与来源对应表", columns, mapped, notes=notes)
         elif tool == 'sources' and (
-                include_lineage or (output.get('includeSources', True) and scope not in forecast_scopes)):
-            rows = [{'member': row.get('member', '归属未知'), 'source': row['source'],
-                     'direction': '收入' if row['metric'] == 'income' else '支出',
-                     'amount': row['amount'], 'count': row.get('recordCount'), 'remark': '；'.join(row.get('remarks', []))}
-                    for row in e.get('sources', []) if metric == 'all' or row['metric'] == metric]
+                include_lineage or not result.get('supplemental') or (output.get('includeSources', True) and scope not in forecast_scopes)):
+            sources = [row for row in e.get('sources', []) if metric in {'all', 'net'} or row['metric'] == metric]
             notes = [REMARK_COVERAGE]
-            if omitted := e.get('omittedSourceCount', 0):
+            if omitted := e.get('omittedSourceCountByMetric', {}).get(metric, e.get('omittedSourceCount', 0)):
                 notes.append(f'另有 {omitted} 个来源超出目录展示范围。')
-            add(f'{scope} 来源与备注依据', [('member', '成员', ''), ('source', '来源', ''), ('direction', '方向', ''),
-                ('amount', '已记录合计', '元'), ('count', '笔数', '笔'), ('remark', '备注证据', '')], rows,
-                notes=notes)
+            show_mapping = include_lineage or not result.get('supplemental')
+            if scope not in forecast_scopes or metric in {'expense', 'net'}:
+                rows = [{'member': row.get('member', '归属未知'), 'source': row['source'],
+                         'direction': METRIC_LABELS[row['metric']], 'amount': row['amount'], 'count': row.get('recordCount')}
+                        for row in sources]
+                columns = [('member', '成员', ''), ('source', '来源', ''), ('direction', '方向', ''),
+                           ('amount', '已记录合计', '元'), ('count', '笔数', '笔')]
+                if not show_mapping:
+                    columns.append(('remark', '备注依据', ''))
+                    for summary, source in zip(rows, sources):
+                        summary['remark'] = '；'.join(source.get('remarks', []))
+                add(f'{scope} 来源汇总', columns, rows, notes=notes)
+            if show_mapping:
+                columns, mapped, mapping_notes = _remark_mapping(sources, notes)
+                add(f'{scope} 原始备注与来源对应表', columns, mapped, notes=mapping_notes)
         elif tool == 'trends' and (kind != 'table' or include_trends):
             fields = [('income', 'incomeTotal', '收入'), ('expense', 'expenseTotal', '支出'),
                       ('net', 'netIncomeMinusExpense', '结余')]

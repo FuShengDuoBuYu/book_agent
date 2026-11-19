@@ -36,6 +36,51 @@ from app.tools.aggregate_analysis import AggregatePeriod
 HISTORY_BASED_TOOLS = {'forecast', 'scenario', 'savings', 'projection', 'purchase', 'runway', 'optimization'}
 
 
+_LEDGER_SCOPES = re.compile(
+    r'(?P<family>家庭(?:版|账本|账单|账户|成员)|(?:家庭|全家)(?=的?(?:收入|收支|开销|支出|账))'
+    r'|(?:我们家|我家)的?(?:账本|账单|账户)|我们家(?!附近|旁边|门口|楼下)|我家(?=的?(?:收入|收支|开销|支出|账|成员)))'
+    r'|(?P<personal>个人(?:版|账本|账单|账户)|(?:我个人|我自己)|个人(?=的?(?:收入|收支|开销|支出|账)))')
+_LEDGER_PAIR = re.compile(
+    r'(?:我(?:个人)?|个人(?:版|账本|账单)?)\s*(?:和|与|跟|及|、|对比)\s*(?:我们家|全家|家庭(?=$|[的版账各分，。？\s]|收入|支出|开销|收支))'
+    r'|(?:我们家|全家|家庭(?:版|账本|账单)?)\s*(?:和|与|跟|及|、|对比)\s*(?:我个人|个人)'
+    r'|(?:两个|两[个份套]?|双)账本')
+
+
+def _requested_ledger_modes(message, default_mode):
+    """Only the current request can select a different ledger from the UI."""
+    # Quoted values of record fields describe transactions, including when the
+    # literal remark or category happens to contain a ledger name.
+    text = re.sub(r'(?:备注|分类|类别|来源)(?:里|中|名称|名)?(?:写着|写的是|包含|含|叫|为|是)?\s*[“「『"\']'
+                  r'[^”」』"\']*[”」』"\']', '', message)
+    clauses = []
+    for clause in re.split(r'[，,；;。！？!?\n]|(?:但)?(?:这次|这回|本次|现在)(?:改为|改用|换到|只看)?', text):
+        if re.search(r'(?:上次|上一轮|刚才|之前|先前)(?:我[们]?|你)?(?:看|查|用|选|说|提|算|讲|是|的范围)', clause):
+            continue
+        clauses.append(clause)
+    current = '，'.join(clauses)
+    excluded, selected = set(), []
+    previous = None
+    coordinated = False
+    for m in _LEDGER_SCOPES.finditer(current):
+        mode = '家庭版' if m.lastgroup == 'family' else '个人版'
+        if re.search(r'(?:不要|不用|不再|不|别|排除)(?:看|再看|查|再查|用|使用|包括|包含|是)?(?:我的|我们的)?\s*$', current[:m.start()]):
+            excluded.add(mode)
+            continue
+        if previous and previous.lastgroup != m.lastgroup:
+            between = current[previous.end():m.start()]
+            coordinated |= bool(re.search(r'和|与|跟|以及|、|对比|对照|相比|，(?:再|也|另外)(?:查|看|核对)', between))
+        selected.append((mode, m.group().endswith(('账本', '版', '账户', '账单'))))
+        previous = m
+    both = {'家庭版', '个人版'}
+    if not excluded and (_LEDGER_PAIR.search(current) or coordinated):
+        return both
+    # An explicit ledger can be filtered to one member ("家庭账本里我个人的收入").
+    explicit = [mode for mode, ledger in selected if ledger]
+    if explicit or selected:
+        return {explicit[-1] if explicit else selected[-1][0]}
+    return both - excluded if len(excluded) == 1 else {default_mode}
+
+
 # A complete calendar month ends before the current local month begins.
 _COMPLETE_MONTHS = re.compile(r'(?:最近|上)\s*([0-9]+|[一二两三四五六七八九十]+)\s*个?\s*完整(?:自然)?月份?')
 _CHINESE_DIGITS = {char: number for number, char in enumerate('零一二三四五六七八九')} | {'两': 2}
@@ -186,11 +231,17 @@ class QueryPlanner:
     ) -> AgentPlan:
         # 这里的核心任务是：拿到 LLM 输出后，尽量把它收敛成一个可执行的 AgentPlan。
         now = datetime.now(ZoneInfo("Asia/Shanghai"))
+        modes = _requested_ledger_modes(message, self._normalize_mode(book_mode))
+        if len(modes) == 1:
+            book_mode = next(iter(modes))
         previous_context = deepcopy(previous_context or {})
         if previous_context.get('scope'):
             previous_context['scope'] = [list(row) for row in sorted({
                 (tool, self._normalize_cost_type(category), remark or '')
                 for tool, category, remark in previous_context['scope']})]
+            prior_modes = {PLANNER_TOOL_BY_NAME.get(row[0], (None,))[0] for row in previous_context['scope']}
+            if prior_modes != modes:
+                previous_context = {}
         prompt_values = {
             "current_date": now.strftime("%Y-%m-%d"),
             "calendar_context": json.dumps(calendar_context(now.date()), ensure_ascii=False),
@@ -247,7 +298,7 @@ class QueryPlanner:
                     elif relation in {'independent', 'reset'}:
                         plan.followUpOfPreviousQuestion = False
                         plan.resetAnalysisContext = relation == 'reset'
-                self._normalize_query_scopes(plan)
+                self._normalize_query_scopes(plan, modes)
                 self._materialize_requirements(plan, message, previous_context, book_mode)
                 self._sanitize_conditions(plan, message, book_mode, previous_context)
                 if (plan.intent == 'analyze_orders' and (plan.analyses or plan.analysisType == 'financial_analysis')
@@ -275,6 +326,11 @@ class QueryPlanner:
                             task.aggregate.periods = relative_periods
                 self._preserve_referent_window(plan, previous_context or {}, message, now)
                 context = self._inherit_conversation(plan, previous_context or {})
+                if len(modes) == 2 and plan.intent == 'analyze_orders':
+                    queried = {PLANNER_TOOL_BY_NAME[call.toolName][0] for call in plan.toolCalls
+                               if call.toolName in PLANNER_TOOL_BY_NAME}
+                    if queried != modes:
+                        raise ValueError('用户要求同时核对两个账本，请分别绑定个人和家庭查询。')
                 self._normalize_explicit_conditions(plan, message)
                 self._normalize_projection(plan, message, context, book_mode, now.date())
                 self._sanitize_conditions(plan, message, book_mode, context)
@@ -587,7 +643,24 @@ class QueryPlanner:
                     task.pop(field, None)
         plan._planning_issues.extend(issues)
 
-    def _normalize_query_scopes(self, plan):
+    def _normalize_query_scopes(self, plan, modes):
+        if len(modes) == 1:
+            target = next(name for name, (mode, _) in PLANNER_TOOL_BY_NAME.items() if mode in modes)
+            foreign = [call for call in plan.toolCalls if call.toolName in PLANNER_TOOL_BY_NAME and call.toolName != target]
+            if foreign:
+                if any(call.toolName == target for call in plan.toolCalls):
+                    # Keep tasks for the requested ledger. A task bound only to
+                    # another ledger must not silently acquire different records.
+                    plan.toolCalls = [call for call in plan.toolCalls if call not in foreign]
+                    removed = {call.id for call in foreign} - {call.id for call in plan.toolCalls}
+                    plan.analyses = [task for task in plan.analyses if not task.queryIds or set(task.queryIds) - removed]
+                    for task in plan.analyses:
+                        task.queryIds = [key for key in task.queryIds if key not in removed]
+                else:
+                    for call in foreign:
+                        call.toolName = target
+                        call.reason = '查询当前指定账本并保留本次筛选条件'
+                plan._planning_issues.append({'type': 'normalized_ledger_scope', 'tool': target})
         for call in plan.toolCalls:
             call.args.cost_type = self._normalize_cost_type(call.args.cost_type)
             call.args.remark = call.args.remark or ''
@@ -721,14 +794,13 @@ class QueryPlanner:
         return explicit, {row['tool'] for row in active if row.get('tool')}
 
     def _materialize_requirements(self, plan, message='', previous=None, book_mode='个人版'):
-        from app.agent.plan_review import CLAUSES, HISTORY_WORDS, NEGATED, _amount_matches, _explicit_amount, _time_evidence
+        from app.agent.plan_review import CLAUSES, HISTORY_WORDS, NEGATED, _amount_matches, _direction_request, _explicit_amount, _time_evidence
 
         if plan.intent != 'analyze_orders':
             return
         self._ground_spending_request(plan, message)
         requirements = set(plan.understanding.evidenceNeeds)
         existing = {task.tool for task in plan.analyses}
-        scoped = {(c.toolName, c.args.cost_type, c.args.remark) for c in plan.toolCalls}
         bindings = {(c.toolName, c.args.cost_type, c.args.remark, tuple(c.sourceIds or [c.id]))
                     for c in plan.toolCalls}
         decisions = HISTORY_BASED_TOOLS | {'budget'}
@@ -767,10 +839,13 @@ class QueryPlanner:
 
         future = bool((existing | requested) & decisions)
         overall = re.search(r"财务|收支|现金流", message) or ("收入" in message and "支出" in message)
-        direction_only = re.search(r"(?:只|仅|单)(?:想|需|要)?(?:看|算|分析|统计|比较).{0,12}(?:收入|支出|开销)", message)
+        diagnosis = re.search(r"(?:财务|收支|现金流)的?(?:情况|状况|概况|健康|体检|诊断|表现)"
+                              r"|(?:整体|总体|全面)(?:财务|收支|现金流)", message)
+        direction_only = _direction_request(message)[1] or re.search(r"(?:只|仅|单)(?:想|需|要)?(?:看|算|分析|统计|比较).{0,12}(?:收入|支出|开销)", message)
         filtered = any(c.args.cost_type != '不限' or c.args.remark for c in plan.toolCalls) or any(
             t.aggregate and t.aggregate.filters.model_dump(exclude_defaults=True) for t in plan.analyses)
-        if 'totals' in requirements and overall and not direction_only and not future and len(scoped) <= 1 and not filtered:
+        if (overall and (diagnosis or 'totals' in requirements) and not direction_only
+                and not future and len(bindings) <= 1 and not filtered):
             requested.add('cashflow')
         if plan.output.chart != 'none' and 'aggregate' not in existing | requested and not future:
             requested.add('trends')

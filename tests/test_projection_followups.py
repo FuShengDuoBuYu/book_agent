@@ -557,7 +557,7 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
             ('预测下个月收入。',{'followUpOfPreviousQuestion':False}),
             ('预测下个月收入。',{}),
             (combined,{'resetAnalysisContext':True}),
-            (combined,{'toolCalls':[{'id':'home','toolName':'search_family_orders'}]}),
+            ('换到家庭账本，'+combined,{'toolCalls':[{'id':'home','toolName':'search_family_orders'}]}),
         ]:
             with self.subTest(question=question,extra=extra):
                 plan=await self.plan(question,{**draft,'analyses':[{'tool':'trends'}],**extra},saved)

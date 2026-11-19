@@ -10,12 +10,89 @@ from app.schemas.plan import AgentPlan, ToolCall
 
 
 class PlanningInheritanceTests(unittest.IsolatedAsyncioTestCase):
-    async def planned(self, draft, previous, message='把刚才的结果展开'):
+    async def planned(self, draft, previous, message='把刚才的结果展开', book_mode='个人版'):
         planner = QueryPlanner.__new__(QueryPlanner)
         planner.chain = SimpleNamespace(ainvoke=AsyncMock(return_value=SimpleNamespace(content=json.dumps(draft))))
         with patch('app.agent.planner.datetime', wraps=datetime) as clock:
             clock.now.return_value = datetime(2026, 11, 19)
-            return await planner.create_plan(message, '', '个人版', previous)
+            return await planner.create_plan(message, '', book_mode, previous)
+
+    async def test_family_member_request_corrects_personal_query_before_calendar_expansion(self):
+        draft = {'intent': 'analyze_orders', 'analysisType': 'category_expense',
+                 'toolCalls': [{'id': 'income', 'toolName': 'search_personal_orders'}],
+                 'understanding': {'objective': '按家庭成员说明收入来源', 'evidenceNeeds': ['members', 'sources']}}
+        question = '在我们家上一个完整月的收入里，谁从哪些地方收到了钱？即使备注相同，也请按人分清楚。'
+        for mode in ['家庭版', '个人版']:
+            with self.subTest(mode=mode):
+                p = await self.planned(draft, {}, question, mode)
+                self.assertEqual([(c.toolName, c.args.year, c.args.month, c.sourceIds) for c in p.toolCalls],
+                                 [('search_family_orders', 2026, 10, ['income'])])
+                self.assertEqual(p._analysis_context['scope'], [['search_family_orders', '不限', '']])
+
+    async def test_current_ledger_and_filters_are_grounded_in_the_request_or_ui(self):
+        tests = [('本月收入有哪些？', '家庭版', 'search_family_orders'),
+                 ('我的收入来源有哪些？', '家庭版', 'search_family_orders'),
+                 ('我个人在家里做饭花了多少？', '家庭版', 'search_personal_orders'),
+                 ('在我们家的账本里只看我个人的收入，各月份分别统计。', '个人版', 'search_family_orders'),
+                 ('对照个人账本与家庭用品的预算明细。', '个人版', 'search_personal_orders'),
+                 ('上次查的是家庭账本，这次核对收入。', '个人版', 'search_personal_orders'),
+                 ('只查个人账本里备注写着“家庭账本”的餐饮消费', '家庭版', 'search_personal_orders'),
+                 ('不要查家庭账本，只看个人账本。', '家庭版', 'search_personal_orders')]
+        for question, mode, tool in tests:
+            with self.subTest(question=question):
+                other = 'search_personal_orders' if tool == 'search_family_orders' else 'search_family_orders'
+                draft = {'toolCalls': [{'id': 'q', 'toolName': other, 'args': {'cost_type': '餐饮', 'remark': '午饭'}}],
+                         'analyses': [{'tool': 'sources', 'queryIds': ['q']}]}
+                p = await self.planned(draft, {}, question, mode)
+                self.assertEqual({(c.toolName, c.args.cost_type, c.args.remark, tuple(c.sourceIds)) for c in p.toolCalls},
+                                 {(tool, '餐饮', '午饭', ('q',))})
+                self.assertEqual(p.analyses[0].queryIds, ['q'])
+
+    async def test_previous_ledger_cannot_override_current_ui_when_no_new_query_is_proposed(self):
+        prior = {'scope': [['search_family_orders', '不限', '']], 'startingBalance': 1000,
+                 'conversation': {'queries': [{'id': 'family', 'toolName': 'search_family_orders'}],
+                                  'analyses': [{'tool': 'purchase', 'queryIds': ['family']}]}}
+        p = await self.planned({'followUpOfPreviousQuestion': True, 'analyses': [{'tool': 'purchase'}]},
+                               prior, '按相同的方法再判断能否购买。', '个人版')
+        self.assertEqual({c.toolName for c in p.toolCalls}, {'search_personal_orders'})
+        self.assertIsNone(p.analyses[0].startingBalance)
+
+    async def test_mixed_ledgers_require_an_actual_request_for_both(self):
+        queries = [{'id': 'p', 'toolName': 'search_personal_orders'}, {'id': 'f', 'toolName': 'search_family_orders'}]
+        draft = {'toolCalls': queries, 'analyses': [{'tool': 'sources', 'queryIds': [key]} for key in ['p', 'f']]}
+        for question, both in [('分别核对个人账本和家庭账本的收入来源。', True), ('核对收入来源。', False)]:
+            with self.subTest(question=question):
+                p = await self.planned(draft, {}, question, '家庭版')
+                self.assertEqual({c.toolName for c in p.toolCalls}, {q['toolName'] for q in queries} if both else {'search_family_orders'})
+                self.assertEqual({tuple(t.queryIds) for t in p.analyses}, {('p',), ('f',)} if both else {('f',)})
+
+    async def test_one_ledger_cannot_stand_in_for_an_explicit_two_ledger_comparison(self):
+        p = await self.planned({'toolCalls': [{'id': 'p', 'toolName': 'search_personal_orders'}],
+                                'analyses': [{'tool': 'cashflow', 'queryIds': ['p']}]},
+                               {}, '分别核对个人账本与家庭账本的本月收支。')
+        self.assertFalse(p.toolCalls)
+        self.assertTrue(any('两个账本' in issue.get('detail', '') for issue in p._planning_issues))
+
+    async def test_overall_financial_diagnosis_has_a_cashflow_baseline_without_a_totals_tag(self):
+        question = '综合看看我最近半年的财务情况，最值得注意的三个问题是什么？'
+        draft = {'understanding': {'evidenceNeeds': ['changes', 'anomalies', 'sources']},
+                 'analyses': [{'tool': 'aggregate'}, {'tool': 'trends'}]}
+        plan = await self.planned(draft, {}, question)
+        self.assertEqual([t.tool for t in plan.analyses].count('cashflow'), 1)
+        self.assertEqual(plan.analysisWindow.startDate, date(2026, 5, 1))
+        self.assertEqual(plan.analysisWindow.endDate, date(2026, 11, 19))
+        for text, extra in [
+            ('分析财务情况，只看收入来源。', {}),
+            ('我的收入主要从哪里来？', {}),
+            (question, {'toolCalls': [{'id': 'x', 'toolName': 'search_personal_orders', 'args': {'remark': '稿费'}}]}),
+            (question, {'analyses': [{'tool': 'aggregate', 'aggregate': {'filters': {'includeCategories': ['餐饮']}}}]}),
+            ('分别对照个人账本与家庭账本的财务状况。', {'toolCalls': [
+                {'id': 'mine', 'toolName': 'search_personal_orders'}, {'id': 'home', 'toolName': 'search_family_orders'}]}),
+            ('未来三个月的财务状况能存下多少？', {'analyses': [{'tool': 'projection', 'months': 3}]})]:
+            with self.subTest(text=text, extra=extra):
+                plan = await self.planned({**draft, **extra}, {}, text)
+                self.assertTrue(plan.toolCalls)
+                self.assertNotIn('cashflow', [t.tool for t in plan.analyses])
 
     async def test_semantic_review_corrects_tools_and_target_before_date_expansion(self):
         from app.agent.plan_review import PlanReviewDecision
@@ -209,7 +286,7 @@ class PlanningInheritanceTests(unittest.IsolatedAsyncioTestCase):
             'purchaseAmount': 700, 'conversation': {'analyses': [{'tool': 'purchase', 'queryIds': ['family'],
                 'startingBalance': 1000, 'purchaseAmount': 700}],
                 'queries': [{'id': 'family', 'toolName': 'search_family_orders', 'args': {}}]}}
-        plan = await self.planned({'followUpOfPreviousQuestion': True}, previous)
+        plan = await self.planned({'followUpOfPreviousQuestion': True}, previous, book_mode='家庭版')
         self.assertEqual(plan.intent, 'analyze_orders')
         self.assertTrue(plan.toolCalls)
         self.assertEqual({call.toolName for call in plan.toolCalls}, {'search_family_orders'})

@@ -210,9 +210,11 @@ def build_facts(results):
             for row in e.get('sources', [])[:8]:
                 label = '收入' if row['metric'] == 'income' else '支出'
                 summary = f"{row.get('member', '归属未知')}的{label}来源“{row['source']}”已记录 {money(row['amount'])} 元，备注依据："
-                add(summary + '；'.join(row.get('remarks', [])) + '。',
-                    binding={key: row[key] for key in ('metric', 'member', 'memberKey', 'source', 'sourceKey') if key in row},
-                    model_text=summary + '；'.join(str(remark)[:80] for remark in row.get('remarks', [])[:2]) + '。',
+                preview = [str(remark)[:160] for remark in row.get('remarks', [])[:4]]
+                add(summary + literal(json.dumps(row.get('remarks', []), ensure_ascii=False)) + '。',
+                    binding={**{key: row[key] for key in ('metric', 'member', 'memberKey', 'source', 'sourceKey') if key in row},
+                             'originalRemarks': preview, 'omittedRemarkCount': max(0, len(row.get('remarks', [])) - len(preview))},
+                    model_text=summary + literal(json.dumps(preview, ensure_ascii=False)) + '。',
                     values=[q('金额', row['amount']), q('账单笔数', row.get('recordCount'), '笔')] + [q('账单月份', month, 'month') for month in row.get('monthlyAmounts', {})])
             if e.get('omittedSourceCount'):
                 add(f"来源摘要另有 {e['omittedSourceCount']} 项未展开，不能据摘要断言不存在其他来源。", True, values=[q('省略来源', e['omittedSourceCount'], '项')])

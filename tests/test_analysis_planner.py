@@ -132,7 +132,8 @@ class AnalysisPlannerTests(unittest.TestCase):
         normalized = QueryPlanner.__new__(QueryPlanner)._normalize_plan(plan, datetime(2026, 11, 12), "分析我的财务情况", "家庭版")
         self.assertTrue(normalized.needsTools)
         self.assertEqual({c.toolName for c in normalized.toolCalls}, {"search_family_orders"})
-        self.assertEqual(len(normalized.analyses), 4)
+        self.assertCountEqual([t.tool for t in normalized.analyses],
+                              ["trends", "changes", "anomalies", "recurring", "cashflow"])
 
     def test_scenario_preserves_explicit_assumptions(self):
         plan = AgentPlan.model_validate({"analyses": [{"tool": "scenario", "changes": [

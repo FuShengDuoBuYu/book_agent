@@ -138,10 +138,36 @@ class ArtifactTests(unittest.TestCase):
         forecast_table, lineage = artifacts
         for remark in stages:
             self.assertIn(remark, forecast_table['rows'][0]['basis'])
-            self.assertIn(remark, lineage['rows'][0]['remark'])
-        self.assertEqual(lineage['rows'][0]['source'], '星港项目')
+        self.assertEqual(lineage['rows'], [{'remark': remark, 'member': '成员甲', 'source': '星港项目',
+                                           'direction': '收入'} for remark in stages])
         self.assertTrue(any('4 条' in note and '160 字' in note for note in lineage['notes']))
         self.assertTrue(any('12' in note and '来源' in note for note in lineage['notes']))
+
+    def test_primary_sources_publish_individual_remarks_and_keep_source_amounts_separate(self):
+        result = {'tool': 'sources', 'mode': '家庭版', 'evidence': {'sources': [
+            {'source': '画册', 'member': '春枝', 'metric': 'income', 'amount': 500, 'recordCount': 4,
+             'remarks': ['起稿；修改', '=SUM(A1)', '起稿；修改', '']},
+            {'source': '画册', 'member': '云川', 'metric': 'income', 'amount': 80, 'remarks': ['起稿；修改']},
+            {'source': '排版', 'member': '春枝', 'metric': 'expense', 'amount': 20, 'remarks': ['排版']},
+            {'source': '无备注来源', 'member': '春枝', 'metric': 'income', 'amount': 70, 'remarks': []},
+        ]}}
+        artifacts = build_artifacts([result], {'metric': 'income', 'includeSources': True})
+        summary, mapping = artifacts
+        self.assertEqual([row['amount'] for row in summary['rows']], [500, 80, 70])
+        self.assertEqual([(r['member'], r['remark']) for r in mapping['rows']],
+                         [('春枝', '起稿；修改'), ('春枝', '=SUM(A1)'), ('云川', '起稿；修改')])
+        self.assertEqual({col['key'] for col in mapping['columns']}, {'remark', 'member', 'source', 'direction'})
+
+    def test_forecast_can_show_bounded_lineage_without_a_separate_catalog(self):
+        forecast = forecast_result()
+        components = forecast['evidence']['sourceForecasts']
+        components[:] = [dict(components[0], source=f'来源{i}', remarks=[f'阶段{j}' for j in range(4)])
+                         for i in range(65)]
+        plain = build_artifacts([forecast], {'metric': 'income'})
+        self.assertEqual(len(plain), 1)
+        summary, mapping = build_artifacts([forecast], {'includeLineage': True, 'metric': 'income'})
+        self.assertEqual(len(mapping['rows']), 240)
+        self.assertTrue(any('20' in n and '省略' in n for n in mapping['notes']))
 
     def test_forecast_audit_preserves_excluded_historical_amount_and_translates_statuses(self):
         forecast = forecast_result()

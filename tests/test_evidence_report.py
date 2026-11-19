@@ -123,6 +123,14 @@ class EvidenceReportTests(unittest.TestCase):
         facts = build_facts([{'tool': 'sources', 'evidence': {'sources': [], 'memberTotals': [], 'sourceCount': 0}}])
         self.assertTrue(any(f['required'] and '未知' in f['text'] for f in facts))
 
+    def test_source_inspection_keeps_separate_original_remarks_in_the_model_view(self):
+        remarks = ['星港海报初排', '星港海报调版', '星港海报完稿']
+        facts = build_facts([{'tool': 'sources', 'metric': 'income', 'evidence': {'sources': [
+            {'metric': 'income', 'member': '甲', 'source': '星港海报', 'amount': 3000,
+             'recordCount': 6, 'remarks': remarks}]}}])
+        self.assertEqual(facts[0]['binding']['originalRemarks'], remarks)
+        self.assertIn('星港海报完稿', facts[0]['modelText'])
+
     def test_required_evidence_can_fill_additional_sections_without_losing_the_model_answer(self):
         facts = [{'id': f'f{i}', 'text': f'已核对条件{"甲" * i}。', 'required': True} for i in range(1, 17)]
         draft = self.draft(analysis='应根据已核对条件逐项评估后续安排。')
