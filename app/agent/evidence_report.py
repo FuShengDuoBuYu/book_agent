@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from time import perf_counter
 from app.agent.artifacts import render_artifacts_markdown
 from app.agent.analysis_findings import build_analysis_findings
+from app.agent.attention_points import build_attention_points, requested_attention_count
 from app.agent.report_context import build_report_context
 from app.agent.report_composition import (compose_report, grounded_analysis, ReportOutline,
                                           outline_schema, OUTLINE_PROMPT, OUTLINE_TOKENS)
@@ -455,6 +456,9 @@ class EvidenceReporter:
                     + ('未给出明确存款目标，尚不能计算所需月结余能降低多少。' if context.get('targetAmount') is None else ''),
                     'values': [q('原期限', previous, '个月'), q('新期限', projection['months'], '个月'),
                                q('新增结余增量', extra), q('月度结余', projection['monthlyNet'])]})
+        attention = build_attention_points(question, focused, facts, findings)
+        attention_ids = {key for point in attention for key in point['factIds']}
+        facts = [{**row, 'required': row['required'] or row['id'] in attention_ids} for row in facts]
         all_facts, attempts, budget_stats = facts, [], {}
         status = 'planned'
         try:
@@ -485,9 +489,20 @@ class EvidenceReporter:
                     paragraphs.append(explanation)
             reply = '以下是本次账本核算与分析：\n\n' + '\n\n'.join(paragraphs)
             report, status = None, 'fallback'
+        count = requested_attention_count(question)
+        if count:
+            by_id = {row['id']: row for row in all_facts}
+            lines = ['**综合关注点**', '按已核算的资金约束、已记变化、来源结构和待核查线索依次整理：']
+            for index, point in enumerate(attention, 1):
+                scope = by_id[point['factIds'][0]]['binding']['scope']
+                lines.append(f"{index}. **【{scope}】{point['title']}**：{point['reason']}")
+            if len(attention) < count:
+                lines.append(f'现有证据仅支持 {len(attention)} 项关注点，不能据此凑出 {count} 项财务问题。')
+            reply = '\n\n'.join(lines) + '\n\n' + reply
         table_text = render_artifacts_markdown(artifacts)
         return reply + ('\n\n' + table_text if table_text else ''), {
             'status': 'grounded', 'mechanism': 'computed_findings', 'compositionStatus': status,
             'facts': facts, 'findings': findings, 'report': report, 'attempts': attempts,
+            'attentionPoints': attention,
             'compositionPlan': getattr(self, '_last_composition_plan', None),
             'calls': list(getattr(self, '_last_composition_calls', [])), 'contextBudget': budget_stats}

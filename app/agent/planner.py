@@ -16,7 +16,7 @@ from app.agent.intent_resolution import IntentResolver
 from app.agent.conversation_context import compact_user_context
 from app.agent.plan_parsing import repair_descriptive_arrays
 from app.agent.report_context import build_report_context
-from app.agent.plan_review import NUMBER, PlanReviewer, _duration_evidence, calendar_context, explicit_month_delta, explicit_projection_start, named_percent_changes, sanitize_user_conditions
+from app.agent.plan_review import NUMBER, PlanReviewer, _duration_evidence, calendar_context, explicit_month_delta, explicit_projection_start, named_percent_changes, sanitize_user_conditions, unrequested_future_aggregate
 from app.agent.prompts import PLANNER_HUMAN_PROMPT, PLANNER_SYSTEM_PROMPT
 from app.schemas.plan import (
     AgentPlan,
@@ -564,6 +564,15 @@ class QueryPlanner:
         # normalize 的目的，是把“不稳定的 LLM 输出”整理成“稳定的程序输入”。
         self._coalesce_forecasts(plan)
         self._materialize_requirements(plan, message, plan._analysis_context, book_mode)
+        kept = []
+        for task in plan.analyses:
+            if unrequested_future_aggregate(task, plan, message, now.date()):
+                plan._planning_issues.append({'type': 'unrequested_future_aggregate', 'tool': task.tool,
+                    'queryIds': task.queryIds, 'periods': [p.model_dump(mode='json') for p in task.aggregate.periods],
+                    'detail': '未来估计由预测或推演计算，本轮没有要求统计未来日期已登记的记录。'})
+            else:
+                kept.append(task)
+        plan.analyses = kept
         if plan.analysisType == "financial_analysis" and not plan.analyses:
             plan.analyses = [AnalysisRequest(tool=name) for name in ("cashflow", "trends", "changes", "anomalies", "recurring")]
         if plan.analyses:

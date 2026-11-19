@@ -793,6 +793,29 @@ class ProjectionFollowups(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((leader['weekday'], leader['expense'], leader['count']), ('星期一', 440, 2))
                 self.assertEqual(evidence['appliedFilters'], task['aggregate']['filters'])
 
+    async def test_forecast_uses_projection_instead_of_unrequested_future_recorded_aggregation(self):
+        periods = [{'label': '十二月', 'startDate': '2026-12-01', 'endDate': '2026-12-31'},
+                   {'label': '一月', 'startDate': '2027-01-01', 'endDate': '2027-01-31'}]
+        future = {'tool': 'aggregate', 'queryIds': ['ledger'], 'metric': 'net',
+                  'aggregate': {'periods': periods, 'groupBy': ['month']}}
+        historical = {**future, 'aggregate': {'groupBy': ['category'], 'periods': [
+            {'label': '十月', 'startDate': '2026-10-01', 'endDate': '2026-10-31'}]}}
+        draft = {'analyses': [{'tool': 'projection', 'months': 3}, historical, future],
+                 'toolCalls': [{'id': 'ledger', 'toolName': 'search_personal_orders'}],
+                 'understanding': {'evidenceNeeds': ['aggregate', 'projection']}}
+        for question, retain in [('未来三个月，我大概能存下多少钱？', False),
+                ('根据过去半年已记的收入，预计未来三个月结余；另外统计十月各类支出。', False),
+                ('预测未来三个月的结余，另列出未来两个月已录入的预约扣款。', True),
+                ('预测未来三个月的结余，另外统计已记入12月账本的支出。', True)]:
+            with self.subTest(question=question):
+                plan = await self.plan(question, draft, {})
+                actual = [t for t in plan.analyses if t.tool == 'aggregate']
+                self.assertEqual([t.aggregate.periods[0].label for t in actual], ['十月', '十二月'] if retain else ['十月'])
+                self.assertTrue(any(t.tool == 'projection' for t in plan.analyses))
+                self.assertEqual(any(i['type'] == 'unrequested_future_aggregate' for i in plan._planning_issues), not retain)
+                if not retain:
+                    self.assertFalse(any((q.args.year, q.args.month) >= (2026, 12) for q in plan.toolCalls))
+
     async def test_open_savings_duration_drops_invented_deadlines_and_keeps_grounded_ones(self):
         question = '现在有10000元，保持当前收支，多久能存到20000元？'
         draft = {'analyses': [{'tool': 'savings', 'months': 12}]}

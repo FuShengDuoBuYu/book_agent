@@ -87,10 +87,21 @@ class _Brief:
     group: str | None
 
 
+def _primary_rank(identifiers, facts):
+    rank = 2
+    for key in identifiers:
+        binding = facts[key].get('binding', {})
+        if binding.get('primary') is True and binding.get('tool') in DECISION_TOOLS:
+            if binding.get('headline') is True:
+                return 0
+            rank = 1
+    return rank
+
+
 def _bind_briefs(outline, facts):
     dependencies = _headline_dependencies(list(facts.values()))
     briefs = []
-    for section in outline.sections:
+    for section in sorted(outline.sections, key=lambda item: _primary_rank(item.factIds, facts)):
         selected = tuple(dict.fromkeys(section.factIds))
         bound = tuple(dict.fromkeys((*selected, *(head for key in selected for head in dependencies.get(key, ())))))
         if len(bound) > 8:
@@ -171,17 +182,31 @@ async def compose_report(payload, invoke, *, num_ctx=8192) -> ReportDraft:
     bound_facts = {row['id']: row for row in facts}
     briefs = _bind_briefs(outline, bound_facts)
     used = {key for brief in briefs for key in brief.fact_ids}
-    missing = [row['id'] for row in facts if row.get('required') and row['id'] not in used]
-    remaining = [missing[index:index + 8] for index in range(0, len(missing), 8)]
-    if len(briefs) + len(remaining) > 6:
-        raise ValueError('必需证据超出报告段落容量')
+    missing = {}
+    for row in facts:
+        if row.get('required') and row['id'] not in used:
+            scope = _serialized(_subset(row.get('binding', {}), SCOPE_FIELDS))
+            missing.setdefault(scope, []).append(row['id'])
+    ordered = [((_primary_rank(brief.selected_ids, bound_facts), _primary_rank(brief.fact_ids, bound_facts)),
+                brief.title, brief.fact_ids) for brief in briefs]
+    for identifiers in missing.values():
+        identifiers.sort(key=lambda key: _primary_rank((key,), bound_facts))
+        for index in range(0, len(identifiers), 8):
+            block = identifiers[index:index + 8]
+            rank = _primary_rank(block, bound_facts)
+            ordered.append(((rank, rank), '补充账本依据', block))
 
     findings = payload.get('analysisFindings', {})
-    seen = set()
-    sections = [(brief.title, brief.fact_ids) for brief in briefs]
-    sections.extend(('补充账本依据', identifiers) for identifiers in remaining)
-    return ReportDraft(sections=[
-        {'title': title, 'factIds': list(identifiers),
-         'analysis': grounded_analysis(identifiers, bound_facts, findings, seen)}
-        for title, identifiers in sections
-    ])
+    seen_facts, seen_groups = set(), set()
+    sections = []
+    for _, title, identifiers in sorted(ordered, key=lambda item: item[0]):
+        first_use = [key for key in sorted(identifiers, key=lambda key: _primary_rank((key,), bound_facts))
+                     if key not in seen_facts]
+        if not first_use:
+            continue
+        seen_facts.update(first_use)
+        sections.append({'title': title, 'factIds': first_use,
+                         'analysis': grounded_analysis(first_use, bound_facts, findings, seen_groups)})
+    if len(sections) > 6:
+        raise ValueError('必需证据超出报告段落容量')
+    return ReportDraft(sections=sections)

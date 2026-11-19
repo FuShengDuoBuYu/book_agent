@@ -134,6 +134,23 @@ class InvestigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.additionalAnalyses, [])
         self.assertTrue(audit['issues'])
 
+    async def test_refinement_cannot_add_future_booked_totals_to_a_projection(self):
+        from app.agent.investigation import EvidenceInvestigator, InvestigationDecision
+        plan = AgentPlan(toolCalls=[{'id': 'ledger', 'toolName': 'search_personal_orders'}], analyses=[{'tool': 'projection'}])
+        def proposal(month):
+            return {'tool': 'aggregate', 'queryIds': ['ledger'], 'aggregate': {'periods': [{
+                'label': month, 'startDate': month+'-01', 'endDate': month+'-28'}]}}
+        for question, allowed in [('未来三个月能存下多少钱？', ['2026-10']),
+                ('预测接下来三个月，另查下个月已经登记的账单。', ['2026-10', '2026-12'])]:
+            with self.subTest(question=question):
+                agent = EvidenceInvestigator()
+                agent._invoke = AsyncMock(return_value=InvestigationDecision(additionalAnalyses=[
+                    proposal('2026-10'), proposal('2026-12')]))
+                results = [{'tool': 'projection', 'evidence': {'asOf': '2026-11-19'}}]
+                decision, audit = await agent.refine(question, '', plan, [], results=results)
+                self.assertEqual([t.aggregate.periods[0].label for t in decision.additionalAnalyses], allowed)
+                self.assertEqual(any('未来' in issue for issue in audit['issues']), len(allowed) == 1)
+
     async def test_aggregate_dates_are_json_safe_in_model_payload_and_saved_audit(self):
         import json
         from app.agent.investigation import EvidenceInvestigator, InvestigationDecision

@@ -3,13 +3,15 @@
 import asyncio
 import json
 import re
+from datetime import date, datetime
 from time import perf_counter
+from zoneinfo import ZoneInfo
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.agent.source_grouping import grounded_source_groups
-from app.agent.plan_review import canonicalize_aggregate_defaults
+from app.agent.plan_review import canonicalize_aggregate_defaults, unrequested_future_aggregate
 from app.core.config import get_settings
 from app.core.llm import get_structured_model
 from app.schemas.plan import SourceGroup
@@ -169,10 +171,15 @@ class EvidenceInvestigator:
                 issues.extend(corrections)
                 plan.sourceGroups = [group for group in applied_groups if group not in decision.sourceGroups]
                 decision.sourceGroups = [group for group in decision.sourceGroups if group in applied_groups]
+            as_of = next((r['evidence']['asOf'] for r in (results or []) if r.get('evidence', {}).get('asOf')), None)
+            today = date.fromisoformat(as_of) if as_of else datetime.now(ZoneInfo('Asia/Shanghai')).date()
             safe = []
             for task in decision.additionalAnalyses:
                 if task.tool not in READ_ONLY_ANALYSES or set(task.queryIds) - known_ids:
                     issues.append('补查任务超出已授权查询或只读分析范围，已忽略')
+                    continue
+                if unrequested_future_aggregate(task, plan, question, today):
+                    issues.append('补查的聚合区间全部在未来，用户未要求查询该期间已登记的记录，已忽略此项补查。')
                     continue
                 if task.tool == 'aggregate' and task.aggregate:
                     try:

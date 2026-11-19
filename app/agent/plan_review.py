@@ -328,6 +328,39 @@ def _placeholder_is_literal(value, dimension, question):
     return bool(re.search(rf"{kind}\s*(?:{named}(?:{quoted}|{name}{end})|{quoted})|{quoted}\s*(?:这个|这一)?{kind}", question))
 
 
+def unrequested_future_aggregate(task, plan, question, today):
+    """Recorded totals over wholly future periods cannot answer an outlook."""
+    if task.tool != "aggregate" or not task.aggregate or not task.aggregate.periods:
+        return False
+    if any(p.startDate <= today for p in task.aggregate.periods):
+        return False
+    if not any(t.tool in {"forecast", "projection"} for t in plan.analyses):
+        return False
+
+    # Attribute "已记" to its own date/request. A historical sample joined to
+    # a future forecast is not permission to aggregate future ledger records.
+    for clause in re.split(r"[，。；！？,;\n]|预测|预计|预估|推演|估算", question):
+        if not re.search(r"已(?:经)?(?:记|录入|登记|入账|安排)|预订|预定|预约|待扣款|已排期", clause):
+            continue
+        future = re.search(r"未来|接下来|今后|明年|明天|下(?:下?个?)?(?:月|周|季度)|下半年", clause)
+        if future and not re.search(r"过去|以往|历史|去年|上个?月", clause[future.end():]):
+            return False
+        # A named month must actually intersect one of this task's future periods.
+        for match in re.finditer(rf"(?:(\d{{4}})\s*[-年/]\s*)?({NUMBER})\s*月", clause):
+            month = _number(match[2])
+            if not month or month != int(month) or not 1 <= month <= 12:
+                continue
+            year = int(match[1]) if match[1] else today.year + (month < today.month)
+            key = (year, int(month))
+            if any((p.startDate.year, p.startDate.month) <= key <= (p.endDate.year, p.endDate.month)
+                   for p in task.aggregate.periods):
+                return False
+        if (re.search(r"查|列出|核对|查看|统计|汇总", clause) and re.search(r"预订|预定|预约|待扣款|已排期", clause)
+                and not re.search(r"过去|以往|历史|去年|上个?月|\d+\s*月", clause)):
+            return False
+    return True
+
+
 def canonicalize_aggregate_defaults(filters, question, prior_filters=None):
     """Normalize empty native-schema fillers before planning or examining a review diff."""
     changed = []

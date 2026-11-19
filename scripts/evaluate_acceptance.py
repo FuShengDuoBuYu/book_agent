@@ -49,6 +49,8 @@ def assess(record):
     if name == 'diagnosis':
         checks['completeMonthlyAverage'] = results.get('cashflow', {}).get('completeMonthAverage', {}).get('net') == 3850
         checks['changeExplained'] = has('changes', 'expenseChange', 900)
+        points = metadata.get('validation', {}).get('attentionPoints', [])
+        checks['threeEvidenceBackedAttentionPoints'] = len(points) == 3 and all(p.get('factIds') and p.get('reason') for p in points)
     if name == 'drivers':
         checks['changeExplained'] = has('changes', 'expenseChange', 900)
     if name == 'resilience':

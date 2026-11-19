@@ -201,9 +201,9 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
         fake = FakeComposition(section('变化来源', goal, 'f2'), section('收入构成', goal, 'f3'),
                                section('统计口径', goal, 'f4'))
         draft = await compose_fixture(payload, fake.invoke)
-        self.assertEqual([row.factIds for row in draft.sections], [['f2'], ['f3'], ['f4'], ['f1']])
-        self.assertTrue(draft.sections[1].analysis.startswith('【家庭版】'))
-        self.assertTrue(draft.sections[-1].analysis.startswith('【个人版】'))
+        self.assertEqual([row.factIds for row in draft.sections], [['f1'], ['f2'], ['f3'], ['f4']])
+        self.assertTrue(draft.sections[0].analysis.startswith('【个人版】'))
+        self.assertTrue(draft.sections[2].analysis.startswith('【家庭版】'))
 
     async def test_identical_explicit_query_bindings_share_the_primary_decision(self):
         payload = payload_for_composition()
@@ -229,8 +229,8 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
         ]
         fake = FakeComposition(section('统计口径', goal, 'f3'))
         draft = await compose_fixture(payload, fake.invoke)
-        self.assertEqual([row.factIds for row in draft.sections], [['f3'], ['f1', 'f2']])
-        self.assertTrue(draft.sections[-1].analysis)
+        self.assertEqual([row.factIds for row in draft.sections], [['f1', 'f2'], ['f3']])
+        self.assertTrue(draft.sections[0].analysis)
 
     async def test_different_filters_do_not_inherit_headline_in_same_book_and_window(self):
         payload = payload_for_composition()
@@ -241,8 +241,8 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
         ]
         fake = FakeComposition(section('统计口径', goal, 'f2'))
         draft = await compose_fixture(payload, fake.invoke)
-        self.assertEqual([row.factIds for row in draft.sections], [['f2'], ['f1']])
-        self.assertTrue(draft.sections[-1].analysis)
+        self.assertEqual([row.factIds for row in draft.sections], [['f1'], ['f2']])
+        self.assertTrue(draft.sections[0].analysis)
 
     async def test_headline_dependency_over_capacity_raises_without_discarding_facts(self):
         payload = payload_for_composition()
@@ -274,6 +274,48 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
         draft = await compose_fixture(payload, fake.invoke)
         self.assertEqual([row.factIds for row in draft.sections], [['f1']])
         self.assertEqual(draft.sections[0].analysis.count('本组账单已核对。'), 1)
+
+    async def test_shared_headlines_only_appear_at_first_use_when_briefs_cannot_merge(self):
+        payload = payload_for_composition()
+        goal = payload['understanding']['requestedAnswers'][0]
+        payload['facts'] = [
+            bound_fact('f1', '条件推演合计。', 'g1', 'projection', headline=True),
+            bound_fact('f2', '已采用用户所设条件。', 'g1', 'projection', headline=True),
+        ] + [
+            bound_fact(f'f{i}', '推演的分项数据。', 'g1', 'projection') for i in range(3, 8)
+        ] + [
+            bound_fact(f'f{i}', '历史已记的收支。', 'g2', 'cashflow', primary=False) for i in range(8, 12)
+        ]
+        payload['analysisFindings'] = {
+            'g1': {'tool': 'projection', 'scope': '个人版', 'observations': ['结果已经按本次条件推演。']},
+            'g2': {'tool': 'cashflow', 'scope': '个人版', 'observations': ['历史现金流是参考依据。']},
+        }
+        main = [f'f{i}' for i in range(1, 8)]
+        support = [f'f{i}' for i in range(8, 12)]
+        fake = FakeComposition(section('条件与方案', goal, *main), section('统计口径', goal, *support))
+        draft = await compose_report(payload, fake.invoke)
+        self.assertEqual([entry.factIds for entry in draft.sections], [main, support])
+        self.assertIn('结果已经按本次条件推演。', draft.sections[0].analysis)
+        self.assertNotIn('已按本次条件推演', draft.sections[1].analysis)
+        self.assertIn('历史现金流是参考依据。', draft.sections[1].analysis)
+
+    async def test_primary_decision_leads_even_when_merged_with_earlier_support(self):
+        payload = payload_for_composition()
+        goal = payload['understanding']['requestedAnswers'][0]
+        payload['facts'] = [
+            bound_fact('f1', '已核算改善目标。', 'g1', 'optimization', headline=True),
+            bound_fact('f2', '历史完整月份的收支。', 'g2', 'cashflow', primary=False),
+        ]
+        payload['analysisFindings'] = {
+            'g1': {'tool': 'optimization', 'scope': '个人版', 'observations': ['改善目标以已核对的候选开销评估。']},
+            'g2': {'tool': 'cashflow', 'scope': '个人版', 'observations': ['历史收支只提供比较口径。']},
+        }
+        fake = FakeComposition(section('统计口径', goal, 'f2'), section('条件与方案', goal, 'f1'))
+        draft = await compose_report(payload, fake.invoke)
+        main, = draft.sections
+        self.assertEqual((main.title, main.factIds), ('条件与方案', ['f1', 'f2']))
+        self.assertTrue(main.analysis.startswith('【个人版】改善目标'))
+        self.assertIn('历史收支只提供比较口径。', main.analysis)
 
 
 class GroundedAnalysisTests(unittest.TestCase):
