@@ -330,7 +330,7 @@ class QueryPlanner:
                             task.aggregate.periods = relative_periods
                 self._restore_forecast_explanation(plan, previous_context, message, now.date())
                 self._preserve_referent_window(plan, previous_context or {}, message, now)
-                context = self._inherit_conversation(plan, previous_context or {})
+                context = self._inherit_conversation(plan, previous_context or {}, message)
                 self._normalize_referenced_periods(plan, context, message, now.date())
                 if len(modes) == 2 and plan.intent == 'analyze_orders':
                     queried = {PLANNER_TOOL_BY_NAME[call.toolName][0] for call in plan.toolCalls
@@ -982,7 +982,7 @@ class QueryPlanner:
                     if len(values) == 1 and _explicit_amount(message, field, next(iter(values))):
                         setattr(tasks[0], field, values.pop())
 
-    def _inherit_conversation(self, plan, previous):
+    def _inherit_conversation(self, plan, previous, message=''):
         """Only inherit a referent's range and grouping within its ledger/filter scope."""
         conversation = previous.get('conversation', {})
         if not (plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext and conversation):
@@ -1009,9 +1009,28 @@ class QueryPlanner:
         active = previous.get('activeAnalyses') or [row for row in conversation.get('analyses', []) if row.get('tool') != 'sources']
         previous_window = previous.get('activeHistoryWindow', conversation.get('analysisWindow'))
         same_window = not plan.analysisWindow or plan.analysisWindow.model_dump(mode='json') == previous_window
-        if not plan.sourceGroups:
+        confirmed = conversation.get('sourceGroups', [])
+        regrouped = False
+        for clause in re.split(r'[，。；,;\n]', message):
+            if re.search(r'(?:不要|不用|无需|不必|别)(?:再)?(?:重新|更改|修改|调整|取消|撤销|重置).{0,6}(?:分组|归组|归并|合并)', clause):
+                continue
+            named = (any(group['label'] in clause for group in confirmed)
+                     or re.search(r'(?:刚才|原来|之前|上轮|这些|这几项|那几项).{0,20}(?:项目|来源|阶段|工序|归并|分组)', clause))
+            revise = re.search(r'(?:重新|更改|修改|调整|取消|撤销|重置).{0,6}(?:分组|归组|归并|合并)'
+                               r'|(?:只|仅)(?:把|将).{1,40}(?:合为|合成|合并|归并|归为)', clause)
+            ungroup = named and re.search(r'(?:不再|不要|别).{0,40}(?:合为|合成|合并|归并|归为|认作|算作|视为)', clause)
+            separate = (named and re.search(r'单列|单独核算|分开核算', clause)
+                        and not re.search(r'(?:不要|不用|不再|别).{0,20}(?:单列|单独核算|分开核算)'
+                                          r'|(?:合计|总计|总额).{0,4}(?:单列|单独核算|分开核算)', clause))
+            regrouped |= bool(revise or ungroup or separate)
+        if confirmed and not regrouped:
             from app.schemas.plan import SourceGroup
-            plan.sourceGroups = [SourceGroup.model_validate(row) for row in conversation.get('sourceGroups', [])]
+            restored = [SourceGroup.model_validate(row) for row in confirmed]
+            if plan.sourceGroups != restored:
+                plan._planning_issues.append({'type': 'restored_confirmed_source_groups', 'count': len(restored)})
+            # Planner proposals have not seen the current catalog. They cannot
+            # replace a confirmed referent; execution still regrounds these keys.
+            plan.sourceGroups = restored
         sources_only = bool(plan.analyses) and all(task.tool == 'sources' for task in plan.analyses)
         if sources_only and not same_window:
             # The explicit historical range establishes a new referent for future turns.

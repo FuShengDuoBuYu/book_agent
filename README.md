@@ -27,6 +27,21 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
 
 `LLM_PROVIDER=openai_compatible` 使用配置的兼容网关。原生 Ollama 可用 `LLM_PROVIDER=ollama`、`LLM_BASE_URL=http://127.0.0.1:11434` 和 `LLM_MODEL`；已有的 `OLLAMA_BASE_URL`、`OLLAMA_MODEL` 等仍可作为回退配置。
 
+官方 OpenAI API 使用独立的 Responses 适配器，支持严格 JSON Schema。低费用配置如下；密钥只放服务器环境，不能写进 Android 或仓库。
+
+```dotenv
+LLM_PROVIDER=openai
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_MODEL=gpt-6-luna
+LLM_API_KEY=<server-only secret>
+LLM_REASONING_EFFORT=none
+PLANNER_NUM_PREDICT=2048
+OLLAMA_NUM_CTX=8192
+```
+
+`OLLAMA_NUM_CTX` 同时是当前规划器的上下文预算，API 模式也使用它裁剪上下文。可选 API 模型限定为 Luna、Terra、Sol；应先用同一组回归比较，再提高费用档位。API 模式省略不兼容的温度参数，关闭服务端存储和外部追踪；本应用仍保存授权历史，模型请求仍需发送本轮必要的账本证据。
+
+
 ## 分析与历史对话
 
 页面顶部的“历史对话”可回看、续聊和分页加载旧消息，“新对话”创建独立上下文。历史按服务端验证的账号及个人/家庭账本范围隔离。刷新页面自动恢复最近会话。
@@ -65,7 +80,7 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
 
 这项约束来自实际模型回放：正确取数后，模型仍曾把历史医疗增长误说成已计入未来，或把月结余能力不变误说成延后目标的储蓄压力不变。模型自审也未可靠拦住这些错误，因此移除了自由正文写作、数量占位符修复及整篇模型自审。意图理解、计划核对和来源调查仍使用模型；财务结论由可核对的计算发现生成。提纲超时、越权引用或缺少绑定时直接返回相关核算、解释、缺失条件和表格，不再重复消耗模型做正文纠错。
 
-内部 `validation.status=grounded` 表示报告与计算发现一致，不代表用户意图理解已经完美。`compositionStatus=planned/fallback` 区分模型提纲和程序回退，`compositionPlan` 保留目标与证据引用，`findings` 保留分析发现，`calls` 记录提纲耗时与 token 数。`analysisVersion=5`、`releaseRevision`、意图/规划/调查记录和模型配置保存在私有回答元数据，供后续定位问题；本地未设发布 SHA 时 `releaseRevision=null`。这些内部记录不通过页面历史 API 公开。
+内部 `validation.status=grounded` 表示报告与计算发现一致，不代表用户意图理解已经完美。`compositionStatus=planned/fallback` 区分模型提纲和程序回退，`compositionPlan` 保留目标与证据引用，`findings` 保留分析发现，`calls` 记录提纲耗时与 token 数。独立的 `modelUsage` 记录各阶段调用次数、输入/输出、缓存与推理 token、耗时和估算 API 费用；推理 token 已计入输出，不重复收费。缺少用量的失败调用标记费用未知，本地 Qwen 的 API 调用费为零，不含电费和硬件成本。`analysisVersion=5`、`releaseRevision`、意图/规划/调查记录和模型配置保存在私有回答元数据，供后续定位问题；本地未设发布 SHA 时 `releaseRevision=null`。这些内部记录不通过页面历史 API 公开。
 
 ## 模型回归
 
@@ -77,7 +92,10 @@ python -m scripts.evaluate_acceptance
 python -m scripts.evaluate_acceptance --case chain
 python -m scripts.evaluate_intent
 python -m scripts.evaluate_intent --case forecast_followups --output intent-results.jsonl
+python -m scripts.evaluate_dialogues --output dialogue-results.jsonl --max-cost-usd 1
 ```
+
+`evaluate_dialogues` 包含十组、三十轮接近日常表达的问答，覆盖来源拆解、假设撤回、期限更改、条件补充、跨维筛选、家庭归属、数据质量和上下文重置。它独立核对实际查询、执行窗口、参考月份、计算结果和交付表格；数字一致不能掩盖用了错误样本。默认遇到未知费用就停止。有限题集可显式指定 `--unknown-turn-reserve-usd 0.10`，每个未知费用轮增加预算预留；承诺额达到 `--max-cost-usd` 停止。预留不是实际费用或费用上界，真实估算仍保持未知。
 
 上述命令使用配置中的模型，但账本及记忆由虚构样本替代，不访问用户数据库。输出 JSONL 包含问题类型、所选工具、数值检查和回答，可用于比较模型与提示词。程序检查不能替代对解释是否准确、是否把推断说成事实的人工复核。
 

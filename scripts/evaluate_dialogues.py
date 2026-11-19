@@ -6,6 +6,8 @@ conditions, not a verdict on explanation quality; every row also needs human rev
 The fixture date and fingerprint must match when comparing models. No provider changes
 the questions, fixture or scoring rules. Exit codes: 0 checks pass, 1 checks/error,
 2 cost budget reached, 3 cost unavailable. Unknown cost is never treated as zero.
+An explicit --unknown-turn-reserve-usd permits caller-provided budget allowances
+for unknown-cost turns; those allowances are not actual charges or cost estimates.
 """
 
 import argparse
@@ -374,11 +376,10 @@ def valid_lookup_data(today, turn, lookups):
 
 def required_fixture_data(today, turn, lookups, oracle):
     """A right amount cannot compensate for querying the wrong records."""
-    future = {'forecast', 'forecast_table', 'forecast_notes', 'forecast_method',
-              'projection_base', 'projection_shock', 'projection_retract', 'reset_independent',
-              'remark_projection', 'protected_three', 'protected_five', 'pressure_capacity',
-              'savings_four', 'savings_gap', 'savings_unbounded'}
-    if turn.kind in future:
+    requested = requested_history_window(turn, today)
+    if requested:
+        window = requested
+    elif turn.kind in {'forecast', 'forecast_table', 'forecast_notes', 'forecast_method'}:
         window = window_for(today, -3, -1)
     elif turn.kind in {'category_window', 'weekday_window', 'bank_window'}:
         window = oracle['twoMonthWindow']
@@ -408,6 +409,41 @@ def required_fixture_data(today, turn, lookups, oracle):
         expected.add(row['id'])
     actual = {row.get('id') for lookup in lookups for row in lookup.get('rows', [])}
     return bool(expected) and expected <= actual
+
+
+def requested_history_window(turn, today):
+    # The shock/retraction retain the explicit sample in source_scenario[0].
+    # A three-month future deadline, on its own, says nothing about history.
+    inherited = {'projection_shock', 'projection_retract'}
+    explicit = re.search(r'最近\s*(?:三|3)\s*个?\s*完整(?:的)?(?:自然)?月', turn.question)
+    return window_for(today, -3, -1) if explicit or turn.kind in inherited else None
+
+
+def preferred_results(analyses, tool, output_field):
+    """Supplemental evidence may fill a missing tool, never replace a wrong primary."""
+    relevant = [row for row in analyses if row.get('tool') == tool or output_field in row['evidence']]
+    primary = [row for row in relevant if not row.get('supplemental', False)]
+    return primary or relevant
+
+
+def actual_history_checks(result, expected_window, expected_months, *, prefix=''):
+    """Inspect the executed result's scope and references, not plan/query supersets."""
+    reference_sets = []
+    current = result.get('evidence', {})
+    while isinstance(current, dict):
+        if 'baselineMonths' in current:
+            reference_sets.append(current['baselineMonths'])
+        current = current.get('baseline')
+    exact_references = bool(reference_sets) and all(value == expected_months for value in reference_sets)
+    actual_window = result.get('historyWindow')
+    window_matches = actual_window == expected_window if actual_window is not None else exact_references
+    # Optimization currently exposes its applied window but not baselineMonths.
+    # An exact three-month bound proves its possible reference set; a missing
+    # window or an explicitly conflicting reference set cannot prove it.
+    references_match = exact_references or (not reference_sets and result.get('tool') == 'optimization'
+                                            and actual_window == expected_window)
+    return {prefix + 'actualHistoryWindow': window_matches,
+            prefix + 'actualReferenceMonths': references_match}
 
 
 def query_covers_window(lookups, window):
@@ -446,6 +482,99 @@ def group_values_match(evidence, expected, dimensions, *, means=False):
         for key, value in expected.items())
 
 
+def certified_bank_partition(result, turn, today, oracle):
+    """Prove an extra time dimension before collapsing additive bank measures."""
+    evidence = result.get('evidence', {})
+    dimensions = evidence.get('dimensions', [])
+    if len(dimensions) != 2 or 'bank' not in dimensions:
+        return None
+    time_dimension = next((name for name in ('period', 'month') if name in dimensions), None)
+    window = oracle['twoMonthWindow']
+    if time_dimension is None or evidence.get('metric') != 'expense' or not exact_window(result, window):
+        return None
+    included = evidence.get('appliedFilters', {}).get('includeCategories', [])
+    excluded = evidence.get('appliedFilters', {}).get('excludeCategories', [])
+    bound_filters = result.get('filters', [])
+    category_bound = set(included) == {'展览'} or (bool(bound_filters)
+        and all(item.get('category') == '展览' for item in bound_filters))
+    if not category_bound or '展览' in excluded:
+        return None
+    coverage = evidence.get('coverage', [])
+    ranges = []
+    try:
+        for period in coverage:
+            start, end = date.fromisoformat(period['startDate']), date.fromisoformat(period['endDate'])
+            if (period.get('queryCoverage') != 'complete' or end < start
+                or period.get('effectiveStartDate') != start.isoformat()
+                or period.get('effectiveEndDate') != end.isoformat()):
+                return None
+            ranges.append((start, end, period.get('period')))
+        cursor = date.fromisoformat(window['startDate']).toordinal()
+        for start, end, _ in sorted(ranges):
+            # Equality rejects both gaps and overlaps, including duplicate ranges.
+            if start.toordinal() != cursor:
+                return None
+            cursor = end.toordinal() + 1
+        if not ranges or cursor != date.fromisoformat(window['endDate']).toordinal() + 1:
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    if time_dimension == 'period':
+        partitions = {label: (start, end) for start, end, label in ranges if isinstance(label, str) and label}
+        if len(partitions) != len(ranges):
+            return None
+    else:
+        start, end = date.fromisoformat(window['startDate']), date.fromisoformat(window['endDate'])
+        partitions = {}
+        while start <= end:
+            last = start.replace(day=monthrange(start.year, start.month)[1])
+            partitions[start.strftime('%Y-%m')] = (start, last)
+            start = date.fromordinal(last.toordinal() + 1)
+
+    # Independently derive every displayed time/bank cell from the raw fixture.
+    # Matching only the final bank totals would hide wrong extra-period values.
+    expected = defaultdict(lambda: {'amount': 0, 'count': 0})
+    for row in DialogueLedger(today).orders:
+        if ((turn.mode != '家庭版' and row['userId'] != turn.member)
+            or row['money'] >= 0 or row['costType'] != '展览'):
+            continue
+        when = date(row['year'], row['month'], row['day'])
+        for label, (start, end) in partitions.items():
+            if start <= when <= end:
+                cell = expected[label, row.get('bankName', '')]
+                cell['amount'] -= row['money']
+                cell['count'] += 1
+    rows = evidence.get('rows', [])
+    if (evidence.get('omittedGroupCount', 0) != 0
+        or evidence.get('totalGroupCount', len(rows)) != len(rows)
+        or any(type(row.get('count')) is not int or row['count'] < 0 for row in rows)
+        or not group_values_match(evidence, expected, [time_dimension, 'bank'])):
+        return None
+    total_count = sum(value['count'] for value in expected.values())
+    if (not same(evidence.get('totals', {}).get('expense'), oracle['exhibitionTwoMonthExpense'])
+        or evidence.get('totals', {}).get('count') != total_count):
+        return None
+    return {'timeDimension': time_dimension, 'groups': dict(expected)}
+
+
+def partition_table_delivered(artifacts, proof):
+    time_dimension = proof['timeDimension']
+    required = {time_dimension, 'bank', 'count'}
+    for artifact in artifacts:
+        columns = {column.get('key') for column in artifact.get('columns', []) if isinstance(column, dict)}
+        if (artifact.get('kind') != 'table' or not required <= columns
+            or not columns & {'amount', 'expense'}):
+            continue
+        rows = artifact.get('rows', [])
+        if (any(type(row.get('count')) is not int or row['count'] < 0 for row in rows)
+            or not group_values_match({'rows': rows}, proof['groups'], [time_dimension, 'bank'])):
+            continue
+        # One complete corresponding table is required. Do not borrow rows from
+        # unrelated artifacts or count a duplicated time/bank row twice.
+        return True
+    return False
+
+
 def assess_turn(turn, today, reply, metadata, lookups):
     """Check executed data, parameters and delivery; never trust a model pass flag."""
     oracle = fixture_oracle(today)
@@ -467,6 +596,7 @@ def assess_turn(turn, today, reply, metadata, lookups):
         'noPrivateIdentifiers': all(value not in visible for value in (OWNER, PARTNER, FAMILY)),
         'untrustedDataInert': not payload_has_injected_number([tasks, evidence, context, artifacts])}
     kind = turn.kind
+    requested_window = requested_history_window(turn, today)
 
     if kind in {'forecast', 'forecast_table', 'forecast_method'}:
         candidates = [row for row in evidence if row.get('metric') == 'income' and 'sourceForecasts' in row]
@@ -504,8 +634,17 @@ def assess_turn(turn, today, reply, metadata, lookups):
         expected_income = oracle['monthlyIncome'] - (oracle['monthlyProjectIncome'] / 2 if shocked else 0)
         expected_net = expected_income - oracle['monthlyExpense']
         expected_total = expected_net * 3
-        candidates = [row for row in evidence if 'totalNet' in row and row.get('months') == 3]
-        result = next((row for row in candidates if same(row.get('totalNet'), expected_total)), {})
+        projection_rows = preferred_results(analyses, 'projection', 'totalNet')
+        candidates = [row for row in projection_rows if row['evidence'].get('months') == 3]
+        result_row = next((row for row in candidates if same(row['evidence'].get('totalNet'), expected_total)), {})
+        result = result_row.get('evidence', {})
+        if requested_window:
+            checks.update(actual_history_checks(result_row, requested_window, oracle['referenceMonths']))
+            # Every primary calculation of the requested projection must keep
+            # the declared sample, even if a second result happens to be right.
+            checks['primaryHistoryConsistent'] = bool(projection_rows) and all(
+                all(actual_history_checks(row, requested_window, oracle['referenceMonths']).values())
+                for row in projection_rows if not row.get('supplemental', False))
         applied = result.get('assumptions', result.get('baseline', {}).get('assumptions', []))
         checks.update(horizonPreserved=result.get('months') == 3,
             completeHistoryQueries=query_covers_window(lookups, window_for(today, -3, -1)),
@@ -531,9 +670,13 @@ def assess_turn(turn, today, reply, metadata, lookups):
         target = 22000 if protected else 20000
         required = (target - 10000) / months if months else None
         projected = 10000 + oracle['monthlyNet'] * months if months else None
-        optimization = next((row for row in evidence if 'reviewableMonthlySpend' in row), {})
-        savings = next((row for row in evidence if same(row.get('startingBalance'), 10000)
-            and same(row.get('targetAmount'), target) and row.get('months') == months), {})
+        optimization_rows = preferred_results(analyses, 'optimization', 'reviewableMonthlySpend')
+        optimization_row = next(iter(optimization_rows), {})
+        optimization = optimization_row.get('evidence', {})
+        savings_rows = preferred_results(analyses, 'savings', 'estimatedMonthsToTarget')
+        savings_row = next((row for row in savings_rows if same(row['evidence'].get('startingBalance'), 10000)
+            and same(row['evidence'].get('targetAmount'), target) and row['evidence'].get('months') == months), {})
+        savings = savings_row.get('evidence', {})
         pressure_task = next((task for task in tasks if task.get('tool') == 'optimization'
             and same(task.get('startingBalance'), 10000) and same(task.get('targetAmount'), target)
             and task.get('months') == months), {})
@@ -542,8 +685,16 @@ def assess_turn(turn, today, reply, metadata, lookups):
                     else savings.get('baselineMonthlySaving'))
         checks.update(knownGoalInputs=bool(savings) or pressure_equivalent,
             noInventedDeadline=pressure_equivalent or bool(savings) and savings.get('months') == months,
-            baselineCapacity=same(capacity, oracle['monthlyNet']),
-            completeHistoryQueries=query_covers_window(lookups, window_for(today, -3, -1)))
+            baselineCapacity=same(capacity, oracle['monthlyNet']))
+        if requested_window:
+            checks['completeHistoryQueries'] = query_covers_window(lookups, requested_window)
+            scoped_rows = ([savings_row] if savings else []) + ([optimization_row] if protected and optimization else [])
+            checks['actualGoalHistory'] = bool(scoped_rows) and all(
+                all(actual_history_checks(row, requested_window, oracle['referenceMonths']).values()) for row in scoped_rows)
+            checks['primaryHistoryConsistent'] = all(
+                all(actual_history_checks(row, requested_window, oracle['referenceMonths']).values())
+                for row in savings_rows + (optimization_rows if protected else [])
+                if not row.get('supplemental', False))
         if kind == 'pressure_capacity':
             actual_required = optimization.get('goalMonthlyRequirement') if pressure_equivalent else savings.get('requiredMonthlySaving')
             checks['independentGoalArithmetic'] = same(actual_required, required) and same(capacity, oracle['monthlyNet'])
@@ -602,6 +753,13 @@ def assess_turn(turn, today, reply, metadata, lookups):
         total = oracle['filteredTwoMonthExpense'] if kind == 'category_window' else oracle['exhibitionTwoMonthExpense']
         matching = [row for row in analyses if group_values_match(row['evidence'], expected, dimension,
                     means=kind == 'category_window')]
+        partitions = []
+        if kind == 'bank_window':
+            matching = [row for row in matching if not
+                {'period', 'month'} & set(row['evidence'].get('dimensions', []))]
+            partitions = [(row, proof) for row in analyses
+                for proof in [certified_bank_partition(row, turn, today, oracle)] if proof is not None]
+            matching.extend(row for row, _ in partitions if row not in matching)
         result = next((row for row in matching if exact_window(row, oracle['twoMonthWindow'])), {})
         aggregate = result.get('evidence', {})
         checks.update(fullTwoMonthWindow=bool(result) and query_covers_window(lookups, oracle['twoMonthWindow']),
@@ -612,6 +770,9 @@ def assess_turn(turn, today, reply, metadata, lookups):
                  'amount': value['amount'], 'count': value['count'],
                  **({'meanTransactionAmount': value['meanTransactionAmount']} if kind == 'category_window' else {})})
                 for key, value in expected.items())
+            if kind == 'bank_window':
+                checks['deliveredTable'] = checks['deliveredTable'] or any(
+                    partition_table_delivered(artifacts, proof) for _, proof in partitions)
         if kind == 'category_window':
             comparisons = aggregate.get('comparisons', [])
             checks['changeDelivered'] = ('展览' in visible and 260 in amounts
@@ -689,36 +850,67 @@ def make_agent(today):
 
 
 class CostBudget:
-    def __init__(self, limit):
+    def __init__(self, limit, *, unknown_turn_reserve_usd=None):
         self.limit = Decimal(str(positive_number(limit)))
+        if isinstance(unknown_turn_reserve_usd, bool):
+            raise argparse.ArgumentTypeError('unknown-turn reserve must be a finite positive number')
+        self.unknown_turn_reserve = (None if unknown_turn_reserve_usd is None
+            else Decimal(str(positive_number(unknown_turn_reserve_usd))))
         self.known = Decimal('0')
+        self.reserved = Decimal('0')
+        self.unknown_turn_count = 0
         self.unknown = False
+
+    @staticmethod
+    def _amount(value):
+        try:
+            amount = Decimal(str(value))
+            if not isinstance(value, bool) and amount.is_finite() and amount >= 0:
+                return amount
+        except (InvalidOperation, ValueError):
+            pass
+        return None
 
     def add(self, metadata):
         usage = metadata.get('modelUsage') or {}
-        value = usage.get('estimatedCostUsd')
-        try:
-            amount = Decimal(str(value))
-            valid = not isinstance(value, bool) and amount.is_finite() and amount >= 0
-        except (InvalidOperation, ValueError):
-            valid = False
-        if valid:
+        usage = usage if isinstance(usage, dict) else {}
+        amount = self._amount(usage.get('estimatedCostUsd'))
+        if amount is not None:
+            # A known aggregate already includes its individual model calls.
             self.known += amount
-        else:
-            self.unknown = True
+            return
+        self.unknown = True
+        self.unknown_turn_count += 1
+        calls = usage.get('calls') or []
+        for call in calls if isinstance(calls, list) else []:
+            known_call = self._amount(call.get('estimatedCostUsd')) if isinstance(call, dict) else None
+            if known_call is not None:
+                self.known += known_call
+        if self.unknown_turn_reserve is not None:
+            # One allowance per unknown-cost turn, even with several failed calls.
+            self.reserved += self.unknown_turn_reserve
+
+    @property
+    def committed(self):
+        return self.known + self.reserved
 
     @property
     def stop_status(self):
-        if self.known >= self.limit:
+        if self.unknown and self.unknown_turn_reserve is None:
+            return 'costUnknown'
+        if self.committed >= self.limit:
             return 'budgetExceeded'
-        return 'costUnknown' if self.unknown else None
+        return None
 
     def snapshot(self):
         return {'limitUsd': float(self.limit), 'knownEstimatedCostUsd': float(self.known),
                 'estimatedCostUsd': None if self.unknown else float(self.known),
                 'costStatus': 'unknown' if self.unknown else 'estimated',
-                'budgetExceeded': self.known >= self.limit,
-                'note': 'Per-turn estimates; a running turn may cross the limit. Zero local API charge is not a total operating-cost estimate.'}
+                'unknownTurnReserveUsd': float(self.unknown_turn_reserve) if self.unknown_turn_reserve is not None else None,
+                'unknownCostTurnCount': self.unknown_turn_count,
+                'reservedUnknownCostUsd': float(self.reserved), 'budgetCommittedUsd': float(self.committed),
+                'budgetExceeded': self.committed >= self.limit,
+                'note': 'Committed budget is known estimates plus caller-provided allowances, not actual charges or a cost upper bound. A running turn may cross the limit. Zero local API charge excludes operating costs.'}
 
 
 def positive_number(value):
@@ -731,14 +923,15 @@ def positive_number(value):
     return value
 
 
-async def evaluate(selected, output_file, timeout, max_cost_usd=1, *, today=None, agent_factory=None):
+async def evaluate(selected, output_file, timeout, max_cost_usd=1, *, unknown_turn_reserve_usd=None,
+                   today=None, agent_factory=None):
     today = today or datetime.now(ZoneInfo('Asia/Shanghai')).date()
     cases = build_cases(today)
     selected = set(selected or cases)
     if not selected <= set(cases):
         raise ValueError('Unknown dialogue case')
     timeout = positive_number(timeout)
-    budget = CostBudget(max_cost_usd)
+    budget = CostBudget(max_cost_usd, unknown_turn_reserve_usd=unknown_turn_reserve_usd)
     factory = agent_factory or make_agent
     output_file = Path(output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -800,11 +993,14 @@ def make_parser(today=None):
         f"dialogue-benchmark-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%f')}.jsonl")
     parser.add_argument('--timeout', type=positive_number, default=240, help='Maximum seconds per turn.')
     parser.add_argument('--max-cost-usd', type=positive_number, default=1,
-                        help='Stop after cumulative estimated API cost reaches this USD budget (default: 1).')
+                        help='Stop after known estimates plus any explicit allowances reach this USD budget (default: 1).')
+    parser.add_argument('--unknown-turn-reserve-usd', type=positive_number, default=None,
+                        help='Explicit USD allowance per unknown-cost turn; not an actual charge. Without this option unknown cost stops the run.')
     return parser
 
 
 if __name__ == '__main__':
     args = make_parser().parse_args()
     with tracing_context(enabled=False):
-        raise SystemExit(asyncio.run(evaluate(args.cases, args.output, args.timeout, args.max_cost_usd)))
+        raise SystemExit(asyncio.run(evaluate(args.cases, args.output, args.timeout, args.max_cost_usd,
+            unknown_turn_reserve_usd=args.unknown_turn_reserve_usd)))

@@ -4,6 +4,7 @@ import logging
 from collections import defaultdict
 from collections.abc import AsyncIterator
 from contextlib import aclosing
+from copy import deepcopy
 from datetime import datetime
 from time import perf_counter
 from typing import Any
@@ -131,6 +132,8 @@ class BookAgent:
         # 前端看到的 status / thinking / delta / done 事件，都是从这里连续产出的。
         resolved_session_id: str | None = None
         assistant_chunks: list[str] = []
+        user_message_saved = False
+        confirmed_context: dict[str, Any] = {}
         started_at = perf_counter()
         try:
             book_mode = self._normalize_mode(mode)
@@ -151,6 +154,7 @@ class BookAgent:
                 session_id=resolved_session_id,
                 limit=12,
             )
+            confirmed_context = latest_context(history_messages)
             yield {
                 "type": "status",
                 "content": f"已加载 {len(history_messages)} 条会话历史",
@@ -162,11 +166,12 @@ class BookAgent:
                 role="user",
                 content=message,
             )
+            user_message_saved = True
 
             yield {"type": "status", "content": "正在规划账单查询"}
             async with aclosing(with_progress(self._create_plan(
                 message=message, history=history_text, book_mode=book_mode,
-                previous_context=latest_context(history_messages),
+                previous_context=deepcopy(confirmed_context),
             ), '正在理解问题与已有会话')) as progress_stream:
                 async for progress in progress_stream:
                     if progress['type'] == 'result':
@@ -309,8 +314,30 @@ class BookAgent:
 
             yield {"type": "done", "content": ""}
         except Exception as exc:
-            logger.warning("AI bill chat failed (%s)", type(exc).__name__)
-            yield {"type": "error", "content": "AI 账单处理失败，请稍后重试。"}
+            error_type = self._safe_error_type(exc)
+            logger.warning("AI bill chat failed (%s)", error_type)
+            failure_message = "AI 账单处理失败，请稍后重试。"
+            if resolved_session_id and user_message_saved:
+                try:
+                    await self.memory.add_message(
+                        phone_num=phone_num, session_id=resolved_session_id,
+                        role='assistant', content=failure_message,
+                        metadata={
+                            'status': 'error', 'errorType': error_type,
+                            'releaseRevision': get_settings().release_revision,
+                            'durationMs': round(max(0, perf_counter() - started_at) * 1000),
+                            'modelUsage': (current_usage() or TurnUsage()).snapshot(),
+                            'analysisContext': deepcopy(confirmed_context),
+                            'contextOrigin': 'prior_confirmed_turn' if confirmed_context else None,
+                        },
+                    )
+                except Exception as storage_exc:
+                    logger.warning('AI bill failure history save failed (%s)', self._safe_error_type(storage_exc))
+            yield {"type": "error", "content": failure_message}
+
+    @staticmethod
+    def _safe_error_type(error: BaseException) -> str:
+        return re.sub(r'[^A-Za-z0-9_]', '', type(error).__name__)[:128] or 'Error'
 
     def _query_status(self, orders_json: str) -> str:
         data = self._safe_json_loads(orders_json)

@@ -14,15 +14,15 @@
 
 ## Task 1: OpenAI adapter and usage accounting
 
-- [ ] Add failing mock HTTP tests for Responses strict schema, model allowlist/configuration, no secret repr, compatible parameter omission and normalized plain JSON content.
-- [ ] Implement explicit provider, schema normalization and bounded output budgets; preserve Ollama and existing compatible provider tests.
-- [ ] Add per-turn isolated call/token/cost recording, including reasoning and cached input, without prompts or credentials; test concurrent isolation and error paths.
-- [ ] Run the native contract probe against Luna and targeted end-to-end synthetic questions, recording actual usage.
+- [x] Add failing mock HTTP tests for Responses strict schema, model allowlist/configuration, no secret repr, compatible parameter omission and normalized plain JSON content.
+- [x] Implement explicit provider, schema normalization and bounded output budgets; preserve Ollama and existing compatible provider tests.
+- [x] Add per-turn isolated call/token/cost recording, including reasoning and cached input, without prompts or credentials; test concurrent isolation and error paths.
+- [x] Run the native contract probe against Luna and targeted end-to-end synthetic questions, recording actual usage.
 
 ## Task 2: Independent dialogue comparison
 
-- [ ] Add 24–32 synthetic turns covering historical failure shapes and held-out wording, with independent expected calculations and context checks.
-- [ ] Test scoring against incorrect queries, amounts, missing conditions and budget-stop behavior.
+- [x] Add 24–32 synthetic turns covering historical failure shapes and held-out wording, with independent expected calculations and context checks.
+- [x] Test scoring against incorrect queries, amounts, missing conditions and budget-stop behavior.
 - [ ] Run the same committed code/fixtures with OpenAI and Qwen; collect individual outputs, task fulfillment, latency and API usage. Manually review substantive answers.
 - [ ] Fix concrete failures with regression tests; rerun affected comparisons and report remaining limitations honestly.
 
@@ -34,3 +34,11 @@
 - [ ] Sync the durable checkout and perform phone installation/WebView validation if a device is available.
 
 **Ruling:** Preserve program-bound financial explanations while testing model changes. Better models do not make lost context, unauthorized records or unsupported money claims acceptable. Any later relaxation needs typed claims and evidence validation rather than a return to unrestricted financial prose.
+
+
+## Actual comparison findings and bounded follow-up
+
+- Frozen initial application `f8db882` completed Qwen and Luna thirty-turn runs; Terra uses that same application and fixture for its comparison. Scorer-only revisions are applied uniformly to saved raw outputs, with no feedback to model generation.
+- Confirmed and regression-tested: source-group fragments dropping a stage; unverified planner groups blocking confirmed follow-up grouping; omitted negative anomaly results; failed turns losing history/usage. Correct historical samples and equivalent nonoverlapping bank tables now have independent checks.
+- Two shared failures require program corrections before model selection: colloquial Chinese amount literals were rejected by the guard, and an explicitly removed deadline was reintroduced after the model review correctly set it to null. Add test-first fixes, then rerun the affected dialogues with the compared providers.
+- Production is still the original release until authenticated staged acceptance and final merge succeed. USB devices were not connected at the latest ADB check.

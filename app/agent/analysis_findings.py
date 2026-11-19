@@ -353,6 +353,11 @@ def build_analysis_findings(results, context=None):
                 obs.append('命中疑似重复线索，需要核对原始记录。' if e['possibleDuplicates'] else '本次规则未检出疑似重复。')
             if e.get('largeExpenses'):
                 obs.append('同类金额规则标出了待核查的大额支出。')
+            elif tool == 'anomalies' and e.get('largeExpenses') == []:
+                obs.append('本次同类金额规则未检出待核查大额支出。')
+            if e.get('insufficientCategories'):
+                names = '、'.join(_name(r['category']) for r in e['insufficientCategories'][:4])
+                limits.append(f'{names}的同类记录样本不足，暂不能据此判断金额是否异常。分类是否缺失由单独的字段检查确认。')
             if tool == 'data_quality':
                 measured = {key: name for key, name in [('missingPaymentMethodCount', '支付方式'),
                             ('missingCategoryCount', '分类')] if e.get(key) is not None}
@@ -362,9 +367,6 @@ def build_analysis_findings(results, context=None):
                     names = '、'.join(fields)
                     obs.append('检测到的缺失字段为' + names + '，会影响按' + names + '归集；缺失本身不能证明合计有误。')
                     out['actions'].append('优先核对账本中' + names + '空缺的记录，再按这些字段比较。')
-                if e.get('insufficientCategories'):
-                    names = '、'.join(_name(r['category']) for r in e['insufficientCategories'][:4])
-                    limits.append(f'{names}的同类记录样本不足，暂不能据此判断金额是否异常。分类是否缺失由单独的字段检查确认。')
                 if measured:
                     limits.append('字段缺失检测仅涵盖' + '、'.join(measured.values()) + '。')
             if e.get('nonrecurringIncomeCount'):

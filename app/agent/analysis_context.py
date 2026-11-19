@@ -59,6 +59,11 @@ def latest_context(messages):
         if message.get('role') == 'assistant':
             metadata = message.get('metadata') or {}
             context = deepcopy(metadata.get('analysisContext') or {})
+            if metadata.get('status') == 'error':
+                # This snapshot came from the same session's last confirmed
+                # turn, before the failed planner could mutate its own copy.
+                # Failed turns have no new evidence from which to infer roles.
+                return context if metadata.get('contextOrigin') == 'prior_confirmed_turn' else {}
             context.pop('observedSourceDirections', None)
             directions = _observed_source_directions(metadata, context)
             if directions:

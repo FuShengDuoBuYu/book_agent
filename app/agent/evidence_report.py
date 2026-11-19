@@ -254,6 +254,8 @@ def build_facts(results):
             for row in e['possibleDuplicates'][:3]:
                 add('待核查重复线索：' + literal(json.dumps(row, ensure_ascii=False)))
             if tool == 'anomalies':
+                if e.get('largeExpenses') == []:
+                    add('本次同类金额规则未检出待核查大额支出；样本不足的类别无法据此判断，规则未命中也不证明消费正常或账单完整。', True)
                 for row in e['largeExpenses'][:3]:
                     add('待核查大额消费：' + literal(json.dumps(row, ensure_ascii=False)))
             else:

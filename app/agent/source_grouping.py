@@ -84,12 +84,24 @@ def grounded_source_groups(groups, catalogs, question):
     """Retain independently supported subgroups; all other sources keep their observed keys."""
     observed = {row['sourceKey']: row for catalog in catalogs for row in catalog.get('sources', [])}
     output, issues, used = [], [], set()
+    combined = []
     for group in groups:
         keys = group.sourceKeys
         if not keys or len(keys) != len(set(keys)) or set(keys) - observed.keys() or used.intersection(keys):
             issues.append('来源归组含未核实或重复的键，已保留原始来源。')
             continue
         used.update(keys)
+        # A partial refinement leaves the untouched keys as another fragment of
+        # the same alias. Rejoin those fragments before singleton validation;
+        # the member/direction/exclusion and literal-evidence checks still apply.
+        match = next((row for row in combined if row.label == group.label
+                      and len(row.sourceKeys) + len(keys) <= 60), None)
+        if match is None:
+            combined.append(group.model_copy(deep=True))
+        else:
+            match.sourceKeys.extend(keys)
+    for group in combined:
+        keys = group.sourceKeys
         if len(keys) == 1:
             if _named_by_user(question, observed[keys[0]]['source'], group.label):
                 output.append(group)
