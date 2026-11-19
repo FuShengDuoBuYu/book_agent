@@ -11,6 +11,7 @@ from app.schemas.report import ReportDraft, ReportReview, ReportSection
 from pydantic import ValidationError
 from time import perf_counter
 from app.agent.artifacts import render_artifacts_markdown
+from app.agent.analysis_findings import build_analysis_findings
 from app.agent.report_context import build_report_context, repair_context
 from app.agent.report_composition import (compose_report, ReportOutline, ReportComment,
                                           outline_schema, OUTLINE_PROMPT, OUTLINE_TOKENS, COMMENT_TOKENS)
@@ -43,6 +44,26 @@ def build_facts(results):
 
     def add(text, required=False, values=(), model_text=None, binding=None):
         values = list(values)
+        inputs = {
+            'savings': ('startingBalance', 'targetAmount', 'months'),
+            'purchase': ('startingBalance', 'purchaseAmount', 'reserveAmount'),
+            'runway': ('startingBalance',), 'budget': ('budgetAmount',),
+            'optimization': ('monthlyImprovement',), 'projection': ('startingBalance', 'months'),
+        }
+        # Verified parameters belong to the whole calculation, even when the
+        # explanation cites a different result of that same calculation.
+        values.extend(q(INPUT_NAMES.get(key, key), e[key], '个月' if key == 'months' else '元')
+                      for key in inputs.get(tool, ()) if e.get(key) is not None)
+        for assumption in e.get('assumptions', e.get('baseline', {}).get('assumptions', [])):
+            percent = assumption.get('percent')
+            if percent is not None:
+                values.extend([q('用户假设变化比例', percent, '%'), q('用户假设变化比例幅度', abs(percent), '%')])
+            if assumption.get('amount') is not None:
+                values.append(q('用户假设每次变化', assumption['amount']))
+                values.append(q('用户假设每次变化幅度', abs(assumption['amount'])))
+                values.append(q('用户假设变化次数', assumption.get('count', 1), '次'))
+        if tool == 'forecast':
+            values.append(q('预测跨度', 1, '个月'))
         if tool == 'forecast' and required:
             values.extend(q('参考月份', month, 'month') for month in e.get('baselineMonths', []))
             values.append(q('参考月份数', len(e.get('baselineMonths', [])), '个月'))
@@ -476,6 +497,7 @@ REVIEW_PROMPT = '''/no_think
 
 REVIEW_PROMPT += '\nanalysisScope 是程序核对后的历史范围和主任务。原问题中的相对日期按该范围核对；understanding/instruction 的日期和建议只是规划提示，不是用户新给的条件。事实会逐字显示在每段解释前，解释不必再次复述所有数值。'
 REVIEW_PROMPT += '\nreport.displayedFacts 是已经向用户逐字显示的事实目录；每段 factIds 对应的事实已显示在该段解释前。不要因 analysis 没重复金额或日期而判未完成。facts 另列未引用但可用的事实，检查是否遗漏本轮要求。artifacts 中 totalRows 是实际交付的完整表行数，rows 只是节选预览；预览被缩短不等于用户没收到表格。'
+REVIEW_PROMPT += '\nmissingPrerequisites 是计算工具确认仍缺的必要输入。报告如实交代这些缺口、已有结论和下一步询问信息，即完成了当前可完成的判断；不能要求在余额或变化幅度未知时编造具体承受月数。仍须核查报告是否有其他无依据断言。'
 
 
 class EvidenceReporter:
@@ -483,11 +505,12 @@ class EvidenceReporter:
         started = perf_counter()
         self._last_call = {'schema': schema.__name__}
         output_limit = {ReportReview: 512, ReportOutline: OUTLINE_TOKENS, ReportComment: COMMENT_TOKENS}[schema]
+        generation_schema = outline_schema(payload) if schema is ReportOutline else schema.model_json_schema()
         if get_settings().llm_provider != 'ollama':
-            system += '\n必须遵守的 JSON schema：' + json.dumps(schema.model_json_schema(), ensure_ascii=False, separators=(',', ':'))
+            system += '\n必须遵守的 JSON schema：' + json.dumps(generation_schema, ensure_ascii=False, separators=(',', ':'))
         model = get_structured_model(schema, reasoning=False, num_predict=output_limit)
         if schema is ReportOutline and get_settings().llm_provider == 'ollama':
-            model = model.bind(format=outline_schema(payload))
+            model = model.bind(format=generation_schema)
         response = await asyncio.wait_for(model.ainvoke([
             ('system', system),
             ('human', json.dumps(payload, ensure_ascii=False, separators=(',', ':')))]),
@@ -533,6 +556,7 @@ class EvidenceReporter:
                        if row['tool'] == 'recurring' and row.get('mode') in forecast_modes
                        and (row.get('supplemental') or row.get('metric') == metric) else row for row in focused]
         facts = build_facts(focused)
+        analysis_findings = build_analysis_findings(focused, context)
         # Keep required conditions and a bounded selection of observations in the model context.
         facts = [row for row in facts if row['required']] + [row for row in facts if not row['required']]
         artifacts = artifacts or []
@@ -545,7 +569,10 @@ class EvidenceReporter:
                       if key not in {'conversation', 'activeAnalyses', 'activeHistoryWindow', 'scope'}}
         base_payload = {'question': question, 'history': report_history, 'instruction': instruction,
                         'understanding': understanding or {}, 'userConditions': conditions,
-                        'artifacts': artifact_preview, 'analysisScope': analysis_scope or {}}
+                        'artifacts': artifact_preview, 'analysisScope': analysis_scope or {},
+                        'missingPrerequisites': [{'tool': row['tool'], 'scope': row.get('mode'),
+                            'inputs': [INPUT_NAMES.get(key, key) for key in row['evidence']['missingInputs']]}
+                            for row in focused if row['evidence'].get('missingInputs') and not row.get('supplemental')]}
         previous = context.get('previousMonths')
         projection = next((row['evidence'] for row in results if row['tool'] == 'projection' and row['evidence'].get('sufficientData')), None)
         if previous and projection:
@@ -555,6 +582,10 @@ class EvidenceReporter:
                 + ('未给出明确存款目标，尚不能计算所需月结余能降低多少。' if context.get('targetAmount') is None else ''),
                 'values': [q('原期限', previous, '个月'), q('新期限', projection['months'], '个月'),
                            q('新增结余增量', extra), q('月度结余', projection['monthlyNet'])]})
+        if previous and projection:
+            projection_binding = next((row['binding'] for row in facts if row.get('binding', {}).get('tool') == 'projection'), None)
+            if projection_binding:
+                facts[-1]['binding'] = {**projection_binding, 'headline': True}
         all_facts = facts
         issues, attempts, previous = [], [], None
         payload = None
@@ -567,12 +598,12 @@ class EvidenceReporter:
                 if payload is None:
                     payload, facts, budget_stats['draft'] = build_report_context(
                         base_payload, facts, OUTLINE_PROMPT, ReportOutline,
-                        include_values=settings.llm_provider != 'ollama', **budget_options)
+                        include_values=False, **budget_options)
                 current_payload = payload
                 if issues:
                     current_payload, budget_stats['repair'] = repair_context(
                         payload, previous, issues, OUTLINE_PROMPT, ReportOutline, **budget_options)
-                draft = await self._draft(current_payload)
+                draft = await self._draft({**current_payload, 'analysisFindings': analysis_findings})
                 calls['draft'] = dict(getattr(self, '_last_call', {}))
                 calls['composition'] = list(getattr(self, '_last_composition_calls', []))
                 previous = draft.model_dump()
@@ -592,7 +623,7 @@ class EvidenceReporter:
                     review_payload, _, budget_stats['review'] = build_report_context(
                         {**base_payload, 'report': report}, review_facts, REVIEW_PROMPT, ReportReview,
                         num_ctx=settings.ollama_num_ctx, num_predict=512,
-                        include_values=settings.llm_provider != 'ollama')
+                        include_values=False)
                     issues = await self._review(review_payload)
                     calls['review'] = dict(getattr(self, '_last_call', {}))
                 attempts.append({'issues': issues, 'draft': draft.model_dump(), 'repairs': repairs,
@@ -601,7 +632,7 @@ class EvidenceReporter:
                 if not issues:
                     reply = render_report(draft, facts)
                     table_text = render_artifacts_markdown(artifacts)
-                    return reply + ('\n\n' + table_text if table_text else ''), {'status': 'reviewed', 'facts': facts, 'report': draft.model_dump(), 'attempts': attempts}
+                    return reply + ('\n\n' + table_text if table_text else ''), {'status': 'reviewed', 'facts': facts, 'findings': analysis_findings, 'report': draft.model_dump(), 'attempts': attempts}
             except Exception as exc:
                 detail = '; '.join(f"{err['loc']}: {err['msg']}" for err in exc.errors()) if isinstance(exc, ValidationError) else (str(exc) if isinstance(exc, ValueError) else '')
                 issues = exc.issues if isinstance(exc, ReportEvidenceError) else ['报告生成失败：' + type(exc).__name__ + ' ' + detail[:500]]
@@ -612,4 +643,4 @@ class EvidenceReporter:
         selected += [row['text'] for row in all_facts if not row['required']][:12]
         table_text = render_artifacts_markdown(artifacts)
         return ('以下是本次账本核算结果：\n\n' + '\n\n'.join(selected) + ('\n\n' + table_text if table_text else ''),
-                {'status': 'computed_fallback', 'facts': all_facts, 'attempts': attempts})
+                {'status': 'computed_fallback', 'facts': all_facts, 'findings': analysis_findings, 'attempts': attempts})

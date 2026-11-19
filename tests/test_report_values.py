@@ -84,3 +84,11 @@ class CalendarProvenanceTests(unittest.TestCase):
         facts = [{'id': 'cash', 'values': [quantity('月结余', 3850)]}]
         self.assertEqual(numerical_issues('月结余3850.0元。', ['cash'], facts), [])
         self.assertTrue(numerical_issues('月结余3850.1元。', ['cash'], facts))
+
+    def test_single_month_shorthand_needs_one_matching_year_in_the_cited_scope(self):
+        self.assertEqual(self.issues('十月与9月记录已核对。'), [])
+        self.assertEqual(self.issues('1月份的估计仍需确认后续安排。'), [])
+        self.assertTrue(self.issues('11月的记录已核对。'))
+        self.assertTrue(self.issues('9月元。'))
+        ambiguous = [{'id': 'f', 'calendars': ['2025-10', '2026-10']}]
+        self.assertTrue(numerical_issues('10月的记录。', ['f'], ambiguous))

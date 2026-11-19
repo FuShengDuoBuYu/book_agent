@@ -18,12 +18,11 @@ COMMENT_TOKENS = 768
 OUTLINE_PROMPT = '''根据本轮问题、用户条件和账本证据拟定简短提纲。
 answerGoal 必须逐字选用 answerGoals 中用户已经要求的目标，不能将自己的判断变成新目标。title 选择中性标题，factIds 只绑定真实的事实编号，a 开头的表格编号不能作事实引用。
 只写有必要且有证据的段落，一段也可以。金额、日期和表格由程序展示。'''
-COMMENT_PROMPT = '''你是记账助手，正在直接回复用户。本段要回答的问题是 section.answerGoal。analysis 就是给用户看的最终答复，请用两至三句话先回答问题，再说明对用户的实际意义，需要时给出具体核查或调整建议。
-computedFacts 是程序已经完成的核算结果，会原样显示在你的解释前；表格和备注明细也由程序交付。你直接衔接这些结果，不重做表格，不介绍任务、步骤、字段或生成过程。条件推演已经应用用户假设，不能再扣减或重新计算。
-若有 section.answerGoals，合并回应所列目标。计算结果的主结论优先，原始历史总额、样本和分项各自按所属口径解读。availableEvidence 说明本次其他证据的范围和类型，具体数值仍以本段 computedFacts 为准。
-账本说明已记录的变化，不证明未来收入稳定、医疗以后不再发生、生活负担过高或记录完整。未知余额时先确认余额和近期支出，不据月结余判断买得起。正文不用内部编号或代码字段名。
-corrections 只说明上一版的错误，须据此修正，不要把纠错意见抄成新的财务事实或用户要求。
-如有 values，可按 {{v1}} 的格式引用实际提供的变量，变量已带单位。'''
+COMMENT_PROMPT = """你是记账助手，正在直接回复用户。本段要回答的问题是 section.answerGoal。analysis 就是给用户看的最终答复，请用两至三句话先回答问题，再说明对用户的实际意义，需要时给出具体核查或调整建议。
+findings 是程序从已核算结果得到的分析发现，包含变化方向、目标是否可达、缺少哪些条件及来源关系。具体金额、日期、笔数、完整备注和表格由程序在你的解释前原样展示，你只解释其含义和实际行动，不重新计算或编造数值，不介绍内部字段或生成过程。
+若有 section.answerGoals，合并回应所列目标。主计算结论优先，历史观察、用户假设和未来估计分别说明。availableEvidence 说明其他部分已有何种证据，本段没列明细不表示整个账本没有。
+账本说明已记录的变化，不证明未来收入稳定、医疗以后不再发生、生活负担过高或记录完整。未知余额时先确认余额和近期支出，不据月结余判断买得起。
+corrections 只说明上一版的错误，须据此修正，不要把纠错意见抄成新的财务事实或用户要求。"""
 SECTION_DIAGNOSTIC = re.compile(r'^第\s*(\d+)\s*段')
 SCOPE_FIELDS = ('scope', 'historyWindow', 'filters', 'queryIds')
 
@@ -45,7 +44,7 @@ class ReportOutline(BaseModel):
 class ReportComment(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
-    analysis: str = Field(max_length=1000, description='直接回答用户本段问题的最终答复。使用已完成的核算结果，不重新计算，不介绍内部处理过程。')
+    analysis: str = Field(max_length=1000, description='直接回答用户本段问题的最终答复。解释已验证的分析发现，具体数值由程序展示，不重新计算，不介绍内部处理过程。')
 
 
 def outline_schema(payload):
@@ -54,6 +53,9 @@ def outline_schema(payload):
     fields = schema['$defs']['OutlineSection']['properties']
     fields['answerGoal']['enum'] = payload['answerGoals']
     fields['factIds']['items']['enum'] = [row['id'] for row in payload['facts']]
+    dependencies = _headline_dependencies(payload['facts'])
+    reserve = max((len(heads) for heads in dependencies.values()), default=0)
+    fields['factIds']['maxItems'] = max(1, 8 - reserve)
     return schema
 
 
@@ -207,16 +209,17 @@ async def compose_report(payload, invoke, *, num_ctx=8192) -> ReportDraft:
     inventory = _evidence_inventory(facts)
     comment_inputs = []
     for brief in briefs:
-        selected = set(brief.fact_ids)
+        groups = list(dict.fromkeys(bound_facts[key].get('binding', {}).get('resultGroup') for key in brief.fact_ids))
+        groups = [group for group in groups if group]
+        findings = payload.get('analysisFindings', {})
+        if not groups or any(group not in findings for group in groups):
+            raise ValueError('解释缺少与当前计算证据绑定的分析发现')
         section = {'title': brief.titles[0], 'answerGoal': brief.goals[0]}
         if len(brief.goals) > 1:
             section['answerGoals'] = list(brief.goals)
-        comment = {**common, 'section': section,
-                   'computedFacts': [_subset(bound_facts[key], ('text', 'binding')) for key in brief.fact_ids],
+        comment = {'question': common.get('question', ''), 'section': section,
+                   'findings': [findings[group] for group in groups],
                    'availableEvidence': inventory}
-        if 'values' in payload:
-            comment['values'] = {key: value.split(' ', 1)[1] for key, value in payload['values'].items()
-                                 if value.split(' ', 1)[0] in selected}
         diagnostics = _section_diagnostics(corrections, previous, brief)
         if diagnostics:
             comment['corrections'] = diagnostics

@@ -15,9 +15,9 @@ def payload_for_composition():
         'analysisScope': {'metric': 'expense', 'window': '九月到十月'},
         'userConditions': {'protectedCategories': ['房租']},
         'history': '不应回放的旧助手分析。',
-        'facts': [{'id': 'f1', 'text': '交通支出变化。', 'required': True, 'binding': {'measure': 'expense'}},
-                  {'id': 'f2', 'text': '餐饮支出变化。', 'required': False},
-                  {'id': 'f3', 'text': '与本段均无关的其他事实。', 'required': False}],
+        'facts': [{'id': 'f1', 'text': '交通支出变化。', 'required': True, 'binding': {'measure': 'expense', 'resultGroup': 'g1', 'tool': 'changes', 'scope': '个人版'}},
+                  {'id': 'f2', 'text': '餐饮支出变化。', 'required': False, 'binding': {'resultGroup': 'g2', 'tool': 'changes', 'scope': '个人版'}},
+                  {'id': 'f3', 'text': '与本段均无关的其他事实。', 'required': False, 'binding': {'resultGroup': 'g3', 'tool': 'changes', 'scope': '个人版'}}],
         'values': {'v1': 'f1 变化额 = 100 元', 'v7': 'f2 变化额 = 80 元', 'v10': 'f3 参考项 = 200 元'},
         'artifacts': [{'id': 'a1', 'title': '分类统计', 'rows': [{'label': '其他资料'}], 'totalRows': 20}],
     }
@@ -32,6 +32,21 @@ def bound_fact(identifier, text, group, tool, *, headline=False, primary=True, s
     if headline:
         binding['headline'] = True
     return {'id': identifier, 'text': text, 'required': headline and primary, 'binding': binding}
+
+
+async def compose_fixture(payload, invoke, **kwargs):
+    data = deepcopy(payload)
+    if 'analysisFindings' not in data:
+        data['analysisFindings'] = {}
+        for index, fact in enumerate(data.get('facts', []), 1):
+            binding = fact.setdefault('binding', {})
+            group = binding.setdefault('resultGroup', f'fixture{index}')
+            binding.setdefault('tool', 'changes')
+            binding.setdefault('scope', '个人版')
+            data['analysisFindings'].setdefault(group, {
+                'tool': binding['tool'], 'scope': binding['scope'],
+                'observations': ['已核对该结果，应据此说明实际含义。'], 'states': {}, 'labels': {}, 'limitations': []})
+    return await compose_report(data, invoke, **kwargs)
 
 
 class FakeComposition:
@@ -49,6 +64,36 @@ class FakeComposition:
 
 
 class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_qualitative_findings_cannot_silently_restore_raw_amounts(self):
+        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'))
+        with self.assertRaisesRegex(ValueError, '分析发现'):
+            await compose_report(payload_for_composition(), fake.invoke)
+        self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline])
+
+    async def test_native_outline_reserves_room_for_mandatory_summary_dependencies(self):
+        from app.agent.report_composition import outline_schema
+        payload = payload_for_composition()
+        payload['answerGoals'] = payload['understanding']['requestedAnswers']
+        payload['facts'] = [bound_fact('f1', '已算出主结论。', 'g1', 'forecast', headline=True),
+                            bound_fact('f2', '已确认方法。', 'g1', 'forecast', headline=True),
+                            bound_fact('f3', '来源明细。', 'g1', 'forecast')]
+        schema = outline_schema(payload)['$defs']['OutlineSection']['properties']
+        self.assertEqual(schema['factIds']['maxItems'], 6)
+
+    async def test_explanation_uses_verified_findings_without_recalculating_raw_amounts(self):
+        payload = payload_for_composition()
+        payload['facts'][0] = bound_fact('f1', '展览从180元变为440元，增加260元。', 'g1', 'aggregate')
+        payload['userConditions']['startingBalance'] = 989898
+        payload['analysisFindings'] = {'g1': {'tool': 'aggregate', 'scope': '个人版',
+            'observations': ['展览前期已有记录，对比期继续上升。'], 'states': {}, 'labels': {}, 'limitations': []}}
+        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'))
+        await compose_fixture(payload, fake.invoke)
+        comment = fake.calls[-1][1]
+        self.assertIn('前期已有记录', repr(comment))
+        for raw in ('180', '440', '260', '989898', '200 元'):
+            self.assertNotIn(raw, repr(comment))
+        self.assertNotIn('values', comment)
+
     async def test_native_outline_cannot_generate_artifact_ids_or_new_goals(self):
         from app.agent.report_composition import outline_schema
         p = payload_for_composition()
@@ -61,15 +106,15 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
     async def test_outline_cannot_invent_a_new_answer_goal_from_its_observations(self):
         fake = FakeComposition(section('分析结论', '证明收入单一所以抗风险能力弱', 'f1'))
         with self.assertRaisesRegex(ValueError, '目标'):
-            await compose_report(payload_for_composition(), fake.invoke)
+            await compose_fixture(payload_for_composition(), fake.invoke)
         self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline])
 
-    async def test_each_comment_receives_only_its_bound_facts_and_original_value_ids(self):
+    async def test_each_comment_receives_only_bound_qualitative_findings(self):
         payload = payload_for_composition()
         initial = deepcopy(payload)
         fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'),
                                section('统计口径', '解释哪些类别增加', 'f2'))
-        draft = await compose_report(payload, fake.invoke)
+        draft = await compose_fixture(payload, fake.invoke)
         self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline, ReportComment, ReportComment])
         outline = fake.calls[0][1]
         self.assertEqual(outline['facts'], payload['facts'])
@@ -79,11 +124,13 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
         for index, (key, value) in enumerate([('v1', 'f1'), ('v7', 'f2')], 1):
             comment = fake.calls[index][1]
             self.assertEqual(comment['section'], {k: v for k, v in fake.outline['sections'][index - 1].items() if k != 'factIds'})
-            self.assertEqual(comment['computedFacts'], [{k: v for k, v in next(row for row in payload['facts'] if row['id'] == value).items() if k in {'text', 'binding'}}])
-            self.assertEqual(comment['values'], {key: payload['values'][key].split(' ', 1)[1]})
+            self.assertEqual(len(comment['findings']), 1)
+            self.assertEqual(comment['findings'][0]['scope'], '个人版')
+            self.assertNotIn('computedFacts', comment)
+            self.assertNotIn('values', comment)
             self.assertEqual(comment['question'], payload['question'])
-            self.assertEqual(comment['analysisScope'], payload['analysisScope'])
-            self.assertEqual(comment['userConditions'], payload['userConditions'])
+            self.assertNotIn('analysisScope', comment)
+            self.assertNotIn('userConditions', comment)
             self.assertNotIn('artifacts', comment)
             self.assertNotIn('history', comment)
         self.assertEqual([(row.title, row.factIds) for row in draft.sections],
@@ -94,7 +141,7 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
         fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'),
                                section('需要确认的事项', '猜测其他范围', 'fabricated'))
         with self.assertRaisesRegex(ValueError, '证据'):
-            await compose_report(payload_for_composition(), fake.invoke)
+            await compose_fixture(payload_for_composition(), fake.invoke)
         self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline])
 
     async def test_omitted_required_evidence_has_independent_blank_analysis_sections(self):
@@ -102,7 +149,7 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
         payload = payload_for_composition()
         payload['facts'] = [{'id': f'f{n}', 'text': '原始必需证据。', 'required': True}
                             for n in range(1, 12)]
-        draft = await compose_report(payload, fake.invoke)
+        draft = await compose_fixture(payload, fake.invoke)
         model, first, second = draft.sections
         self.assertEqual(model.factIds, ['f1'])
         self.assertTrue(model.analysis)
@@ -117,7 +164,7 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
         payload['facts'] = [{'id': f'f{n}', 'text': '必需证据。', 'required': True}
                             for n in range(1, 43)]
         with self.assertRaisesRegex(ValueError, '必需证据'):
-            await compose_report(payload, fake.invoke)
+            await compose_fixture(payload, fake.invoke)
         self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline])
 
     async def test_diagnostics_follow_the_bound_section_when_outline_reorders_sections(self):
@@ -132,7 +179,7 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
         payload['corrections'] = [first, second, common]
         fake = FakeComposition(section('统计口径', '解释哪些类别增加', 'f2'),
                                section('变化来源', '解释哪些类别增加', 'f1'))
-        await compose_report(payload, fake.invoke)
+        await compose_fixture(payload, fake.invoke)
         outline, dining, travel = [entry[1] for entry in fake.calls]
         self.assertEqual(outline['corrections'], [first, second, common])
         self.assertEqual(dining['corrections'], [second, common])
@@ -141,12 +188,12 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('previousReport', dining)
         self.assertNotIn('previousReport', travel)
 
-    async def test_comment_budget_never_drops_bound_value_to_force_a_call(self):
+    async def test_comment_budget_never_drops_bound_finding_to_force_a_call(self):
         payload = payload_for_composition()
-        payload['values']['v1'] = 'f1 ' + '必须保留的已绑定数量依据。' * 700
+        payload['analysisFindings'] = {'g1': {'tool': 'changes', 'scope': '个人版', 'observations': ['必须保留的已绑定分析依据。' * 1000]}}
         fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'))
         with self.assertRaisesRegex(ValueError, '预算'):
-            await compose_report(payload, fake.invoke)
+            await compose_fixture(payload, fake.invoke)
         self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline])
 
     async def test_forecast_parts_share_the_computed_headline_and_may_merge(self):
@@ -164,14 +211,14 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
                              'v12': 'f4 总额 = 83,700 元'}
         fake = FakeComposition(section('收入构成', goals[0], 'f2'), section('分析结论', goals[1], 'f1'),
                                section('统计口径', goals[2], 'f3'))
-        draft = await compose_report(payload, fake.invoke)
+        draft = await compose_fixture(payload, fake.invoke)
         self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline, ReportComment])
         self.assertEqual(set(draft.sections[0].factIds), {'f1', 'f2', 'f3', 'f5'})
         comment = fake.calls[-1][1]
         self.assertEqual(comment['section']['answerGoals'], goals)
-        self.assertEqual({row['text'] for row in comment['computedFacts']},
-                         {row['text'] for row in payload['facts'][:4]})
-        self.assertEqual(comment['values'], {'v1': '条件预测 = 3,700 元', 'v2': '历史样本 = 19,000 元'})
+        self.assertEqual({row['tool'] for row in comment['findings']}, {'forecast', 'sources'})
+        self.assertNotIn('19,000', repr(comment))
+        self.assertNotIn('values', comment)
         self.assertNotIn('83,700', repr(comment))
         inventory = comment['availableEvidence']
         self.assertTrue(any(row['tool'] == 'forecast' and row.get('sourceBreakdown') for row in inventory))
@@ -190,7 +237,7 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
         ]
         fake = FakeComposition(section('变化来源', goal, 'f2'), section('收入构成', goal, 'f3'),
                                section('统计口径', goal, 'f4'))
-        draft = await compose_report(payload, fake.invoke)
+        draft = await compose_fixture(payload, fake.invoke)
         self.assertEqual([row.factIds for row in draft.sections], [['f2'], ['f3'], ['f4'], ['f1']])
         self.assertEqual(draft.sections[-1].analysis, '')
         for _, comment in fake.calls[1:]:
@@ -205,7 +252,7 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
             bound_fact('f3', '历史来源。', 'g3', 'sources', primary=False),
         ]
         fake = FakeComposition(section('统计口径', goal, 'f3'))
-        draft = await compose_report(payload, fake.invoke)
+        draft = await compose_fixture(payload, fake.invoke)
         self.assertEqual([row.factIds for row in draft.sections], [['f3'], ['f1', 'f2']])
         self.assertEqual(draft.sections[-1].analysis, '')
 
@@ -218,7 +265,7 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
             bound_fact('f2', '另一分类的历史来源。', 'g2', 'sources', filters=[{'category': '稿费'}]),
         ]
         fake = FakeComposition(section('统计口径', goal, 'f2'))
-        draft = await compose_report(payload, fake.invoke)
+        draft = await compose_fixture(payload, fake.invoke)
         self.assertEqual([row.factIds for row in draft.sections], [['f2'], ['f1']])
         self.assertEqual(draft.sections[-1].analysis, '')
 
@@ -230,7 +277,7 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
         ]
         fake = FakeComposition(section('收入构成', goal, *(f'f{i}' for i in range(2, 10))))
         with self.assertRaisesRegex(ValueError, '主结论.*8'):
-            await compose_report(payload, fake.invoke)
+            await compose_fixture(payload, fake.invoke)
         self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline])
 
     async def test_duplicate_evidence_sections_keep_only_existing_answer_goals(self):
@@ -238,7 +285,7 @@ class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
         goals = ['解释哪些类别增加', '核对统计口径']
         payload['understanding']['requestedAnswers'] = goals
         fake = FakeComposition(section('变化来源', goals[0], 'f1'), section('统计口径', goals[1], 'f1'))
-        draft = await compose_report(payload, fake.invoke)
+        draft = await compose_fixture(payload, fake.invoke)
         self.assertEqual([row.factIds for row in draft.sections], [['f1']])
         self.assertEqual(fake.calls[1][1]['section']['answerGoals'], goals)
 

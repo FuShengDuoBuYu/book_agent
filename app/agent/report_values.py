@@ -164,7 +164,7 @@ def _validate_calendars(text, allowed, issues):
         supported = [months for year in years if (months := _series_months(tokens, body, year, known))]
         if len(supported) != 1 or not _month_count_matches(match['count'], len(supported[0])) or DATE_UNIT.match(match.string, match.end()):
             issues.append('月份或月份数量缺少本段引用的连续日期依据：' + match[0])
-        return ' '
+        return ' ' * len(match[0])
 
     def single(match):
         if '.' in match[0] and re.match(r'\s*(?:元|块|%|％)', match.string[match.end():]):
@@ -174,15 +174,29 @@ def _validate_calendars(text, allowed, issues):
         valid = value in allowed if day else int(year) * 12 + int(month) - 1 in known and 1 <= int(month) <= 12
         if not valid or DATE_UNIT.match(match.string, match.end()):
             issues.append('日期缺少本段引用的依据或所附单位不符：' + match[0])
-        return ' '
+        return ' ' * len(match[0])
 
     def exact_day(match):
         single(match)
         # Preserve offsets so following shorthand can inherit this date's year.
         return ' ' * len(match[0])
 
+    def short_month(match):
+        raw = match[1]
+        month = int(raw) if raw.isdigit() else _chinese_value(raw)
+        candidates = {index for index in known if index % 12 + 1 == month}
+        clause = re.split(r'[。！？!?；;\n]', text[:match.start()])[-1]
+        anchors = [int(m[1]) for m in CALENDAR.finditer(clause)
+                   if 1 <= int(m[2]) <= 12 and int(m[1]) * 12 + int(m[2]) - 1 in known]
+        if anchors:
+            candidates = {index for index in candidates if index // 12 == anchors[-1]}
+        if len(candidates) != 1 or DATE_UNIT.match(match.string, match.end()):
+            issues.append('单月简称缺少唯一年份或所附单位不符：' + match[0])
+        return ' ' * len(match[0])
+
     dated = FULL_DATE.sub(exact_day, text)
-    return CALENDAR.sub(single, MONTH_SERIES.sub(series, dated))
+    dated = CALENDAR.sub(single, MONTH_SERIES.sub(series, dated))
+    return re.sub(r'(?<![\d年月])([一二两三四五六七八九十]{1,3}|\d{1,2})\s*月(?:份)?', short_month, dated)
 
 
 def numerical_issues(text, fact_ids, facts):

@@ -131,6 +131,26 @@ class EvidenceReportTests(unittest.TestCase):
         self.assertEqual(facts[0]['binding']['originalRemarks'], remarks)
         self.assertIn('星港海报完稿', facts[0]['modelText'])
 
+    def test_verified_scenario_inputs_can_be_repeated_without_requiring_a_separate_condition_paragraph(self):
+        from datetime import date
+        from app.tools.financial_analysis import run_analysis
+        from tests.test_decision_analysis import ledger
+        e = run_analysis('projection', ledger(), as_of=date(2026, 11, 19), months=3,
+                         changes=[{'metric': 'income', 'source': '家教', 'percent': -50}])
+        facts = build_facts([{'tool': 'projection', 'evidence': e}])
+        draft = self.draft(factIds=[facts[0]['id']], analysis='在家教减半的假设下，这三个月的结果以所列条件延续为前提。')
+        self.assertFalse([issue for issue in validate_draft(draft, facts) if '数量' in issue])
+
+    def test_signed_amount_change_can_be_described_by_its_positive_reduction(self):
+        from datetime import date
+        from app.tools.financial_analysis import run_analysis
+        from tests.test_decision_analysis import ledger
+        e = run_analysis('projection', ledger(), as_of=date(2026, 11, 19), months=3,
+                         changes=[{'metric': 'expense', 'amount': -150, 'count': 2}])
+        facts = build_facts([{'tool': 'projection', 'evidence': e}])
+        draft = self.draft(factIds=[facts[0]['id']], analysis='每次少花150元的假设已经计入推演。')
+        self.assertFalse([issue for issue in validate_draft(draft, facts) if '数量' in issue])
+
     def test_required_evidence_can_fill_additional_sections_without_losing_the_model_answer(self):
         facts = [{'id': f'f{i}', 'text': f'已核对条件{"甲" * i}。', 'required': True} for i in range(1, 17)]
         draft = self.draft(analysis='应根据已核对条件逐项评估后续安排。')
