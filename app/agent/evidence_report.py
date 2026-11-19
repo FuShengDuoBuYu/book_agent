@@ -7,6 +7,7 @@ from datetime import date
 
 from app.core.config import get_settings
 from app.core.llm import get_structured_model
+from app.core.openai_adapter import response_format
 from app.schemas.report import ReportDraft
 from pydantic import ValidationError
 from time import perf_counter
@@ -389,11 +390,13 @@ class EvidenceReporter:
         self._last_call = {'schema': schema.__name__}
         settings = get_settings()
         generation_schema = outline_schema(payload)
-        if settings.llm_provider != 'ollama':
+        if settings.llm_provider == 'openai_compatible':
             system += '\n必须遵守的 JSON schema：' + json.dumps(generation_schema, ensure_ascii=False, separators=(',', ':'))
         model = get_structured_model(schema, reasoning=False, num_predict=OUTLINE_TOKENS)
         if settings.llm_provider == 'ollama':
             model = model.bind(format=generation_schema)
+        elif settings.llm_provider == 'openai':
+            model = model.bind(response_format=response_format('ReportOutline', generation_schema))
         response = await asyncio.wait_for(model.ainvoke([
             ('system', system),
             ('human', json.dumps(payload, ensure_ascii=False, separators=(',', ':')))]),

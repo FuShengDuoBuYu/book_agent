@@ -49,7 +49,7 @@ class IntentResolver:
             payload.pop('values', None)
             audit['contextBudget'] = budget
             system = PROMPT
-            if settings.llm_provider != 'ollama':
+            if settings.llm_provider == 'openai_compatible':
                 system += '\nJSON schema：' + json.dumps(IntentUnderstanding.model_json_schema(), ensure_ascii=False)
             response = await asyncio.wait_for(get_structured_model(
                 IntentUnderstanding, reasoning=settings.intent_reasoning, num_predict=2048).ainvoke([

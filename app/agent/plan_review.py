@@ -748,7 +748,7 @@ class PlanReviewer:
                    "logicalQueryIds": sorted(logical_ids),
                    "plan": plan.model_dump(mode="json", exclude_none=True, exclude_defaults=True)}
         system = PROMPT + json.dumps(ANALYSIS_TOOLS, ensure_ascii=False)
-        if get_settings().llm_provider != 'ollama':
+        if get_settings().llm_provider == 'openai_compatible':
             system += "\nJSON schema：" + json.dumps(PlanReviewDecision.model_json_schema(), ensure_ascii=False, separators=(",", ":"))
         attempts = []
         audit = {"status": "unavailable", "attempts": attempts}

@@ -3,6 +3,7 @@ import re
 import logging
 from collections import defaultdict
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from datetime import datetime
 from time import perf_counter
 from typing import Any
@@ -23,6 +24,7 @@ from app.agent.prompts import BOOK_AGENT_ANALYSIS_PROMPT, BOOK_AGENT_SYSTEM_PROM
 from app.clients.bookkeeping_api import BookkeepingApiClient
 from app.core.llm import get_chat_model
 from app.core.config import get_settings
+from app.core.model_usage import TurnUsage, capture_usage, current_usage
 from app.memory.store import MongoMemoryStore, conversation_scope
 from app.schemas.plan import AgentPlan, AnalysisRequest, ToolCall
 from app.tools.order_calculations import (
@@ -97,6 +99,34 @@ class BookAgent:
         family_id: str | None = None,
         new_session: bool = False,
     ) -> AsyncIterator[dict[str, str]]:
+        usage = TurnUsage()
+        stream = self._stream_chat(
+            phone_num=phone_num, message=message, session_id=session_id,
+            mode=mode, family_id=family_id, new_session=new_session,
+        )
+        try:
+            while True:
+                # A consumer can resume or close this generator in another
+                # task. Bind and reset within each advance, before yielding.
+                with capture_usage(usage):
+                    try:
+                        event = await anext(stream)
+                    except StopAsyncIteration:
+                        return
+                yield event
+        finally:
+            with capture_usage(usage):
+                await stream.aclose()
+
+    async def _stream_chat(
+        self,
+        phone_num: str,
+        message: str,
+        session_id: str | None = None,
+        mode: str = "个人版",
+        family_id: str | None = None,
+        new_session: bool = False,
+    ) -> AsyncIterator[dict[str, str]]:
         # stream_chat 是整个 Agent 的主流程。
         # 前端看到的 status / thinking / delta / done 事件，都是从这里连续产出的。
         resolved_session_id: str | None = None
@@ -134,14 +164,15 @@ class BookAgent:
             )
 
             yield {"type": "status", "content": "正在规划账单查询"}
-            async for progress in with_progress(self._create_plan(
+            async with aclosing(with_progress(self._create_plan(
                 message=message, history=history_text, book_mode=book_mode,
                 previous_context=latest_context(history_messages),
-            ), '正在理解问题与已有会话'):
-                if progress['type'] == 'result':
-                    plan = progress['value']
-                else:
-                    yield progress
+            ), '正在理解问题与已有会话')) as progress_stream:
+                async for progress in progress_stream:
+                    if progress['type'] == 'result':
+                        plan = progress['value']
+                    else:
+                        yield progress
             yield {
                 "type": "status",
                 "content": f"查询计划：{plan.summary}",
@@ -157,16 +188,17 @@ class BookAgent:
                             f"分类={tool_call.args.cost_type or '不限'}"
                         ),
                     }
-                async for progress in with_progress(self._execute_tool_calls(
+                async with aclosing(with_progress(self._execute_tool_calls(
                     mode=book_mode,
                     family_id=family_id,
                     plan=plan,
                     question=message, history=history_text,
-                ), '正在查证备注、来源与分析依据'):
-                    if progress['type'] == 'result':
-                        orders_json = progress['value']
-                    else:
-                        yield progress
+                ), '正在查证备注、来源与分析依据')) as progress_stream:
+                    async for progress in progress_stream:
+                        if progress['type'] == 'result':
+                            orders_json = progress['value']
+                        else:
+                            yield progress
                 yield {"type": "status", "content": self._query_status(orders_json)}
             else:
                 # 不需要查账单时，也统一给后续模型一个结构稳定的空结果。
@@ -217,17 +249,18 @@ class BookAgent:
                              ((plan.output.table or plan.output.export) and 'trends' in needs)}
                 artifacts = build_artifacts(results, output,
                     window=plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None)
-                async for progress in with_progress(self.reporter.answer(
+                async with aclosing(with_progress(self.reporter.answer(
                     message, plan._analysis_context, results, history=history_text,
                     instruction=plan.finalInstruction, artifacts=artifacts,
                     understanding=plan.understanding.model_dump(), analysis_scope={
                         'historyWindow': plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None,
                         'primaryTasks': [task.model_dump(mode='json', exclude_none=True) for task in plan.analyses if not task._supplemental]
-                    }), '正在核对分析结论与问题要求'):
-                    if progress['type'] == 'result':
-                        reply, validation = progress['value']
-                    else:
-                        yield progress
+                    }), '正在核对分析结论与问题要求')) as progress_stream:
+                    async for progress in progress_stream:
+                        if progress['type'] == 'result':
+                            reply, validation = progress['value']
+                        else:
+                            yield progress
                 assistant_chunks.append(reply)
                 yield {'type': 'delta', 'content': reply}
                 if artifacts:
@@ -368,9 +401,12 @@ class BookAgent:
                       "planningReview": plan._semantic_review,
                       "analysisContext": plan._analysis_context, "validation": validation or {},
                       "planningIssues": plan._planning_issues,
+                      "modelUsage": (current_usage() or TurnUsage()).snapshot(),
                       "model": {"provider": settings.llm_provider, "name": settings.llm_model,
                                 "reportMechanism": "computed_findings",
-                                "planningTemperature": 0,
+                                "planningTemperature": None if settings.llm_provider == 'openai' else 0,
+                                "api": 'responses' if settings.llm_provider == 'openai' else
+                                    'chat_completions' if settings.llm_provider == 'openai_compatible' else 'ollama',
                                 "reasoning": settings.llm_reasoning,
                                 "planningReasoning": settings.planner_reasoning,
                                 "intentReasoning": settings.intent_reasoning,
