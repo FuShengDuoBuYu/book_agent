@@ -75,8 +75,15 @@ def reference_issues(value, template, start, context):
         item = lookup.get(match[1])
         if item and item['unit'] in {'month', 'date'}:
             inline.append(str(item['value'])[:7])
-    if inline and value['unit'] == '元' and verified_month and inline[-1] != verified_month:
-        issues.append('日期引用与金额所属月份不一致')
+    if inline and value['unit'] == '元' and verified_month:
+        expected = inline[-1]
+        if len(inline) > 1 and '分别' in fragment:
+            paired = fragment.rsplit('分别', 1)[1]
+            index = sum(lookup.get(m[1], {}).get('unit') == '元' for m in SLOT.finditer(paired))
+            if index < len(inline):expected = inline[index]
+        if expected != verified_month:
+            issues.append('日期引用与金额所属月份不一致：{{' + value['id'] + '}}属于' + verified_month
+                          + '，当前配对日期为' + expected + '；按月份逐项对应或分句写')
     return issues
 
 

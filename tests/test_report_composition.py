@@ -78,6 +78,17 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(validate_draft(draft('缺少支付方式{{v1}}，会影响相关归集但不证明金额错误。'), data), [])
         self.assertEqual(validate_draft(draft('{{v1}}账单缺少支付方式，会影响归集。'), data), [])
 
+    def test_parallel_months_and_amounts_are_checked_in_their_respective_order(self):
+        facts = [fact('aug', group='g1', tool='trends', month='2026-08', values=[{'label':'已记结余','value':-100,'unit':'元'}]),
+                 fact('sep', group='g2', tool='trends', month='2026-09', values=[{'label':'已记结余','value':-200,'unit':'元'}])]
+        for f in facts:f['calendars']=[f['binding']['month']]
+        data = context(facts=facts, findings={g:{'scope':'个人版','tool':'trends','states':{}} for g in ['g1','g2']})
+        refs = {(v['factId'],v['unit']): '{{'+v['id']+'}}' for v in data.values if '绝对值' not in v['role']}
+        text = refs['aug','month']+'和'+refs['sep','month']+'分别结余'+refs['aug','元']+'、'+refs['sep','元']+'。'
+        self.assertEqual(validate_draft(draft(text,ids=('aug','sep')),data),[])
+        swapped = refs['aug','month']+'和'+refs['sep','month']+'分别结余'+refs['sep','元']+'、'+refs['aug','元']+'。'
+        self.assertTrue(validate_draft(draft(swapped,ids=('aug','sep')),data))
+
     def test_short_reference_month_question_answers_the_method_first(self):
         from app.agent.report_evidence import judgment_leads
         self.assertFalse(judgment_leads({'question': '这个预测参考哪几个月？'}))
@@ -109,6 +120,7 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
         issues = validate_draft(draft('原始备注是{{n9999}}。'), data)
         self.assertIn('{{n9999}}', ' '.join(issues))
         self.assertTrue(validate_draft(draft('收入为{{v1}}。'), data))
+        self.assertIn('f2', ' '.join(validate_draft(draft('收入为{{v1}}。'), data)))
         self.assertTrue(validate_draft(draft(ids=('unknown',)), data))
 
     def test_same_amount_does_not_make_a_historical_sample_a_forecast(self):

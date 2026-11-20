@@ -91,7 +91,7 @@ def validate_draft(draft, context):
             if key in values:
                 value = values[key]
                 if value['factId'] not in ids:
-                    issues.append('数量引用不属于本句的证据')
+                    issues.append('引用{{' + key + '}}属于证据' + value['factId'] + '；将该事实加入本句factIds，或改用本句所引事实中对应角色的引用')
                 issues.extend(reference_issues(value, statement.text, match.start(), context))
                 if value['unit'] in {'笔', '组', '项', '个'}:
                     before = re.split(r'[。；，,\n]', statement.text[:match.start()])[-1].strip()
