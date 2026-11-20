@@ -7,15 +7,95 @@ import json
 from app.schemas.plan import AgentPlan, ScenarioChange, ToolCall
 
 FIELDS = ('months', 'startingBalance', 'targetAmount', 'monthlyImprovement',
-          'purchaseAmount', 'reserveAmount', 'targetMonth')
-DECISION_TOOLS = {'projection', 'scenario', 'savings', 'optimization', 'purchase', 'runway'}
+          'purchaseAmount', 'reserveAmount')
+DECISION_TOOLS = {'forecast', 'projection', 'scenario', 'savings', 'optimization', 'purchase', 'runway', 'budget'}
+
+
+def _observed_source_directions(metadata, context):
+    # A complete all-direction catalog can disambiguate income from expense.
+    # Do not transfer an unbound result from another ledger or filtered query.
+    from app.tools.order_search import normalize_cost_type
+    from app.tools.registry import PLANNER_TOOL_BY_NAME
+
+    scopes = context.get('scope') or []
+    evidence = metadata.get('evidence') or {}
+    if len(scopes) != 1 or not evidence.get('ok') or context.get('ambiguous'):
+        return {}
+    expected = tuple(scopes[0])
+    mode = PLANNER_TOOL_BY_NAME.get(expected[0], (None,))[0]
+    if not mode:
+        return {}
+    queries = (metadata.get('plan') or {}).get('toolCalls') or context.get('conversation', {}).get('queries', [])
+    bindings = defaultdict(set)
+    for query in queries:
+        tool = query.get('toolName')
+        if PLANNER_TOOL_BY_NAME.get(tool, (None,))[0] != mode:
+            continue
+        args = query.get('args') or {}
+        scope = (tool, normalize_cost_type(args.get('cost_type')), args.get('remark') or '')
+        for key in query.get('sourceIds') or [query.get('id')]:
+            bindings[key].add(scope)
+    found = defaultdict(set)
+    for result in evidence.get('analysisResults', []):
+        if result.get('tool') != 'sources' or result.get('mode') != mode:
+            continue
+        keys = result.get('queryIds') or bindings.keys()
+        if not keys or any(bindings.get(key) != {expected} for key in keys):
+            continue
+        catalog = result.get('evidence') or {}
+        if catalog.get('catalogMetric') not in {'all', 'net'} or catalog.get('omittedSourceCount') != 0:
+            continue
+        for row in catalog.get('sources', []):
+            label, metric = row.get('source'), row.get('metric')
+            if isinstance(label, str) and 0 < len(label) <= 160 and metric in {'income', 'expense'}:
+                found[label].add(metric)
+        if len(found) > 100:
+            return {}
+    return {name: sorted(roles) for name, roles in found.items()}
 
 
 def latest_context(messages):
     for message in reversed(messages):
         if message.get('role') == 'assistant':
-            return message.get('metadata', {}).get('analysisContext', {})
+            metadata = message.get('metadata') or {}
+            context = deepcopy(metadata.get('analysisContext') or {})
+            if metadata.get('status') == 'error':
+                # This snapshot came from the same session's last confirmed
+                # turn, before the failed planner could mutate its own copy.
+                # Failed turns have no new evidence from which to infer roles.
+                return context if metadata.get('contextOrigin') == 'prior_confirmed_turn' else {}
+            context.pop('observedSourceDirections', None)
+            directions = _observed_source_directions(metadata, context)
+            if directions:
+                context['observedSourceDirections'] = directions
+            return context
     return {}
+
+
+def source_direction_of(name, prior):
+    # Prefer an exact ledger label. A shorthand can identify exactly one observed
+    # label in one direction, or one source already bound in the user's scenario.
+    candidates = defaultdict(set)
+    for label, roles in prior.get('observedSourceDirections', {}).items():
+        if name in label:
+            candidates[label].update(roles)
+    for change in prior.get('changes', []):
+        label, role = change.get('source'), change.get('metric')
+        if label and name in label and role in {'income', 'expense'}:
+            candidates[label].add(role)
+    if name in candidates:
+        candidates = {name: candidates[name]}
+    matches = [(label, role) for label, roles in candidates.items() for role in roles]
+    return matches[0] if len(matches) == 1 else None
+
+
+def remove_withdrawn_changes(context, keys):
+    # Cached tasks may supply a later source-only follow-up as well as the next decision.
+    states = [context, *context.get('scenarios', []), *context.get('activeAnalyses', []),
+              *context.get('conversation', {}).get('analyses', [])]
+    for state in states:
+        if 'changes' in state:
+            state['changes'] = [c for c in state['changes'] if (c['metric'], c.get('source') or '') not in keys]
 
 
 def merge_changes(previous, current):
@@ -28,19 +108,34 @@ def merge_changes(previous, current):
 def resolve_group(tasks, previous, scope):
     state = deepcopy(previous)
     state.pop('previousMonths', None)
-    delta = {task.monthsDelta for task in tasks if task.monthsDelta is not None}
+    for task in tasks:
+        if task.targetMonth is None:
+            task.targetMonth = state.get('budgetTargetMonth' if task.tool == 'budget' else 'targetMonth')
+        if task.tool == 'budget':
+            if task.budgetAmount is None:
+                task.budgetAmount = state.get('budgetAmount')
+            if task.budgetAmount is not None:
+                state['budgetAmount'] = task.budgetAmount
+            if task.targetMonth:
+                state['budgetTargetMonth'] = task.targetMonth
+    future_targets = {task.targetMonth for task in tasks if task.tool != 'budget' and task.targetMonth}
+    if len(future_targets) == 1:
+        state['targetMonth'] = next(iter(future_targets))
+    elif len(future_targets) > 1:
+        state.pop('targetMonth', None)
+    delta = {task.monthsDelta for task in tasks if task.monthsDelta not in (None, 0)}
     if len(delta) > 1:
         raise ValueError('Multiple incompatible deadline changes')
     if delta:
         if not state.get('months'):
             raise ValueError('延长期限需要上一轮明确的月数，请确认期限')
         state['previousMonths'] = state['months']
-        state['months'] += delta.pop()
+        state['months'] += next(iter(delta))
         if not 1 <= state['months'] <= 600:
             raise ValueError('Resulting horizon must be between 1 and 600 months')
     for field in FIELDS:
         values = {getattr(task, field) for task in tasks if getattr(task, field) is not None
-                  and not (field == 'months' and task.monthsDelta is not None)}
+                  and not (field == 'months' and delta)}
         if len(values) > 1:
             raise ValueError('同一情景存在互相冲突的条件，请分成独立情景')
         if values:
@@ -89,14 +184,32 @@ def resolve_context(plan: AgentPlan, previous: dict, book_mode='个人版') -> d
         if inherit and previous.get('ambiguous'):
             raise ValueError('上轮比较了多个情景，请明确要沿用的情景及条件')
         prior = previous if inherit else {}
-        alternatives = any(count > 1 for count in Counter(task.tool for task in tasks).values())
+        alternatives = any(count > 1 for count in Counter((task.tool, task.metric) for task in tasks).values())
         batches = [[task] for task in tasks] if alternatives else [tasks]
         states.extend(resolve_group(batch, prior, scope) for batch in batches)
     if len(states) == 1:
         state = states[0]
     elif states:
         state = {'ambiguous': True, 'scenarios': states}
+        scopes = {json.dumps(row['scope'], ensure_ascii=False) for row in states}
+        if len(scopes) == 1:
+            state['scope'] = json.loads(next(iter(scopes)))
     else:
-        state = deepcopy(previous) if plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext else {}
+        current_scope = [list(row) for row in sorted(set(sources.values()))]
+        inherit = (plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext
+                   and previous.get('scope') == current_scope)
+        state = deepcopy(previous) if inherit else {}
+        state['scope'] = current_scope
     plan._analysis_context = state
     return state
+
+
+def logical_queries(plan):
+    queries = {}
+    for call in plan.toolCalls:
+        for identifier in call.sourceIds or [call.id]:
+            args = call.args.model_dump()
+            if plan.analyses:
+                args.update(year=None, month=None, day=None)
+            queries[identifier] = {'id': identifier, 'toolName': call.toolName, 'args': args}
+    return list(queries.values())

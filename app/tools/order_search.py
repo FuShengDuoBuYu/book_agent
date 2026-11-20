@@ -1,3 +1,9 @@
+import hashlib
+import hmac
+import os
+import re
+import secrets
+from collections import defaultdict
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -6,6 +12,55 @@ import httpx
 
 from app.clients.bookkeeping_api import BookkeepingApiClient
 from app.schemas.orders import SearchOrdersRequest, SearchOrdersResponse
+
+
+# Provision this secret once per deployment so restored conversations and workers
+# use the same pseudonyms. Development sessions can operate without persistent keys.
+_MEMBER_SECRET = os.environ.get("AGENT_MEMBER_KEY_SECRET", "").encode() or secrets.token_bytes(32)
+_PRIVATE_NUMBER = r"(?<!\d)(?:\+?86[ -]?)?1[3-9]\d[ -]?\d{4}[ -]?\d{4}(?!\d)|(?<!\d)\d{12,19}(?!\d)"
+
+
+def _opaque_key(kind: str, value: str) -> str:
+    digest = hmac.new(_MEMBER_SECRET, (kind + "\0" + value).encode(), hashlib.sha256)
+    return kind + "_" + digest.hexdigest()[:24]
+
+
+def _public_orders(data, family_scope: str, query: dict) -> tuple[list[dict], dict]:
+    profiles = {str(user["phoneNum"]): user for user in data.userInfo if user.get("phoneNum")}
+    private_values = set(profiles) | {order.userId for order in data.ordersInfo} | {family_scope}
+    private_values.update(str(user.get("familyId") or "") for user in data.userInfo)
+    patterns = [re.escape(value) for value in sorted(private_values - {""}, key=len, reverse=True)]
+    private = re.compile("|".join([_PRIVATE_NUMBER, *patterns]))
+
+    def redact(value: str) -> str:
+        return private.sub("[已隐藏]", value)
+
+    members = {}
+    names = defaultdict(list)
+    for owner in profiles.keys() | {order.userId for order in data.ordersInfo}:
+        key = _opaque_key("member", owner) if owner else "member_unknown"
+        profile = profiles.get(owner, {})
+        candidates = [str(profile.get(field) or "").strip() for field in ("nickname", "familyIdentity")]
+        name = next((label[:48] for label in candidates if label and not private.search(label)), "")
+        members[owner] = (key, name or ("未知成员 " + key[-6:] if owner else "未知成员"))
+        if name:
+            names[name].append((key, owner))
+    for name, owners in names.items():
+        if len(owners) > 1:
+            for index, (key, owner) in enumerate(sorted(owners), 1):
+                members[owner] = (key, f"{name}（成员{index}）")
+
+    records = []
+    for order in data.ordersInfo:
+        row = order.model_dump(exclude={"userId", "id"})
+        for field in ("orderRemark", "costType", "bankName", "clock"):
+            row[field] = redact(row[field])
+        # Distinct ledger rows can have identical public fields when queries overlap.
+        if order.id is not None:
+            row["id"] = _opaque_key("order", str(order.id))
+        row["memberKey"], row["memberName"] = members[order.userId]
+        records.append(row)
+    return records, {key: redact(value) if isinstance(value, str) else value for key, value in query.items()}
 
 
 async def search_orders(
@@ -43,20 +98,20 @@ async def search_orders(
     except (httpx.HTTPError, ValueError):
         return {"ok": False, "error": "bookkeeping_unavailable"}
 
-    orders = [order.model_dump(exclude={"userId"}) for order in parsed.data.ordersInfo]
+    orders, public_query = _public_orders(parsed.data, family_scope, request.model_dump(by_alias=True))
     if should_filter_locally:
         orders = filter_orders_locally(orders, month=month, day=day)
 
     return {
         "ok": parsed.success,
         "mode": mode,
-        "query": request.model_dump(by_alias=True),
+        "query": public_query,
         "localFilter": {
             "enabled": should_filter_locally,
             "month": month,
             "day": day,
         },
-        "normalizedCostType": normalized_cost_type,
+        "normalizedCostType": public_query["searchCostType"],
         "userFound": bool(parsed.data.userInfo),
         "ordersInfo": orders,
         "orderCount": len(orders),
@@ -72,6 +127,7 @@ def normalize_cost_type(value: str | None) -> str:
         "不限",
         "全部",
         "所有",
+        "收入", "收支", "进账", "收入明细", "income", "incomes", "expense", "expenses", "all",
         "支出",
         "花费",
         "消费",
@@ -85,7 +141,7 @@ def normalize_cost_type(value: str | None) -> str:
         "各分类",
         "分类",
     }
-    return "不限" if cost_type in broad_words else cost_type
+    return "不限" if cost_type.lower() in broad_words else cost_type
 
 
 def filter_orders_locally(

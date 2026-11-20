@@ -10,8 +10,10 @@ import re
 from calendar import monthrange
 from collections import Counter, defaultdict
 from datetime import date
+from decimal import Decimal
 from statistics import median, quantiles
 
+from app.tools.aggregate_analysis import aggregate_analysis, _query_union
 from app.tools.order_calculations import (
     calculate_category_breakdown,
     calculate_order_summary,
@@ -22,7 +24,19 @@ from app.tools.order_calculations import (
 )
 
 
+from app.tools.source_analysis import (
+    income_source_forecasts,
+    money,
+    nonrecurring_income as _nonrecurring_income,
+    source_aliases,
+    source_catalog,
+    source_rows,
+)
+
+
 ANALYSIS_TOOLS = {
+    "aggregate": "按自选月份、年份、成员、来源、类别、支付方式、星期分组；筛选金额和备注、比较历史区间与统计每笔金额。",
+    "sources": "按记账成员、原始备注归集收入和支出来源，给出分类、月度金额、剔除项和覆盖范围",
     "cashflow": "收入、支出、净现金流、笔数和分类结构",
     "trends": "按月和按日的趋势，区分本月未结束与完整月份",
     "changes": "最近两个完整月份收支变化及各类别贡献，解释变化来自哪里",
@@ -79,16 +93,6 @@ def _source(order: dict) -> str:
     return category
 
 
-def _nonrecurring_income(order: dict) -> bool:
-    text = f"{order.get('costType', '')} {order.get('orderRemark', '')}"
-    if any(word in text for word in ("退款", "退货", "报销", "借款", "借入", "归还借款", "出售", "卖车", "旧车", "二手", "一次性", "年终奖")):
-        return True
-    earned = ("工资", "薪", "家教", "课时", "授课", "劳务", "兼职", "稿费", "租金", "助研", "助教", "补贴")
-    if any(word in text for word in earned):
-        return False
-    return any(word in text for word in ("转入", "转账", "存款", "借还", "红包", "礼金", "报账"))
-
-
 def _totals(orders: list[dict]) -> dict:
     return json.loads(calculate_order_summary(json.dumps({"ordersInfo": orders})))
 
@@ -136,11 +140,24 @@ def _cashflow(orders: list[dict], *, as_of: date, **kwargs) -> dict:
     complete = [row for row in _series(orders, as_of, kwargs.get("window_start"), kwargs.get("window_end")) if not row["partial"]]
     averages = {name: _round_money(sum(row[field] for row in complete) / len(complete)) if complete else None
                 for name, field in (("income", "incomeTotal"), ("expense", "expenseTotal"), ("net", "netIncomeMinusExpense"))}
-    averages["netIncomeRatioPercent"] = _round_money(averages["net"] / averages["income"] * 100) if averages["income"] else None
+    complete_income = sum(row["incomeTotal"] for row in complete)
+    complete_net = sum(row["netIncomeMinusExpense"] for row in complete)
+    averages["netIncomeRatioPercent"] = _round_money(complete_net / complete_income * 100) if complete_income else None
+    query_ranges = _query_union(kwargs.get('queried_intervals'))
+    window_start, window_end = kwargs.get('window_start'), kwargs.get('window_end')
+    if query_ranges is None and window_start and window_end:
+        query_ranges = [(window_start, window_end)]
+    if query_ranges is not None:
+        query_ranges = [{'startDate': max(start, window_start or date.min).isoformat(),
+                         'endDate': min(end, window_end or as_of, as_of).isoformat()}
+                        for start, end in query_ranges
+                        if max(start, window_start or date.min) <= min(end, window_end or as_of, as_of)]
     categories = json.loads(calculate_category_breakdown(payload))
     for row in categories["expenseCategories"]:
         row["shareOfIncomePercent"] = _round_money(row["amount"] / income * 100) if income else None
-    return {**summary, **categories,
+    ratio_text = (f"完整月份结余率 {averages['netIncomeRatioPercent']}%"
+                  if averages['netIncomeRatioPercent'] is not None else "完整月份已记收入为零，结余率不适用")
+    return {**summary, **categories, "queryIntervals": query_ranges,
             **json.loads(calculate_payment_method_breakdown(payload)),
             **json.loads(calculate_remark_breakdown(payload)),
             "expenseIncomeRatioPercent": _round_money(summary["expenseTotal"] / income * 100) if income else None,
@@ -149,7 +166,7 @@ def _cashflow(orders: list[dict], *, as_of: date, **kwargs) -> dict:
                                "sharePercent": _round_money(amount / income * 100) if income else None}
                               for name, amount in sorted(sources.items(), key=lambda item: item[1], reverse=True)][:20],
             "completeMonthAverage": {**averages, "months": [row["month"] for row in complete]},
-            "computedConclusion": (f"完整月份共 {len(complete)} 个，月均收入 {averages['income']} 元，月均支出 {averages['expense']} 元，月均结余 {averages['net']} 元，完整月份结余率 {averages['netIncomeRatioPercent']}%。这组均值包含完整月份中的大额支出，不能用常态或中位数替换。" if complete else "缺少可计算月均值的完整月份。"),
+            "computedConclusion": (f"完整月份共 {len(complete)} 个，月均收入 {averages['income']} 元，月均支出 {averages['expense']} 元，月均结余 {averages['net']} 元，{ratio_text}。这组均值包含完整月份中的大额支出，不能用常态或中位数替换。" if complete else "缺少可计算月均值的完整月份。"),
             "interpretation": "支出占比说明结构，shareOfIncomePercent 才是该支出占收入的比例。资产与债务余额未知，不能据此判断抗风险能力或偿付压力。",
             "averageDefinition": "averageIncome 与 averageExpense 是每笔交易均值；completeMonthAverage 不含未完月份，外层比例为整个查询期累计比例。"}
 
@@ -176,22 +193,37 @@ def _changes(orders: list[dict], *, as_of: date, **kwargs) -> dict:
     result = {"sufficientData": True, "before": before, "after": after, **_change(before, after),
               "interpretation": f"变化只比较 {before['month']} 与 {after['month']} 两个完整月份。{as_of:%Y-%m} 尚未结束，无法据此断言趋势已恢复或未来将回落。"}
     for direction, positive in (("income", True), ("expense", False)):
-        amounts = []
+        periods = []
         for month in (before["month"], after["month"]):
-            groups = defaultdict(float)
+            groups = defaultdict(list)
             for order in buckets[month]:
-                money = float(order["money"])
-                if (money > 0) == positive and money != 0:
-                    groups[_source(order)] += abs(money)
-            amounts.append(groups)
-        result[direction + "Drivers"] = sorted([
-            {"name": name, "before": _round_money(amounts[0][name]),
-             "after": _round_money(amounts[1][name]),
-             "change": _round_money(amounts[1][name] - amounts[0][name]),
-             "afterRemarks": list(dict.fromkeys(str(row.get("orderRemark") or "") for row in buckets[after["month"]]
-                                                if _source(row) == name and (float(row["money"]) > 0) == positive))[:5]}
-            for name in amounts[0].keys() | amounts[1].keys()
-        ], key=lambda row: abs(row["change"]), reverse=True)[:20]
+                amount = float(order["money"])
+                if amount and (amount > 0) == positive:
+                    # Expense drivers are category contributions; remarks remain
+                    # supporting observations rather than replacing the category.
+                    name = _source(order) if positive else (str(order.get("costType") or "").strip() or "未分类")
+                    groups[name].append(order)
+            periods.append(groups)
+        drivers = []
+        for name in sorted(periods[0].keys() | periods[1].keys()):
+            first, second = (period.get(name, []) for period in periods)
+            a, b = (sum((abs(Decimal(str(row["money"]))) for row in items), Decimal(0)) for items in (first, second))
+            mean_a = a / len(first) if first else None
+            mean_b = b / len(second) if second else None
+            change = _round_money(float(b - a))
+            count_effect = mean_effect = None
+            if first and second:
+                count_effect = money((len(second) - len(first)) * (mean_a + mean_b) / 2)
+                # Assign the rounding remainder to the second component so their cents reconcile.
+                mean_effect = money(Decimal(str(change)) - Decimal(str(count_effect)))
+            drivers.append({"name": name, "before": _round_money(float(a)), "after": _round_money(float(b)),
+                            "change": change, "beforeCount": len(first), "afterCount": len(second),
+                            "meanAmountBefore": money(mean_a) if first else None,
+                            "meanAmountAfter": money(mean_b) if second else None,
+                            "countContribution": count_effect, "meanContribution": mean_effect,
+                            "afterRemarks": list(dict.fromkeys(str(row.get("orderRemark") or "") for row in second))[:5]})
+        result[direction + "Drivers"] = sorted(drivers, key=lambda row: abs(row["change"]), reverse=True)[:20]
+    result["driverMethod"] = "两期均有记录时，笔数贡献为笔数差乘两期每笔均额的均值；每笔均额贡献为剩余变化。仅分解已记录交易金额，不代表商品单价、购买次数或现实原因。"
     return result
 
 
@@ -228,87 +260,116 @@ def _anomalies(orders: list[dict], **kwargs) -> dict:
     }
 
 
-def _recurring(orders: list[dict], *, as_of: date, **kwargs) -> dict:
-    groups = defaultdict(list)
-    for order in orders:
-        direction = "income" if float(order["money"]) > 0 else "expense"
-        groups[(direction, _source(order))].append(order)
+def _recurring_summary(rows: list[dict], partial: set[str]) -> dict:
     result = {"income": [], "expense": []}
-    for (direction, source), items in groups.items():
-        month_totals = {month: sum(abs(float(row["money"])) for row in rows) for month, rows in _buckets(items).items()}
+    for row in rows:
+        month_totals = row["monthlyAmounts"]
         if len(month_totals) < 2:
             continue
-        dates = sorted({_date(item) for item in items})
-        gaps = [(later - earlier).days for earlier, later in zip(dates, dates[1:])]
-        partial = [row["month"] for row in _series(items, as_of, kwargs.get("window_start"), kwargs.get("window_end")) if row["partial"]]
-        full_month_amounts = [amount for month, amount in month_totals.items() if month not in partial]
-        result[direction].append({
-            "source": source, "months": month_totals,
-            "typicalAmount": _round_money(median(full_month_amounts)) if full_month_amounts else None,
-            "partialMonths": partial,
-            "activeMonths": len(month_totals), "transactions": len(items),
-            "medianGapDays": median(gaps) if gaps else None,
-            "possibleNonrecurring": direction == "income" and any(_nonrecurring_income(item) for item in items),
+        full = [amount for month, amount in month_totals.items() if month not in partial]
+        result[row["metric"]].append({
+            "source": row["source"], "sourceKey": row["sourceKey"], "member": row["member"],
+            "memberKey": row["memberKey"], "months": month_totals,
+            "typicalAmount": money(median(full)) if full else None,
+            "partialMonths": sorted(month_totals.keys() & partial),
+            "activeMonths": len(month_totals), "transactions": row["recordCount"],
+            "medianGapDays": row["medianGapDays"], "possibleNonrecurring": row["excluded"],
         })
-    for rows in result.values():
-        rows.sort(key=lambda row: row["typicalAmount"] or 0, reverse=True)
-        del rows[20:]
+    for items in result.values():
+        items.sort(key=lambda row: row["typicalAmount"] or 0, reverse=True)
+        del items[20:]
     return result
 
 
-def _forecast(orders: list[dict], *, as_of: date, metric: str = "income", target_month: str | None = None, **kwargs) -> dict:
+def _recurring(orders: list[dict], *, as_of: date, source_groups=None, **kwargs) -> dict:
+    partial = {row["month"] for row in _series(orders, as_of, kwargs.get("window_start"), kwargs.get("window_end"))
+               if row["partial"]}
+    return _recurring_summary(source_rows(orders, source_aliases(orders, source_groups)), partial)
+
+
+def _forecast(orders: list[dict], *, as_of: date, metric: str = "income", target_month: str | None = None,
+              source_groups=None, window_start=None, window_end=None, **kwargs) -> dict:
     target = date.fromisoformat(target_month + "-01") if target_month else shift_month(as_of, 1)
     cutoff = min(as_of.replace(day=1), target)
-    start = shift_month(cutoff, -6)
-    history = [order for order in orders if start <= _date(order) < cutoff]
+    if window_start:
+        start = window_start.replace(day=1)
+    elif window_end:
+        start = min((_date(order) for order in orders), default=cutoff).replace(day=1)
+    else:
+        start = shift_month(cutoff, -6)
+    last = min(window_end or cutoff, cutoff)
+    month_count = (last.year - start.year) * 12 + last.month - start.month + 1
+    expected = (shift_month(start, offset) for offset in range(month_count))
+    complete = {
+        month.strftime("%Y-%m") for month in expected
+        if month < cutoff and (not window_start or month >= window_start)
+        and (not window_end or window_end >= month.replace(day=monthrange(month.year, month.month)[1]))
+    }
+    window_description = "用户指定的历史区间内，仅纳入目标月和本月之前的完整自然月" if window_start or window_end else "最近六个完整自然月内"
+    history = [order for order in orders if _date(order).strftime("%Y-%m") in complete]
     buckets = _buckets(history)
+    observed = list(buckets)
+    baseline = observed[-3:]
+    aliases = source_aliases(orders, source_groups)
+    rows = source_rows(history, aliases)
+    components = income_source_forecasts(rows, observed, baseline)
+
     values = []
-    excluded = 0.0
     for month, items in buckets.items():
         earned = [order for order in items if not (float(order["money"]) > 0 and _nonrecurring_income(order))]
         totals = _totals(earned)
-        excluded += sum(float(order["money"]) for order in items if float(order["money"]) > 0 and _nonrecurring_income(order))
-        values.append({"month": month, "income": totals["incomeTotal"], "expense": totals["expenseTotal"], "net": totals["netIncomeMinusExpense"]})
-    recent = values[-3:]
-    samples = [row[metric] for row in recent]
-    sufficient = len(samples) >= 2
-    estimate = None
+        values.append({"month": month, "income": totals["incomeTotal"], "expense": totals["expenseTotal"],
+                       "net": totals["netIncomeMinusExpense"]})
+    sufficient = len(baseline) >= 2
+    estimate = lower = upper = None
     if sufficient:
-        estimate = median(samples)
-        if metric == "net":
-            estimate = median(row["income"] for row in recent) - median(row["expense"] for row in recent)
-    expected = [shift_month(start, offset).strftime("%Y-%m") for offset in range(6)]
-    missing = [month for month in expected if month not in buckets]
+        expenses = [row["expense"] for row in values[-3:]]
+        expense = money(median(expenses))
+        income = money(sum(row["estimate"] for row in components))
+        lower_income = money(sum(row["lower"] for row in components))
+        upper_income = money(sum(row["upper"] for row in components))
+        if metric == "income":
+            estimate, lower, upper = income, lower_income, upper_income
+        elif metric == "expense":
+            estimate, lower, upper = expense, min(expenses), max(expenses)
+        else:
+            estimate = money(income - expense)
+            lower, upper = money(lower_income - max(expenses)), money(upper_income - min(expenses))
     return {
-        "metric": metric, "targetMonth": target.strftime("%Y-%m"),
-        "sufficientData": sufficient,
-        "estimate": _round_money(estimate) if sufficient else None,
-        "lower": min(samples) if sufficient else None,
-        "upper": max(samples) if sufficient else None,
-        "referenceValue": samples[-1] if samples else None,
-        "observedMonths": list(buckets), "missingMonths": missing,
-        "baselineMonths": [row["month"] for row in recent], "monthlyEvidence": values,
-        "excludedIncomeTotal": _round_money(excluded),
-        "sources": _recurring(history, as_of=as_of),
+        "metric": metric, "targetMonth": target.strftime("%Y-%m"), "sufficientData": sufficient,
+        "estimate": estimate, "lower": lower, "upper": upper,
+        "referenceValue": values[-1][metric] if values else None,
+        "observedMonths": observed, "missingMonths": sorted(complete.difference(observed)),
+        "baselineMonths": baseline, "monthlyEvidence": values,
+        "sourceForecasts": components if metric in {"income", "net"} else [],
+        "excludedIncomeTotal": money(sum(row["amount"] for row in rows if row["excluded"])),
+        "sources": _recurring_summary(rows, set()),
         "latestCompleteChange": _changes(history, as_of=as_of),
-        "method": "最近六个完整自然月内，取最近三个有账单月份的收入和支出中位数作为月度基准，结余为两者之差，最小值和最大值作为历史情景范围。",
+        "method": window_description + "，取最近三个有账单的完整月份。每个成员的每个收入来源按月取中位数后加总；支出取月总额中位数，结余用两者相减。区间组合各来源的历史最低与最高贡献，支出区间取历史最小和最大月总额。",
         "limitations": [
-            "历史情景范围不表示统计置信区间或收入保证。",
-            "账单空白月份未按零处理，账本完整性需要用户确认。",
+            "同一月份各来源的极值未必同时发生。区间不表示统计置信区间或收入保证。",
+            "有其他账单但某来源无记录，该来源当月记作零贡献。全月没有账单则未知，不进入基准。",
+            "新出现、零星出现及基准期未出现仅描述记账记录，不能证明未来入账或就业变化。",
             "显式退款、报销、借款、资产出售、一次性入账与内部转入从预测收入剔除，备注识别可能有误。",
             "岗位、课时、季节、节假日及未来大额支出变化需要用户补充。",
         ],
     }
 
 
+def forecast_scope(options: dict) -> dict:
+    return {key: options[key] for key in ("source_groups", "target_month", "window_start", "window_end")
+            if key in options}
+
+
 def _scenario(orders: list[dict], *, as_of: date, target_month=None, changes=None, **kwargs) -> dict:
-    income = _forecast(orders, as_of=as_of, metric="income", target_month=target_month)
-    expense = _forecast(orders, as_of=as_of, metric="expense", target_month=target_month)
+    scope = {"target_month": target_month, **forecast_scope(kwargs)}
+    income = _forecast(orders, as_of=as_of, metric="income", **scope)
+    expense = _forecast(orders, as_of=as_of, metric="expense", **scope)
     changes = changes or []
     if not income["sufficientData"] or not changes:
         return {"sufficientData": False, "baseline": income, "reason": "需要历史月度基准和用户明确给出的变化金额或次数。"}
     from app.tools.decision_analysis import apply_changes
-    adjusted = apply_changes(orders, income, expense, changes)
+    adjusted = apply_changes(orders, income, expense, changes, source_groups=scope.get("source_groups"))
     if not adjusted["sufficientData"]:
         return adjusted
     totals, assumptions = adjusted["totals"], adjusted["assumptions"]
@@ -317,7 +378,7 @@ def _scenario(orders: list[dict], *, as_of: date, target_month=None, changes=Non
     ratio = _round_money(net / totals["income"] * 100) if totals["income"] else None
     return {"sufficientData": True, **totals, "net": net,
             "baselineNet": baseline_net, "netChange": _round_money(net - baseline_net), "netIncomeRatioPercent": ratio,
-            "computedConclusion": f"在用户假设实现且其他收支延续历史基准的条件下，收入 {totals['income']} 元，支出 {totals['expense']} 元，结余 {net} 元，结余占收入 {ratio}%。基准结余 {baseline_net} 元，改善 {_round_money(net - baseline_net)} 元。这不证明真实资产或抗风险能力。",
+            "computedConclusion": f"在用户假设实现且其他收支延续历史基准的条件下，收入 {totals['income']} 元，支出 {totals['expense']} 元，结余 {net} 元，{('结余占收入 ' + str(ratio) + '%') if ratio is not None else '收入为零，结余率不适用'}。基准结余 {baseline_net} 元，改善 {_round_money(net - baseline_net)} 元。这不证明真实资产或抗风险能力。",
             "assumptions": assumptions, "baseline": {"income": income, "expense": expense}}
 
 
@@ -345,9 +406,10 @@ def _budget(orders: list[dict], *, as_of: date, target_month=None, budget_amount
 
 def _savings(orders: list[dict], *, as_of: date, starting_balance=None, target_amount=None, months=None, **kwargs) -> dict:
     missing = [name for name, value in (("startingBalance", starting_balance), ("targetAmount", target_amount)) if value is None]
-    baseline = _forecast(orders, as_of=as_of, metric="net")
+    scope = forecast_scope(kwargs)
+    baseline = _forecast(orders, as_of=as_of, metric="net", **scope)
     if kwargs.get("changes"):
-        changed = _scenario(orders, as_of=as_of, changes=kwargs["changes"])
+        changed = _scenario(orders, as_of=as_of, changes=kwargs["changes"], **scope)
         if not changed["sufficientData"]:
             return changed
         baseline = {**baseline, "estimate": changed["net"], "assumptions": changed["assumptions"]}
@@ -371,7 +433,8 @@ def _savings(orders: list[dict], *, as_of: date, starting_balance=None, target_a
 
 
 _IMPLEMENTATIONS = {
-    "cashflow": _cashflow, "trends": _trends, "changes": _changes,
+    "aggregate": aggregate_analysis,
+    "sources": source_catalog, "cashflow": _cashflow, "trends": _trends, "changes": _changes,
     "anomalies": _anomalies, "recurring": _recurring, "forecast": _forecast, "scenario": _scenario,
     "budget": _budget, "savings": _savings,
 }

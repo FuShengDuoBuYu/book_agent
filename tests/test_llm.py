@@ -8,12 +8,50 @@ from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
 from app.core.config import get_settings
-from app.core.llm import get_chat_model, get_planner_model
+from app.core.llm import get_chat_model, get_planner_model, get_structured_model
 
 
 class ModelConfigurationTests(unittest.IsolatedAsyncioTestCase):
+    def test_native_planner_schema_requires_execution_not_only_an_intent_description(self):
+        from app.tools.financial_analysis import ANALYSIS_TOOLS
+        from app.tools.registry import PLANNER_TOOL_BY_NAME
+        with patch.dict(os.environ, {'LLM_PROVIDER': 'ollama'}, clear=True):
+            schema = get_planner_model().format
+        self.assertTrue({'understanding', 'analyses', 'toolCalls', 'analysisWindow', 'finalInstruction'} <= set(schema.get('required', [])))
+        analysis = schema['$defs']['AnalysisRequest']
+        self.assertEqual(set(analysis['properties']['tool']['enum']), set(ANALYSIS_TOOLS))
+        self.assertTrue({'tool', 'queryIds', 'metric', 'targetMonth'} <= set(analysis['required']))
+        self.assertEqual(set(schema['$defs']['ToolCall']['properties']['toolName']['enum']), set(PLANNER_TOOL_BY_NAME))
+        evidence = schema['$defs']['IntentUnderstanding']['properties']['evidenceNeeds']['items']['enum']
+        self.assertTrue({'runway', 'savings', 'cashflow', 'data_quality', 'members', 'totals'} <= set(evidence))
+
+    def test_planner_schema_requires_explicit_grouping_filters_and_horizon_fields(self):
+        with patch.dict(os.environ, {'LLM_PROVIDER': 'ollama'}, clear=True):
+            schema = get_planner_model().format
+        self.assertTrue({'aggregate', 'changes', 'months'} <= set(schema['$defs']['AnalysisRequest']['required']))
+        self.assertTrue({'groupBy', 'periods', 'filters'} <= set(schema['$defs']['AggregateSpec']['required']))
+        self.assertTrue({'includeCategories', 'excludeCategories'} <= set(schema['$defs']['AggregateFilters']['required']))
+
+    def test_report_outline_has_an_independent_actual_output_budget(self):
+        from app.agent.report_composition import OUTLINE_TOKENS, ReportOutline
+        with patch.dict(os.environ, {'LLM_PROVIDER': 'ollama', 'PLANNER_NUM_PREDICT': '4096'}, clear=True):
+            outline = get_structured_model(ReportOutline, reasoning=False, num_predict=OUTLINE_TOKENS)
+            planner = get_planner_model()
+        self.assertEqual(outline.bound.num_predict, 768)
+        self.assertFalse(outline.bound.reasoning)
+        self.assertEqual(planner.num_predict, 4096)
+        self.assertFalse(planner.reasoning)
+
+    def test_native_report_asks_only_for_an_evidence_outline(self):
+        from app.agent.report_composition import ReportOutline
+        with patch.dict(os.environ, {'LLM_PROVIDER': 'ollama'}, clear=True):
+            outline = get_structured_model(ReportOutline, reasoning=False, num_predict=768)
+        fields = outline.kwargs['format']['$defs']['OutlineSection']['properties']
+        self.assertEqual(set(fields), {'title', 'answerGoal', 'factIds'})
+        self.assertEqual(fields['factIds']['maxItems'], 8)
+
     def setUp(self):
-        for factory in (get_settings, get_chat_model, get_planner_model):
+        for factory in (get_settings, get_chat_model, get_planner_model, get_structured_model):
             factory.cache_clear()
             self.addCleanup(factory.cache_clear)
 

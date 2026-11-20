@@ -41,7 +41,7 @@ class LedgerAccessTests(unittest.IsolatedAsyncioTestCase):
 
         agent = BookAgent(FixtureLedger())
         agent.memory = FixtureMemory()
-        agent.reporter.answer = AsyncMock(return_value=('合成账本分析完成', {'status': 'reviewed'}))
+        agent.reporter.answer = AsyncMock(return_value=('合成账本分析完成', {'status': 'grounded'}))
         plan = AgentPlan.model_validate({"analyses": [{"tool": "cashflow"}],
             "toolCalls": [{"toolName": "search_personal_orders"}]})
         with patch.object(agent, "_create_plan", AsyncMock(return_value=plan)):
@@ -50,6 +50,9 @@ class LedgerAccessTests(unittest.IsolatedAsyncioTestCase):
         metadata = agent.memory.messages[-1]["metadata"]
         self.assertTrue(metadata["evidence"]["analysisResults"])
         self.assertIsInstance(metadata["durationMs"], int)
+        self.assertEqual(metadata["analysisVersion"], 5)
+        self.assertIn("releaseRevision", metadata)
+        self.assertEqual(metadata["model"]["reportMechanism"], "computed_findings")
 
     async def test_analysis_payload_is_safe_for_answer_generation(self):
         agent = BookAgent(BookkeepingApiClient("fixture"))

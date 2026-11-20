@@ -43,6 +43,23 @@ class ConversationApiTests(unittest.TestCase):
 
 
 class ConversationStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_history_restores_only_validated_artifacts_without_private_evidence(self):
+        artifact = {'id': 'a1', 'kind': 'table', 'title': '来源', 'columns': [{'key': 'source', 'label': '来源'}],
+                    'rows': [{'source': '实习'}], 'notes': []}
+        rows = [{'_id': 'm1', 'role': 'assistant', 'content': '收入构成', 'createdAt': datetime.now(UTC),
+                 'metadata': {'artifacts': [artifact], 'privateEvidence': {'phoneNum': 'private'}}}]
+        cursor = Mock()
+        cursor.sort.return_value = cursor
+        cursor.limit.return_value = cursor
+        cursor.to_list = AsyncMock(return_value=rows)
+        db = SimpleNamespace(agent_sessions=SimpleNamespace(find_one=AsyncMock(return_value={'title': '已有对话'})),
+                             agent_messages=SimpleNamespace(find=Mock(return_value=cursor)))
+        with patch('app.memory.store.get_memory_db', return_value=db):
+            result = await MongoMemoryStore().get_session_messages('fixture', 'personal', 'chat')
+        self.assertEqual(result['messages'][0]['artifacts'][0]['rows'], [{'source': '实习'}])
+        self.assertNotIn('metadata', result['messages'][0])
+        self.assertNotIn('privateEvidence', str(result))
+
     async def test_pagination_keeps_same_timestamp_messages_and_hides_metadata(self):
         timestamp = datetime(2026, 11, 12, tzinfo=UTC)
         rows = [{"_id": key, "role": "assistant", "content": key, "createdAt": timestamp,

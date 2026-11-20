@@ -1,8 +1,10 @@
-import asyncio
 import json
+import re
 import logging
 from collections import defaultdict
 from collections.abc import AsyncIterator
+from contextlib import aclosing
+from copy import deepcopy
 from datetime import datetime
 from time import perf_counter
 from typing import Any
@@ -11,15 +13,21 @@ from zoneinfo import ZoneInfo
 from langchain_core.prompts import ChatPromptTemplate
 from langsmith import traceable
 
-from app.agent.planner import QueryPlanner
-from app.agent.analysis_context import latest_context
-from app.agent.evidence_report import EvidenceReporter
+from app.agent.planner import HISTORY_BASED_TOOLS, QueryPlanner
+from app.agent.analysis_context import latest_context, logical_queries
+from app.agent.evidence_report import EvidenceReporter, money
+from app.agent.report_values import literal
+from app.agent.artifacts import build_artifacts
+from app.agent.investigation import EvidenceInvestigator, merged_source_groups
+from app.agent.source_grouping import grounded_source_groups
+from app.agent.progress import with_progress
 from app.agent.prompts import BOOK_AGENT_ANALYSIS_PROMPT, BOOK_AGENT_SYSTEM_PROMPT
 from app.clients.bookkeeping_api import BookkeepingApiClient
 from app.core.llm import get_chat_model
 from app.core.config import get_settings
+from app.core.model_usage import TurnUsage, capture_usage, current_usage
 from app.memory.store import MongoMemoryStore, conversation_scope
-from app.schemas.plan import AgentPlan, ToolCall
+from app.schemas.plan import AgentPlan, AnalysisRequest, ToolCall
 from app.tools.order_calculations import (
     calculate_category_breakdown,
     calculate_order_summary,
@@ -30,8 +38,13 @@ from app.tools.order_calculations import (
 from app.tools.order_search import search_orders
 from app.tools.registry import PLANNER_TOOL_BY_NAME, format_tool_call
 from app.tools.financial_analysis import _date, merge_orders, run_analysis
+from app.agent.evidence_pipeline import collect_analysis_results
 
 logger = logging.getLogger(__name__)
+
+
+class PlanningUnavailableError(RuntimeError):
+    """Structured planning exhausted its bounded retries without a usable plan."""
 
 
 class BookAgent:
@@ -52,6 +65,7 @@ class BookAgent:
         self.memory = MongoMemoryStore()
         self.planner = QueryPlanner()
         self.reporter = EvidenceReporter()
+        self.investigator = EvidenceInvestigator()
 
     async def chat(
         self,
@@ -90,10 +104,40 @@ class BookAgent:
         family_id: str | None = None,
         new_session: bool = False,
     ) -> AsyncIterator[dict[str, str]]:
+        usage = TurnUsage()
+        stream = self._stream_chat(
+            phone_num=phone_num, message=message, session_id=session_id,
+            mode=mode, family_id=family_id, new_session=new_session,
+        )
+        try:
+            while True:
+                # A consumer can resume or close this generator in another
+                # task. Bind and reset within each advance, before yielding.
+                with capture_usage(usage):
+                    try:
+                        event = await anext(stream)
+                    except StopAsyncIteration:
+                        return
+                yield event
+        finally:
+            with capture_usage(usage):
+                await stream.aclose()
+
+    async def _stream_chat(
+        self,
+        phone_num: str,
+        message: str,
+        session_id: str | None = None,
+        mode: str = "个人版",
+        family_id: str | None = None,
+        new_session: bool = False,
+    ) -> AsyncIterator[dict[str, str]]:
         # stream_chat 是整个 Agent 的主流程。
         # 前端看到的 status / thinking / delta / done 事件，都是从这里连续产出的。
         resolved_session_id: str | None = None
         assistant_chunks: list[str] = []
+        user_message_saved = False
+        confirmed_context: dict[str, Any] = {}
         started_at = perf_counter()
         try:
             book_mode = self._normalize_mode(mode)
@@ -112,8 +156,9 @@ class BookAgent:
             history_messages = await self.memory.get_recent_messages(
                 phone_num=phone_num,
                 session_id=resolved_session_id,
-                limit=6,
+                limit=12,
             )
+            confirmed_context = latest_context(history_messages)
             yield {
                 "type": "status",
                 "content": f"已加载 {len(history_messages)} 条会话历史",
@@ -125,12 +170,25 @@ class BookAgent:
                 role="user",
                 content=message,
             )
+            user_message_saved = True
 
             yield {"type": "status", "content": "正在规划账单查询"}
-            plan = await self._create_plan(
+            async with aclosing(with_progress(self._create_plan(
                 message=message, history=history_text, book_mode=book_mode,
-                previous_context=latest_context(history_messages),
-            )
+                previous_context=deepcopy(confirmed_context),
+            ), '正在理解问题与已有会话')) as progress_stream:
+                async for progress in progress_stream:
+                    if progress['type'] == 'result':
+                        plan = progress['value']
+                    else:
+                        yield progress
+            if (plan.intent == 'unknown' and not plan.needsTools and not plan.analyses
+                    and any(issue.get('type') in {'TimeoutError', 'JSONDecodeError', 'ValidationError', 'ValueError'}
+                            for issue in plan._planning_issues)):
+                # A failed planner is not a completed financial turn. Route it
+                # through the same audited failure path as a provider error so
+                # the last confirmed context remains available for a retry.
+                raise PlanningUnavailableError()
             yield {
                 "type": "status",
                 "content": f"查询计划：{plan.summary}",
@@ -146,11 +204,17 @@ class BookAgent:
                             f"分类={tool_call.args.cost_type or '不限'}"
                         ),
                     }
-                orders_json = await self._execute_tool_calls(
+                async with aclosing(with_progress(self._execute_tool_calls(
                     mode=book_mode,
                     family_id=family_id,
                     plan=plan,
-                )
+                    question=message, history=history_text,
+                ), '正在查证备注、来源与分析依据')) as progress_stream:
+                    async for progress in progress_stream:
+                        if progress['type'] == 'result':
+                            orders_json = progress['value']
+                        else:
+                            yield progress
                 yield {"type": "status", "content": self._query_status(orders_json)}
             else:
                 # 不需要查账单时，也统一给后续模型一个结构稳定的空结果。
@@ -169,6 +233,8 @@ class BookAgent:
                 plan=plan,
                 orders_json=orders_json,
             )
+            if not deterministic_reply and not plan.analyses and (plan.needsTools or plan.intent != 'chat'):
+                deterministic_reply = self._computed_query_reply(self._safe_json_loads(orders_json))
             if deterministic_reply:
                 assistant_chunks.append(deterministic_reply)
                 yield {"type": "delta", "content": deterministic_reply}
@@ -179,33 +245,51 @@ class BookAgent:
                     plan=plan,
                     evidence=self._safe_json_loads(orders_json),
                     duration_ms=round((perf_counter() - started_at) * 1000),
+                    validation={'status': 'grounded', 'mechanism': 'computed_query_summary',
+                                'compositionStatus': 'fallback'},
                 )
                 yield {"type": "done", "content": ""}
                 return
 
             if plan.analyses:
-                report_task = asyncio.create_task(self.reporter.answer(
-                    message, plan._analysis_context, self._safe_json_loads(orders_json).get('analysisResults', [])))
-                try:
-                    while not report_task.done():
-                        done, _ = await asyncio.wait({report_task}, timeout=12)
-                        if not done:
-                            yield {'type': 'status', 'content': '正在核对分析结论与账单依据'}
-                    reply, validation = await report_task
-                finally:
-                    if not report_task.done():
-                        report_task.cancel()
-                        await asyncio.gather(report_task, return_exceptions=True)
+                results = self._safe_json_loads(orders_json).get('analysisResults', [])
+                needs = set(plan.understanding.evidenceNeeds)
+                primary_tools = {row['tool'] for row in results if not row.get('supplemental')}
+                chart_target = next((tool for tool in ('projection', 'forecast', 'aggregate', 'trends')
+                                     if tool in primary_tools), None)
+                output = {**plan.output.model_dump(), 'chartTarget': chart_target,
+                          'includeLineage': 'remarks' in needs,
+                          'includeSources': bool(needs & {'sources', 'members', 'remarks'} or
+                             ((plan.output.table or plan.output.export) and not needs & {'trends', 'changes', 'forecast'})),
+                          'includeTrends': (plan.output.chart != 'none' and chart_target == 'trends') or
+                             ((plan.output.table or plan.output.export) and 'trends' in needs)}
+                artifacts = build_artifacts(results, output,
+                    window=plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None)
+                async with aclosing(with_progress(self.reporter.answer(
+                    message, plan._analysis_context, results, history=history_text,
+                    instruction=plan.finalInstruction, artifacts=artifacts,
+                    understanding=plan.understanding.model_dump(), analysis_scope={
+                        'historyWindow': plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None,
+                        'primaryTasks': [task.model_dump(mode='json', exclude_none=True) for task in plan.analyses if not task._supplemental],
+                        'sourceGroups': [group.model_dump(mode='json') for group in plan.sourceGroups]
+                    }), '正在核对分析结论与问题要求')) as progress_stream:
+                    async for progress in progress_stream:
+                        if progress['type'] == 'result':
+                            reply, validation = progress['value']
+                        else:
+                            yield progress
                 assistant_chunks.append(reply)
                 yield {'type': 'delta', 'content': reply}
+                if artifacts:
+                    yield {'type': 'artifacts', 'artifacts': artifacts}
                 await self._save_assistant_reply(
                     phone_num=phone_num, session_id=resolved_session_id, reply=reply, plan=plan,
                     evidence=self._safe_json_loads(orders_json),
-                    duration_ms=round((perf_counter() - started_at) * 1000), validation=validation)
+                    duration_ms=round((perf_counter() - started_at) * 1000), validation=validation, artifacts=artifacts)
                 yield {'type': 'done', 'content': ''}
                 return
 
-            # ThinkTagStreamParser 把模型流式输出拆成“思考”和“最终回答”两类事件。
+            # Only an explicit non-ledger chat may use a free-form response.
             think_parser = ThinkTagStreamParser()
             async for chunk in self.chain.astream(
                 {
@@ -242,8 +326,30 @@ class BookAgent:
 
             yield {"type": "done", "content": ""}
         except Exception as exc:
-            logger.warning("AI bill chat failed (%s)", type(exc).__name__)
-            yield {"type": "error", "content": "AI 账单处理失败，请稍后重试。"}
+            error_type = self._safe_error_type(exc)
+            logger.warning("AI bill chat failed (%s)", error_type)
+            failure_message = "AI 账单处理失败，请稍后重试。"
+            if resolved_session_id and user_message_saved:
+                try:
+                    await self.memory.add_message(
+                        phone_num=phone_num, session_id=resolved_session_id,
+                        role='assistant', content=failure_message,
+                        metadata={
+                            'status': 'error', 'errorType': error_type,
+                            'releaseRevision': get_settings().release_revision,
+                            'durationMs': round(max(0, perf_counter() - started_at) * 1000),
+                            'modelUsage': (current_usage() or TurnUsage()).snapshot(),
+                            'analysisContext': deepcopy(confirmed_context),
+                            'contextOrigin': 'prior_confirmed_turn' if confirmed_context else None,
+                        },
+                    )
+                except Exception as storage_exc:
+                    logger.warning('AI bill failure history save failed (%s)', self._safe_error_type(storage_exc))
+            yield {"type": "error", "content": failure_message}
+
+    @staticmethod
+    def _safe_error_type(error: BaseException) -> str:
+        return re.sub(r'[^A-Za-z0-9_]', '', type(error).__name__)[:128] or 'Error'
 
     def _query_status(self, orders_json: str) -> str:
         data = self._safe_json_loads(orders_json)
@@ -259,6 +365,34 @@ class BookAgent:
             data = {"analysisResults": data["analysisResults"]}
         return json.dumps(data, ensure_ascii=False, default=str)
 
+    @staticmethod
+    def _computed_query_reply(data):
+        """Keep legacy query plans useful without sending finance to a free writer."""
+        rows = data.get('toolResults') or []
+        if not data.get('ok') or not rows:
+            return '本轮未得到可核算的账本证据，请明确查询范围后重试。'
+        paragraphs = []
+        for result in rows:
+            calculated = result.get('calculationToolResults') or {}
+            totals = calculated.get('summary') or {}
+            heading = literal(result.get('mode') or '当前账本') + ' ' + literal(result.get('summary') or '所选查询')
+            if not result.get('ok') or not totals:
+                paragraphs.append(heading + '：未取得完整统计，金额未知。')
+                continue
+            paragraphs.append(heading + f"：已记 {totals['orderCount']} 笔，收入 {money(totals['incomeTotal'])} 元，"
+                + f"支出 {money(totals['expenseTotal'])} 元，净额 {money(totals['netIncomeMinusExpense'])} 元。")
+            for key, label in [('expenseCategories', '支出类别'), ('incomeCategories', '收入类别')]:
+                for item in calculated.get('categoryBreakdown', {}).get(key, []):
+                    paragraphs.append(label + literal(item['name']) + f"：{money(item['amount'])} 元，{item['orderCount']} 笔。")
+            for key, label in [('topExpenses', '支出记录'), ('topIncomes', '收入记录')]:
+                for item in calculated.get(key, {}).get('orders', []):
+                    paragraphs.append(label + literal(item['date']) + ' ' + literal(item.get('costType') or '未分类')
+                        + f"：{money(item['amount'])} 元；备注：" + literal(item.get('orderRemark') or '无备注'))
+        if len(rows) > 1:
+            paragraphs.append('各查询分别统计，范围重叠时不能直接相加。')
+        paragraphs.append('以上为所选范围的已记收支，净额不能代替当前可动用余额，也不能证明未来安排。')
+        return '\n\n'.join(paragraphs)
+
     async def _save_assistant_reply(
         self,
         phone_num: str,
@@ -268,21 +402,53 @@ class BookAgent:
         evidence: dict | None = None,
         duration_ms: int | None = None,
         validation: dict | None = None,
+        artifacts: list | None = None,
     ) -> None:
         if not reply or not session_id:
             return
         settings = get_settings()
+        primary = [task.model_dump(mode='json', exclude_none=True) for task in plan.analyses if not task._supplemental]
+        active = [task for task in primary if task['tool'] != 'sources']
+        prior_active = plan._analysis_context.get('activeAnalyses', [])
+        current_window = plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None
+        intent = ' '.join([plan.understanding.objective, *plan.understanding.requestedAnswers])
+        tracing_parent = (plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext
+            and any(row['tool'] in HISTORY_BASED_TOOLS | {'budget'} for row in prior_active)
+            and not any(row['tool'] in HISTORY_BASED_TOOLS | {'budget'} for row in primary)
+            and current_window == plan._analysis_context.get('activeHistoryWindow')
+            and bool(re.search(r'备注|归并|归组|归类|依据|参照|怎么.*(?:算|来)|计算方法', intent)))
+        if active and not tracing_parent:
+            plan._analysis_context['activeAnalyses'] = active
+            plan._analysis_context['activeHistoryWindow'] = current_window
+        plan._analysis_context['conversation'] = {
+            'objective': plan.understanding.objective,
+            'analyses': primary,
+            'queries': logical_queries(plan),
+            'analysisWindow': plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None,
+            'output': plan.output.model_dump(),
+            'sourceGroups': [group.model_dump() for group in plan.sourceGroups],
+        }
         await self.memory.add_message(
             phone_num=phone_num,
             session_id=session_id,
             role="assistant",
             content=reply,
             metadata={"plan": plan.model_dump(mode="json"), "evidence": evidence or {},
-                      "analysisVersion": 3, "durationMs": duration_ms,
+                      "analysisVersion": 5, "releaseRevision": settings.release_revision, "durationMs": duration_ms,
+                      "artifacts": artifacts or [], "understanding": plan.understanding.model_dump(),
+                      "investigation": plan._investigation,
+                      "planningReview": plan._semantic_review,
                       "analysisContext": plan._analysis_context, "validation": validation or {},
                       "planningIssues": plan._planning_issues,
+                      "modelUsage": (current_usage() or TurnUsage()).snapshot(),
                       "model": {"provider": settings.llm_provider, "name": settings.llm_model,
+                                "reportMechanism": "computed_findings",
+                                "planningTemperature": None if settings.llm_provider == 'openai' else 0,
+                                "api": 'responses' if settings.llm_provider == 'openai' else
+                                    'chat_completions' if settings.llm_provider == 'openai_compatible' else 'ollama',
                                 "reasoning": settings.llm_reasoning,
+                                "planningReasoning": settings.planner_reasoning,
+                                "intentReasoning": settings.intent_reasoning,
                                 "reasoningEffort": settings.llm_reasoning_effort,
                                 "contextLength": settings.ollama_num_ctx,
                                 "gpuLayers": settings.ollama_num_gpu,
@@ -310,6 +476,8 @@ class BookAgent:
         mode: str,
         family_id: str | None,
         plan: AgentPlan,
+        question: str = '',
+        history: str = '',
     ) -> str:
         # 一个 plan 里可能包含多个 tool call，例如“对比上月和本月”会产生两次查询。
         tool_results = []
@@ -360,37 +528,27 @@ class BookAgent:
         analysis_results = []
         if plan.analyses and all(item["ok"] for item in tool_results):
             today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+            catalogs = []
             for scope, queries in datasets.items():
-                for task in plan.analyses:
-                    bound = [(call, rows) for call, rows in queries
-                             if not task.queryIds or set(task.queryIds) & set(call.sourceIds or [call.id])]
-                    if not bound:
-                        continue
-                    filters = {(call.args.cost_type, call.args.remark) for call, _ in bound}
-                    if len(filters) > 1 and not task.queryIds:
-                        analysis_results.append({"mode": scope, "tool": task.tool, "evidence": {
-                            "sufficientData": False, "reason": "该分析尚未明确关联哪个分类或备注范围，需要确认查询范围。"}})
-                        continue
-                    records = merge_orders([rows for _, rows in bound])
-                    window = plan.analysisWindow if task.tool not in {"forecast", "scenario", "savings", "budget", "projection", "purchase", "runway", "optimization"} else None
-                    selected = records
-                    if window:
-                        selected = [order for order in records if _date(order) and window.startDate <= _date(order) <= window.endDate]
-                    result = run_analysis(
-                        task.tool, selected, as_of=today, metric=task.metric,
-                        target_month=task.targetMonth,
-                        changes=[change.model_dump() for change in task.changes],
-                        budget_amount=task.budgetAmount, starting_balance=task.startingBalance,
-                        target_amount=task.targetAmount, months=task.months,
-                        monthly_improvement=task.monthlyImprovement,
-                        purchase_amount=task.purchaseAmount, reserve_amount=task.reserveAmount,
-                        protected_categories=task.protectedCategories,
-                        window_start=window.startDate if window else None,
-                        window_end=window.endDate if window else None,
-                    )
-                    analysis_results.append({"mode": scope, "tool": task.tool, "queryIds": task.queryIds,
-                                             "filters": [{"category": category, "remark": remark} for category, remark in sorted(filters)],
-                                             "evidence": result})
+                records = merge_orders([rows for _, rows in queries])
+                # Reflection sees actual observed labels/remarks, never the raw account IDs.
+                catalogs.append({'mode': scope, **run_analysis('sources', records, as_of=today, catalog_metric=plan.output.metric)})
+            plan.sourceGroups, grouping_issues = grounded_source_groups(plan.sourceGroups, catalogs, question)
+            initial_results = collect_analysis_results(plan, datasets, today)
+            if question and getattr(self, 'investigator', None):
+                decision, plan._investigation = await self.investigator.refine(question, history, plan, catalogs, results=initial_results)
+                plan._investigation.setdefault('issues', [])[:0] = grouping_issues
+                if decision.sourceGroups:
+                    plan.sourceGroups = merged_source_groups(plan.sourceGroups, decision.sourceGroups)
+                    plan.sourceGroups, final_grouping_issues = grounded_source_groups(plan.sourceGroups, catalogs, question)
+                    plan._investigation.setdefault('issues', []).extend(final_grouping_issues)
+                for task in decision.additionalAnalyses[:max(0, 12 - len(plan.analyses))]:
+                    supplemental = AnalysisRequest.model_validate(task.model_dump())
+                    supplemental._supplemental = True
+                    plan.analyses.append(supplemental)
+                # Reflection selects tools and source identities only. Its free-text
+                # guesses must never become authoritative amounts or instructions.
+            analysis_results = collect_analysis_results(plan, datasets, today)
 
         return json.dumps(
             {
@@ -551,11 +709,12 @@ class BookAgent:
 
         lines = []
         for item in messages:
-            if item.get('role') != 'user':
+            if item.get('role') not in {'user', 'assistant'}:
                 continue
             content = str(item.get("content", "")).strip()
             if content:
-                lines.append(f"用户: {self._sanitize_history_content(content)}")
+                role = '用户' if item['role'] == 'user' else '助手'
+                lines.append(f"{role}: {self._sanitize_history_content(content)}")
 
         return "\n".join(lines) or "无历史消息。"
 

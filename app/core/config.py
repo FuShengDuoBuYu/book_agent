@@ -5,7 +5,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(BASE_DIR / ".env")
@@ -16,23 +16,43 @@ class Settings(BaseModel):
 
     app_name: str = "book_agent"
     app_version: str = "0.1.0"
+    release_revision: str | None = Field(default=None, pattern=r'^[0-9a-f]{40}$')
     bookkeeping_api_base_url: str = "https://autobookkeeping-fastapi.onrender.com"
     agent_mongodb_uri: str = ""
     agent_mongodb_db: str = "book_agent"
-    llm_provider: Literal["ollama", "openai_compatible"] = "ollama"
+    llm_provider: Literal["ollama", "openai_compatible", "openai"] = "ollama"
     llm_base_url: str = "http://localhost:11434"
     llm_model: str = Field(default="qwen3:14b", min_length=1)
     llm_api_key: SecretStr | None = None
     llm_temperature: float = Field(default=0.2, ge=0, le=2)
     llm_reasoning_effort: str | None = None
     llm_reasoning: bool = False
+    planner_reasoning: bool = False
+    intent_reasoning: bool = False
     ollama_num_ctx: int = Field(default=8192, gt=0)
     ollama_keep_alive: str = '60s'
     ollama_num_gpu: int | None = Field(default=None, ge=0)
-    planner_timeout_seconds: float = Field(default=20.0, gt=0)
+    planner_timeout_seconds: float = Field(default=50.0, gt=0)
     planner_num_predict: int = Field(default=2048, gt=0)
     request_timeout_seconds: float = Field(default=120.0, gt=0)
     frontend_dist: Path = BASE_DIR / "frontend" / "dist"
+
+    @model_validator(mode='after')
+    def validate_openai_configuration(self):
+        if self.llm_provider == 'openai':
+            from app.core.model_usage import OPENAI_MODELS
+            if self.llm_model not in OPENAI_MODELS:
+                raise ValueError('OpenAI 模型限定为已配置的 Luna、Terra 或 Sol')
+            if not self.llm_api_key:
+                raise ValueError('OpenAI 服务端密钥未配置')
+            effort = self.llm_reasoning_effort or 'none'
+            if effort not in {'none', 'low', 'medium'}:
+                raise ValueError('账单 Agent 的 OpenAI 推理强度限定为 none、low 或 medium')
+            if self.llm_model == 'gpt-6.2-sol' and effort == 'none':
+                self.llm_reasoning_effort = 'low'
+            else:
+                self.llm_reasoning_effort = effort
+        return self
 
     @field_validator("llm_base_url", "bookkeeping_api_base_url")
     @classmethod
@@ -56,11 +76,15 @@ def get_settings() -> Settings:
     if provider == "ollama":
         base_url = os.getenv("OLLAMA_BASE_URL", defaults.llm_base_url)
         model = os.getenv("OLLAMA_MODEL", defaults.llm_model)
+    elif provider == 'openai':
+        base_url = 'https://api.openai.com/v1'
+        model = 'gpt-6-luna'
     else:
         base_url = ""
         model = ""
 
     return Settings(
+        release_revision=os.getenv("AGENT_RELEASE_REVISION") or None,
         bookkeeping_api_base_url=os.getenv(
             "BOOKKEEPING_API_BASE_URL", defaults.bookkeeping_api_base_url
         ),
@@ -69,11 +93,13 @@ def get_settings() -> Settings:
         llm_provider=provider,
         llm_base_url=os.getenv("LLM_BASE_URL") or base_url,
         llm_model=os.getenv("LLM_MODEL") or model,
-        llm_api_key=os.getenv("LLM_API_KEY") or None,
+        llm_api_key=os.getenv("LLM_API_KEY") or (os.getenv('OPENAI_API_KEY') if provider == 'openai' else None) or None,
         llm_temperature=os.getenv("LLM_TEMPERATURE")
         or os.getenv("OLLAMA_TEMPERATURE", str(defaults.llm_temperature)),
         llm_reasoning_effort=os.getenv("LLM_REASONING_EFFORT") or None,
         llm_reasoning=os.getenv("LLM_REASONING", str(defaults.llm_reasoning)),
+        planner_reasoning=os.getenv("LLM_PLANNING_REASONING", str(defaults.planner_reasoning)),
+        intent_reasoning=os.getenv("LLM_INTENT_REASONING", str(defaults.intent_reasoning)),
         ollama_num_ctx=os.getenv("OLLAMA_NUM_CTX", str(defaults.ollama_num_ctx)),
         ollama_keep_alive=os.getenv('OLLAMA_KEEP_ALIVE', defaults.ollama_keep_alive),
         ollama_num_gpu=os.getenv('OLLAMA_NUM_GPU') or None,

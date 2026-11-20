@@ -43,12 +43,14 @@ def assess(record):
     results = {row['tool']: row['evidence'] for row in metadata.get('evidence', {}).get('analysisResults', [])}
     name = record['case']
     checks = {'answered': bool(record.get('reply')) and not record.get('error'),
-              'interpretationReviewed': metadata.get('validation', {}).get('status') == 'reviewed'}
+              'interpretationGrounded': metadata.get('validation', {}).get('status') == 'grounded'}
     def has(tool, key, expected):
         return results.get(tool, {}).get(key) == expected
     if name == 'diagnosis':
         checks['completeMonthlyAverage'] = results.get('cashflow', {}).get('completeMonthAverage', {}).get('net') == 3850
         checks['changeExplained'] = has('changes', 'expenseChange', 900)
+        points = metadata.get('validation', {}).get('attentionPoints', [])
+        checks['threeEvidenceBackedAttentionPoints'] = len(points) == 3 and all(p.get('factIds') and p.get('reason') for p in points)
     if name == 'drivers':
         checks['changeExplained'] = has('changes', 'expenseChange', 900)
     if name == 'resilience':
@@ -69,8 +71,18 @@ def assess(record):
         checks['qualityAndSampleLimits'] = bool(results.get('data_quality', {}).get('insufficientCategories'))
     if name in {'chain_3', 'chain_4'}:
         context = metadata.get('analysisContext', {})
-        checks['protectedRetained'] = {'房租', '餐饮'} <= set(context.get('protectedCategories', []))
-        checks['sourceScenarioRetained'] = any(c.get('source') == '家教' and c.get('percent') == -50 for c in context.get('changes', []))
+        protected = set(context.get('protectedCategories', []))
+        optimization = results.get('optimization', {})
+        excluded = set(optimization.get('excludedCategories', [])) | set(optimization.get('protectedCategories', []))
+        checks['protectedRetained'] = bool(protected & {'房租', '月租'} and
+            protected & {'餐饮', '吃饭', '饮食', '日常餐饮'} and
+            (not optimization or {'房租', '餐饮'} <= excluded))
+        applied = results.get('projection', {}).get('assumptions', [])
+        checks['sourceScenarioRetained'] = any(
+            c.get('metric') == 'income' and c.get('percent') == -50 and '家教' in (c.get('source') or '') and
+            any(a.get('metric') == 'income' and a.get('source') == c['source'] and a.get('percent') == -50
+                and a.get('sourceBaseline') == 1600 and a.get('totalChange') == -800 for a in applied)
+            for c in context.get('changes', []))
     if name == 'variant_source':
         checks['sourceSpecificArithmetic'] = has('projection', 'totalNet', 10560)
         checks['answerUsesProjection'] = '10560' in record.get('reply', '').replace(',', '')
@@ -108,20 +120,22 @@ async def run_case(agent, name, question, timeout):
 
 
 async def main(args):
+    records = []
     for name, question in QUESTIONS:
         if not args.case or name in args.case:
-            await run_case(make_agent(), name, question, args.timeout)
+            records.append(await run_case(make_agent(), name, question, args.timeout))
     if not args.case or "chain" in args.case:
         agent = make_agent()
         for name, question in FOLLOWUPS:
-            await run_case(agent, name, question, args.timeout)
+            records.append(await run_case(agent, name, question, args.timeout))
     for name, question in VARIANTS:
         if not args.case or 'variants' in args.case or name in args.case:
-            await run_case(make_agent(), name, question, args.timeout)
+            records.append(await run_case(make_agent(), name, question, args.timeout))
+    return 0 if records and all(record['automatedPass'] for record in records) else 1
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", action="append")
     parser.add_argument("--timeout", type=int, default=240)
-    asyncio.run(main(parser.parse_args()))
+    raise SystemExit(asyncio.run(main(parser.parse_args())))

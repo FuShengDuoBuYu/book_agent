@@ -132,7 +132,8 @@ class AnalysisPlannerTests(unittest.TestCase):
         normalized = QueryPlanner.__new__(QueryPlanner)._normalize_plan(plan, datetime(2026, 11, 12), "分析我的财务情况", "家庭版")
         self.assertTrue(normalized.needsTools)
         self.assertEqual({c.toolName for c in normalized.toolCalls}, {"search_family_orders"})
-        self.assertEqual(len(normalized.analyses), 4)
+        self.assertCountEqual([t.tool for t in normalized.analyses],
+                              ["trends", "changes", "anomalies", "recurring", "cashflow"])
 
     def test_scenario_preserves_explicit_assumptions(self):
         plan = AgentPlan.model_validate({"analyses": [{"tool": "scenario", "changes": [
@@ -154,7 +155,7 @@ class AnalysisPlannerTests(unittest.TestCase):
             "analyses": [{"tool": "cashflow"}, {"tool": "forecast"}]})
         normalized = QueryPlanner.__new__(QueryPlanner)._normalize_plan(plan, datetime(2026, 11, 12), "分析9月并预测下月")
         self.assertEqual(normalized.analysisWindow.startDate.isoformat(), "2026-09-01")
-        self.assertEqual([call.args.month for call in normalized.toolCalls], list(range(5, 12)))
+        self.assertEqual([call.args.month for call in normalized.toolCalls], [9])
 
     def test_deduplicated_queries_keep_all_analysis_bindings(self):
         plan = AgentPlan.model_validate({"toolCalls": [

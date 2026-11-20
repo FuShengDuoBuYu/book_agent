@@ -12,7 +12,7 @@ Android ──账号验证──▶ 账本 FastAPI
    ▼                   │
 WebView ──HTTPS──▶ book_agent ──受限会话──▶ 账本 FastAPI / MongoDB
                         │
-                        └──兼容模型 API──▶ 家中推理服务
+                        └──模型适配器──▶ 家中 Ollama 或 OpenAI Responses
 ```
 
 1. Android 从当前 App 账号发起密码验证，向 AI 账单域名调用 `POST /api/session/ticket`，Agent 将请求交给账本服务的 `POST /auth/ai-bill/ticket`。旧 App 登录资料只有账号标识，进入 AI 账单时需要确认密码。账本后端签发一次性短期票据。
@@ -28,6 +28,7 @@ Agent 默认分支为 `main`，账本后端为 `python`，Android 为 `master`�
 
 - 使用账本后端的 `app.ai_bill_app:app` 启动专用服务，再启动 Agent 并构建 `frontend/dist`。聊天记忆使用 `AGENT_MONGODB_URI` 和 `AGENT_MONGODB_DB`。部署前确认 MongoDB 数据库和索引权限。
 - 家中 Agent 可通过 Ollama 原生接口调用 `qwen3.5:9b`，配置 `LLM_PROVIDER=ollama`、`LLM_BASE_URL=http://127.0.0.1:11434`。原生接口支持规划 JSON Schema、`OLLAMA_NUM_CTX` 和回答阶段 `LLM_REASONING`。兼容网关仍可配置 `openai_compatible` 与 `/v1` 地址，密钥由服务环境注入。真实账本联调关闭外部追踪。
+- 官方 OpenAI API 使用 `LLM_PROVIDER=openai`、`https://api.openai.com/v1` 和本轮选定的 `gpt-6.1-terra`。密钥仅从私有服务器环境读取，不能注入页面或 APK；`store=false` 关闭供应商响应存储，必要账本证据仍会发送给所选模型。应用历史和各阶段用量在内部持久化。切换 API 无需重启或改动已有 Ollama 服务。
 - 将选定的 AI 账单子域转发到 Agent 的应用端口。HTTPS 反代为 `/api/chat/stream` 保留 SSE 增量，按家庭网络和模型耗时设置连接和读超时。
 - Android 构建时设置 `AI_BILL_ORIGIN`，值为实际的 HTTPS 源。构建配置按 Gradle `-P`、项目 `local.properties`、环境变量依次读取。
 - 在隔离环境验证票据过期、票据重复兑换、跨账号请求、家庭权限变化和错误反馈，再用同一月份对照 Android 月报。正式接入真实账本前，确认旧账号密码修复、旧账单查询和家庭写接口的访问控制与迁移方案。
@@ -39,10 +40,11 @@ Agent 默认分支为 `main`，账本后端为 `python`，Android 为 `master`�
 
 正式环境由 `app-ai-bill-agent.service` 和 `app-ai-bill-ledger.service` 管理，需保持 enabled 和 active。Agent 环境位于 `/etc/ai-bill/agent.env`，凭据不进入仓库。新版本使用独立发布目录和 systemd drop-in 切换，保留旧发布目录及受限权限的配置备份用于回滚。
 
-以下命令仅用于在发布目录前台启动两项服务进行排障。两端使用各自的 Python 虚拟环境，MongoDB 配置从现有 Agent 环境读取；已经运行 systemd 服务时不要重复占用端口。
+服务统一通过 systemd 管理。旧的前台双进程启动脚本已移除，避免使用过时的兼容接口配置或漏掉会话与成员键环境。排障时检查现有单元及日志：
 
 ```sh
-agent/.venv/bin/python agent/deploy/run-home.py --existing-env /root/apps/book-agent/.env
+systemctl status app-ai-bill-agent.service app-ai-bill-ledger.service app-ollama.service --no-pager
+journalctl -u app-ai-bill-agent.service -n 80 --no-pager
 ```
 
 在 Cloudflare 的既有 Tunnel 下添加 Published application。主机名使用 `bill.fushengduobuyu.com`，Service 选择 HTTP，地址填 `127.0.0.1:18001`，Path 留空。域名生效后访问 `https://bill.fushengduobuyu.com/ready`，预期返回所选模型和 `status: ok`。
@@ -55,6 +57,20 @@ agent/.venv/bin/python agent/deploy/run-home.py --existing-env /root/apps/book-a
 
 发布前运行单元测试、前端构建及 `python -m scripts.evaluate_analysis`。模型评测使用虚构账本和内存会话，同时检查工具选择和关键数值，再人工检查解释中的条件、范围与因果表述。通过 `/ready` 仅证明记忆配置存在且模型在网关列表中；数据库连通性和授权聊天需另行验证。
 
-复杂分析先解析用户条件，再执行计算、构造带编号的证据句、生成解释并校对，核验完成后才发送正文。原始计算、已解析条件、报告引用、修改记录和校对结果保存在回答元数据中。个人/家庭、不同筛选范围以及并列情景分别保留条件，不能互相借用余额；追问同一来源时替换旧条件，同轮多个独立增量则全部保留。
+复杂分析先解析用户条件、核对计划、执行计算和必要的来源调查，再由模型选择已绑定的事实提纲，最后由程序生成计算发现与解释。原始计算、已解析条件、报告引用、修改记录和校对结果保存在回答元数据中。个人/家庭、不同筛选范围以及并列情景分别保留条件，不能互相借用余额；追问同一来源时替换旧条件，同轮多个独立增量则全部保留。
+
+当前分析链路把主任务和备注核查等子任务分开保存。继续追问原结论时恢复目标月份、历史样本、来源归组与用户条件；切换到另一段历史来源查询时退役旧任务，避免后续又恢复无关预测。调查员读取初次计算结果和实际备注，可在同一授权快照内补充有界聚合分析；它不能扩大已经查询的日期覆盖或虚构余额。
+
+`aggregate` 使用声明式分组、筛选与最多八个比较区间，不执行模型生成的 SQL 或代码。它返回实际查询覆盖、筛选审计、完整范围的去重总计和有上限的分组行。确定性表格保留全部已返回分组，即使叙述只选择主要发现。财务叙述从已绑定的计算发现生成；备注里的编号不能被当成金额。提纲错误或越权时由程序回退，不再使用自由财务写作或模型自审。
 
 共享 GPU 的发布验收还需记录显存峰值、其他任务占用、上下文长度、GPU 层数和空闲释放时间。降低驻留时间只减少空闲占用，不能替代运行峰值测试。参数通过 Agent 请求传给 Ollama，无需更改其他 GPU 服务。
+
+## 结构化推理运行时
+
+家庭主机原有 Ollama 0.21.2 对 Qwen3.5 的 `think=false` 加 JSON Schema 请求曾直接返回普通中文，导致规划或报告在读取账本前后反复失败。这与 [Ollama 上游问题及修复](https://github.com/ollama/ollama/pull/15901) 对应；发布前必须验证实际协议能力，不能只检查版本或模型名称。
+
+固定运行时在 `/opt/ai-bill/runtimes/ollama-v0.40.16`，官方发布包的大小和 SHA-256 直接与 GitHub 发布元数据核对后使用。先以临时 `app-ai-bill-ollama.service` 绑定 `127.0.0.1:11435` 验证，复用现有模型目录；原服务在验证期间保持原配置。
+
+仅选择本地Qwen作为生产模型并明确切换其运行时时，顺序是启动验证实例、通过 `python -m scripts.check_model_contract`、完成模型质量回放，再停止验证实例，通过现有 `app-ollama.service` 的 drop-in 切换到已验证的二进制。原来的监听地址、模型目录和账号由现有服务继续配置，Agent 继续使用 `127.0.0.1:11434`，其他现有 API 路由无需改变。仓库提供 `deploy/ollama-runtime.conf.example`。生产复用同一个运行时，保持单路推理、最多一个驻留模型和一分钟空闲释放；模型不随应用发布复制。比较两个运行时时串行测试，等待前一个模型释放。Agent 发布和运行时配置都保留原版本，方便回滚。
+
+当前默认选择官方 OpenAI API 的 Terra，依据与残留失败见[模型对照](model-comparison-2026-11-19.md)。本地Qwen只在独立验证端口比较；正式Agent切到API时，仅发布Agent，不升级或重启现有Ollama服务。验证实例在回放完成后停止。

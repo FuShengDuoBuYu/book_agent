@@ -1,9 +1,10 @@
 from datetime import date
-from typing import Literal, get_args
+from typing import Annotated, Literal, get_args
 
-from pydantic import AliasChoices, BaseModel, Field, FiniteFloat, PrivateAttr, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, FiniteFloat, PrivateAttr, field_validator, model_validator
 
 from app.tools.financial_analysis import ANALYSIS_TOOLS
+from app.tools.aggregate_analysis import AggregateSpec
 
 
 
@@ -105,6 +106,9 @@ class ScenarioChange(BaseModel):
 
 
 class AnalysisRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid', json_schema_extra={'required': ['tool', 'queryIds', 'metric', 'targetMonth']})
+    _supplemental: bool = PrivateAttr(default=False)
+
     @model_validator(mode="before")
     @classmethod
     def omit_unused_metric(cls, value):
@@ -114,11 +118,18 @@ class AnalysisRequest(BaseModel):
         if isinstance(value, dict) and value.get("tool") != "forecast" and value.get("metric", "income") is None:
             value = dict(value)
             value.pop("metric")
+        if isinstance(value, dict) and value.get('tool') != 'aggregate':
+            value = {key: item for key, item in value.items() if key != 'aggregate'}
+        if isinstance(value, dict) and value.get('tool') not in {'scenario', 'savings', 'projection', 'runway', 'optimization'}:
+            # Historical changes are computed by the tool, not user hypotheses.
+            value = {key: item for key, item in value.items() if key != 'changes'}
         return value
 
-    tool: str
+    tool: str = Field(json_schema_extra={'enum': list(ANALYSIS_TOOLS)})
     queryIds: list[str] = Field(default_factory=list, max_length=24)
-    metric: Literal["income", "expense", "net"] = "income"
+    metric: Literal["income", "expense", "net", "all"] = "income"
+    aggregate: AggregateSpec | None = Field(default=None,
+        description='aggregate工具的全部分组/区间/筛选参数放在这个对象内，不是放在changes或分析任务根部。')
     targetMonth: str | None = Field(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
     changes: list[ScenarioChange] = Field(default_factory=list, max_length=20, description='用户给定的收支变化；全部收入中断对应 income、percent=-100、source为空')
     budgetAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False)
@@ -126,10 +137,19 @@ class AnalysisRequest(BaseModel):
     targetAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False, description='储蓄目标的期末总余额，不是购买后需保留的应急金')
     months: int | None = Field(default=None, ge=1, le=600)
     monthsDelta: int | None = Field(default=None, ge=-599, le=599)
-    monthlyImprovement: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False)
+    monthlyImprovement: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False,
+        description='optimization 要达到的每月额外结余目标；每月多留三百填300。这是目标，不是changes里的已假定削减。')
     purchaseAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False)
     reserveAmount: float | None = Field(default=None, ge=0, le=1e12, allow_inf_nan=False, description='购买后需保留的应急金或现金底线；还要留5000元应急钱对应5000')
     protectedCategories: list[str] = Field(default_factory=list, max_length=30)
+
+    @model_validator(mode='after')
+    def validate_analysis_arguments(self):
+        if self.tool == 'forecast' and self.metric == 'all':
+            raise ValueError('forecast 必须选择 income、expense 或 net 指标')
+        if self.tool == 'aggregate' and self.aggregate is None:
+            self.aggregate = AggregateSpec()
+        return self
 
     @field_validator("tool")
     @classmethod
@@ -157,9 +177,53 @@ class AnalysisWindow(BaseModel):
         return self
 
 
+class IntentUnderstanding(BaseModel):
+    @model_validator(mode='before')
+    @classmethod
+    def bound_descriptive_annotations(cls, value):
+        if not isinstance(value, dict):
+            return value
+        result = dict(value)
+        for name, definition in cls.model_fields.items():
+            limit = next((meta.max_length for meta in definition.metadata if hasattr(meta, 'max_length')), None)
+            item = result.get(name)
+            if limit and isinstance(item, (str, list)):
+                result[name] = item[:limit]
+        if isinstance(result.get('evidenceNeeds'), list):
+            result['evidenceNeeds'] = [item[:80] if isinstance(item, str) else item for item in result['evidenceNeeds']]
+        return result
+
+    objective: str = Field(default='', max_length=600, description='当前真正要解决的问题，追问须解析它指向上轮哪项结论')
+    referents: list[str] = Field(default_factory=list, max_length=8, description='这、它、刚才的金额等在当前对话中的明确含义；未确定就标记待确认')
+    requestedAnswers: list[str] = Field(default_factory=list, max_length=8, description='回答必须完成的具体事项，不是工具名称')
+    evidenceNeeds: list[Annotated[str, Field(max_length=80)]] = Field(default_factory=list, max_length=10,
+        description='推荐 totals/sources/members/remarks/trends/forecast/changes/scenario/quality；描述标签不具有工具调用权限')
+    unknowns: list[str] = Field(default_factory=list, max_length=6, description='完成用户目标仍缺的具体信息，已有账本可查询的信息不要求用户重新提供')
+    conversationRelation: Literal['independent', 'follow_up', 'correction', 'reset', 'unspecified'] = Field(
+        default='unspecified', description='本轮是独立目标、承接、纠正还是明确重来；结合原目标和新条件判断')
+
+
+class OutputRequest(BaseModel):
+    table: bool = False
+    chart: Literal['none', 'line', 'bar'] = 'none'
+    metric: Literal['income', 'expense', 'net', 'all'] = 'all'
+    export: bool = False
+
+
+class SourceGroup(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    label: str = Field(min_length=1, max_length=100)
+    sourceKeys: list[str] = Field(min_length=1, max_length=60)
+
+
 class AgentPlan(BaseModel):
+    understanding: IntentUnderstanding = Field(default_factory=IntentUnderstanding)
+    output: OutputRequest = Field(default_factory=OutputRequest)
+    sourceGroups: list[SourceGroup] = Field(default_factory=list, max_length=30)
     _analysis_context: dict = PrivateAttr(default_factory=dict)
     _planning_issues: list = PrivateAttr(default_factory=list)
+    _investigation: dict = PrivateAttr(default_factory=dict)
+    _semantic_review: dict = PrivateAttr(default_factory=dict)
     resetAnalysisContext: bool = False
 
     @model_validator(mode="before")
