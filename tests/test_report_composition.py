@@ -183,6 +183,37 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
         data = context(facts=facts)
         self.assertIn('cause', {f['id'] for f in data.selected})
 
+    def test_priority_context_does_not_repeat_private_computed_analysis(self):
+        from datetime import date
+        from scripts.conclusion_cases import conclusion_cases
+        from app.agent.evidence_report import build_facts
+        from app.agent.analysis_findings import build_analysis_findings
+        from app.agent.attention_points import build_attention_points
+        case = conclusion_cases(date(2026, 11, 20))[1]
+        facts = build_facts(case['results'])
+        findings = build_analysis_findings(case['results'])
+        priorities = build_attention_points(case['question'], case['results'], facts, findings)
+        data = prepare_report_context({'question': case['question'], 'facts': facts, 'analysisFindings': findings,
+            'reviewPriorities': priorities, 'analysisScope': case['scope'], 'userConditions': case['context'],
+            'understanding': {'requestedAnswers': [case['question']], 'evidenceNeeds': [r['tool'] for r in case['results']]}}, REPORT_PROMPT, ReportDraft)
+        self.assertEqual(len(data.payload['reviewPriorities']), 3)
+        self.assertTrue(all('analysis' not in p for p in data.payload['reviewPriorities']))
+        self.assertTrue(all(set(p['factIds']) <= {f['id'] for f in data.selected} for p in priorities))
+        self.assertTrue(priorities[0]['analysis'])
+
+    def test_method_followup_keeps_source_contributions_and_exclusion_in_context(self):
+        facts = [fact(f'f{i}', tool='forecast', headline=i==0,
+            values=[{'label': '历史摘要', 'value': i, 'unit': '元'}]) for i in range(44)]
+        facts += [fact('method', tool='forecast', headline=False, evidenceRole='forecast_method', text='按来源中位数相加。'),
+                  fact('source', tool='forecast', headline=False, source='项目结算', evidenceRole='forecast_source',
+                       values=[{'label': '该来源预测贡献', 'value': 500, 'unit': '元'}]),
+                  fact('excluded', tool='forecast', headline=False, source='出售', evidenceRole='forecast_source', excluded=True,
+                       text='按已应用规则剔除出售款，归类仍可核查。')]
+        data = context(facts=facts, findings={'g1': {'tool': 'forecast', 'scope': '个人版', 'states': {}}},
+            question='刚才那个月拿哪几个月参照，具体怎么从项目算到总数，一次性款项怎么处理？')
+        self.assertFalse(data.payload['answerRequirements']['leadWithJudgment'])
+        self.assertTrue({'method','source','excluded'} <= {f['id'] for f in data.selected})
+
     def test_monthly_improvement_gap_is_not_solved_by_postponing_a_goal(self):
         data = context(facts=[fact('f1', tool='optimization')], findings={
             'g1': {'tool': 'optimization', 'scope': '个人版', 'states': {},

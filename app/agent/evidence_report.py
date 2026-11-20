@@ -300,18 +300,18 @@ def build_facts(results):
             add(f"假设历史模式延续，{e['targetMonth']} 的月度{label}基准 {money(e['estimate'])} 元，历史情景范围 {money(e['lower'])}～{money(e['upper'])} 元。基准参考月份：{'、'.join(e['baselineMonths'])}。这是条件估计，历史范围不是保证或置信区间。", True, values=[q('预测月份', e['targetMonth'], 'month'), q('预测基准', e['estimate']), q('历史情景下界', e['lower']), q('历史情景上界', e['upper'])])
             if e.get('method'):
                 observed = '历史观察月份：' + '、'.join(e['observedMonths']) + '。' if e.get('observedMonths') else ''
-                add('计算方法：' + e['method'] + observed,
+                add('计算方法：' + e['method'] + observed, binding={'evidenceRole': 'forecast_method'},
                     values=[q('历史观察月份', month, 'month') for month in e.get('observedMonths', [])])
             for row in e.get('sourceForecasts', [])[:8]:
                 historical = f"历史样本入账 {money(row['amount'])} 元，" if row.get('amount') is not None else ''
                 summary = f"{row.get('member', '归属未知')}的“{row['source']}”{historical}条件估计 {money(row.get('estimate'))} 元。备注依据："
                 exclusion = '此项为已剔除的入账，不计入持续收入。' if row.get('excluded') else ''
                 add(summary + '；'.join(row.get('remarks', [])) + '。' + exclusion,
-                    binding={'metric': 'income', **{key: row[key] for key in ('member', 'memberKey', 'source', 'sourceKey') if key in row}},
-                    model_text=summary + '；'.join(str(remark)[:80] for remark in row.get('remarks', [])[:2]) + '。' + exclusion,
+                    binding={'metric': 'income', 'evidenceRole': 'forecast_source', 'excluded': bool(row.get('excluded')), **{key: row[key] for key in ('member', 'memberKey', 'source', 'sourceKey') if key in row}},
+                    model_text=summary + '；'.join(str(remark)[:80] for remark in row.get('remarks', [])[:4]) + ('。仅展示部分备注，不能据此判断其他备注不存在。' if len(row.get('remarks', [])) > 4 else '。') + exclusion,
                     values=[q('该来源预测贡献', row.get('estimate')), q('该来源历史样本入账', row.get('amount'))])
             if e.get('excludedIncomeTotal'):
-                add(f"历史样本中按备注识别并剔除非持续性入账 {money(e['excludedIncomeTotal'])} 元；归类仍需核查。", values=[q('excludedIncomeTotal', e['excludedIncomeTotal'])])
+                add(f"历史样本中按备注识别并剔除非持续性入账 {money(e['excludedIncomeTotal'])} 元；归类仍需核查。", binding={'evidenceRole': 'forecast_exclusions'}, values=[q('excludedIncomeTotal', e['excludedIncomeTotal'])])
         elif tool == 'scenario':
             add(e['computedConclusion'], True)
         elif tool == 'savings':

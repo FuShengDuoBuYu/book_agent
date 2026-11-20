@@ -38,7 +38,7 @@ def response_limit(question):
 
 def judgment_leads(payload):
     question = payload.get('question', '')
-    if re.search(r'多少|多久|几个月|能否|能不能|是否足够|够不够|合适吗|能实现', question):
+    if re.search(r'多少|多久|要几个月|能否|能不能|是否足够|够不够|合适吗|能实现', question):
         return True
     return not bool(re.search(r'为什么|为啥|依据|方法|怎么算|怎么.*(?:算|判断)|如何.*(?:算|判断)|怎样.*(?:算|判断)|靠谱|可信|限制', question))
 
@@ -154,17 +154,26 @@ def _catalog(facts):
     return values
 
 
-def _ordered(facts, judgments, priorities):
+def _ordered(facts, judgments, priorities, question=""):
     pinned = {key for j in [*judgments, *priorities] for key in j['factIds']}
     # Trend synthesis needs all returned month totals, not the generic coverage warning.
     pinned.update(f['id'] for f in facts if f.get('binding', {}).get('aggregation') == 'recorded_month_total')
     causes = {}
     for fact in facts:
         binding = fact.get('binding', {})
+        if binding.get('primary') is False:
+            continue
         typed_driver = binding.get('evidenceRole') == 'change_driver'
         if typed_driver or (binding.get('tool') == 'aggregate' and re.search(r'(?:category|source)=', fact['text'])):
             causes.setdefault((binding.get('resultGroup'), binding.get('metric') if typed_driver else None), []).append(fact)
     pinned.update(f['id'] for rows in causes.values() for f in rows[:2])
+    if not judgment_leads({'question': question}):
+        # Method questions need the actual source contributions and applied exclusions.
+        method_facts = [f for f in facts if f.get('binding', {}).get('evidenceRole') in {'forecast_method', 'forecast_exclusions'}]
+        source_facts = [f for f in facts if f.get('binding', {}).get('evidenceRole') == 'forecast_source']
+        pinned.update(f['id'] for f in method_facts)
+        pinned.update(f['id'] for f in source_facts[:4])
+        pinned.update(f['id'] for f in source_facts if f.get('binding', {}).get('excluded'))
     mandatory = [f for f in facts if f['id'] in pinned]
     groups, warnings = {}, []
     for fact in facts:
@@ -213,6 +222,8 @@ def prepare_report_context(payload, system, schema, *, num_ctx=8192, num_predict
     values, judgments = _catalog(facts), _judgments(facts, findings)
     char_limit = response_limit(payload.get('question', ''))
     common = _compact({k: payload[k] for k in ('question', 'understanding', 'analysisScope', 'userConditions', 'reviewPriorities', 'asOfDate') if k in payload})
+    if 'reviewPriorities' in common:
+        common['reviewPriorities'] = [{k: p[k] for k in ('title', 'reason', 'factIds') if k in p} for p in common['reviewPriorities']]
     if isinstance(common.get('analysisScope'), dict):
         for task in common['analysisScope'].get('primaryTasks', []):
             task.pop('aggregate', None)  # The report uses computed, scoped facts, not executable aggregation plans.
@@ -224,7 +235,7 @@ def prepare_report_context(payload, system, schema, *, num_ctx=8192, num_predict
     common['judgments'] = [{k: j[k] for k in ('id', 'text', 'factIds', 'states')} for j in judgments]
     limit, estimate = _prompt_budget(system, schema, num_ctx, num_predict)
     limit -= 768  # Reserve a bounded correction instruction without changing reference IDs.
-    mandatory, optional = _ordered(facts, judgments, payload.get('reviewPriorities', []))
+    mandatory, optional = _ordered(facts, judgments, payload.get('reviewPriorities', []), payload.get('question', ''))
 
     def project(selected):
         ids = {f['id'] for f in selected}
@@ -244,7 +255,7 @@ def prepare_report_context(payload, system, schema, *, num_ctx=8192, num_predict
                            else '原文过长，当前仅提供已核算的数值及范围；不能补全未展示的含义。',
                            'binding': {k: v for k, v in f.get('binding', {}).items() if v is not None and v != []
                                        if k in {'tool', 'scope', 'historyWindow', 'month', 'partial', 'metric',
-                                                'aggregation', 'evidenceRole', 'category', 'source', 'member', 'filters', 'primary'}}}
+                                                'aggregation', 'evidenceRole', 'excluded', 'category', 'source', 'member', 'filters', 'primary'}}}
                           for f in selected],
                 'values': {v['id']: v['factId'] + ' ' + v['label'] + ' = ' + v['display'] for v in supplied},
                 'computedFindings': brief_findings,
