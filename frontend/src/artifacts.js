@@ -45,6 +45,7 @@ function normalizeArtifact(item) {
   }
 
   const artifact = { id: item.id, kind: item.kind, title: item.title, columns };
+  if (["supporting", "requested"].includes(item.presentation)) artifact.presentation = item.presentation;
   const seriesKeys = new Set();
   if (item.kind !== "table") {
     if (!columnKeys.has(item.xKey) || !Array.isArray(item.series) || !item.series.length) {

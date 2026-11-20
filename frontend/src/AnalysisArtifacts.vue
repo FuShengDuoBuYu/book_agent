@@ -1,5 +1,7 @@
 <template>
-  <div class="analysis-artifacts">
+  <details class="analysis-evidence" :open="items.some((item) => item.presentation === 'requested')">
+    <summary>查看数据依据（{{ items.length }}项）</summary>
+    <div class="analysis-artifacts">
     <section v-for="{ artifact, chart } in cards" :key="artifact.id" class="analysis-card">
       <header class="analysis-heading">
         <h3>{{ artifact.title }}</h3>
@@ -119,7 +121,8 @@
         <li v-for="(note, index) in artifact.notes" :key="index">{{ note }}</li>
       </ul>
     </section>
-  </div>
+    </div>
+  </details>
 </template>
 
 <script setup>
@@ -214,6 +217,18 @@ async function downloadPng(artifact, chart) {
 </script>
 
 <style scoped>
+ .analysis-evidence {
+  border: 1px solid var(--border, #e4e4e7);
+  border-radius: 12px;
+  padding: 12px;
+}
+.analysis-evidence > summary {
+  cursor: pointer;
+  color: var(--muted, #52525b);
+  font-size: 13px;
+}
+.analysis-evidence[open] > summary { margin-bottom: 12px; }
+
 .analysis-artifacts {
   display: grid;
   gap: 12px;

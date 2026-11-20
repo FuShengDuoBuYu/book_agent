@@ -8,7 +8,7 @@ from tests.test_decision_analysis import ledger
 
 
 class AttentionReportTests(unittest.IsolatedAsyncioTestCase):
-    async def test_three_requested_issues_are_synthesized_even_if_outline_times_out(self):
+    async def test_three_requested_issues_are_synthesized_even_if_composition_times_out(self):
         records = [{**row, 'bankName': '现金'} for row in ledger()]
         records.append({'year': 2026, 'month': 10, 'day': 8, 'money': -900,
                         'costType': '医疗', 'orderRemark': '门诊', 'bankName': '现金'})

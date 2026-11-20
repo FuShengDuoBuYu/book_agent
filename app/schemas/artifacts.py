@@ -23,6 +23,7 @@ class AnalysisArtifact(BaseModel):
     model_config = ConfigDict(extra='forbid')
     id: str = Field(min_length=1, max_length=80)
     kind: Literal['table', 'line', 'bar']
+    presentation: Literal['supporting', 'requested'] | None = None
     title: str = Field(max_length=160)
     columns: list[Column] = Field(min_length=1, max_length=16)
     rows: list[dict] = Field(max_length=1000)

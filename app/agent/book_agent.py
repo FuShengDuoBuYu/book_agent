@@ -434,7 +434,7 @@ class BookAgent:
             role="assistant",
             content=reply,
             metadata={"plan": plan.model_dump(mode="json"), "evidence": evidence or {},
-                      "analysisVersion": 5, "releaseRevision": settings.release_revision, "durationMs": duration_ms,
+                      "analysisVersion": 6, "releaseRevision": settings.release_revision, "durationMs": duration_ms,
                       "artifacts": artifacts or [], "understanding": plan.understanding.model_dump(),
                       "investigation": plan._investigation,
                       "planningReview": plan._semantic_review,
@@ -442,7 +442,7 @@ class BookAgent:
                       "planningIssues": plan._planning_issues,
                       "modelUsage": (current_usage() or TurnUsage()).snapshot(),
                       "model": {"provider": settings.llm_provider, "name": settings.llm_model,
-                                "reportMechanism": "computed_findings",
+                                "reportMechanism": "cited_conclusions",
                                 "planningTemperature": None if settings.llm_provider == 'openai' else 0,
                                 "api": 'responses' if settings.llm_provider == 'openai' else
                                     'chat_completions' if settings.llm_provider == 'openai_compatible' else 'ollama',

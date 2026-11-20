@@ -11,12 +11,11 @@ from app.core.openai_adapter import response_format
 from app.schemas.report import ReportDraft
 from pydantic import ValidationError
 from time import perf_counter
-from app.agent.artifacts import render_artifacts_markdown
 from app.agent.analysis_findings import build_analysis_findings
 from app.agent.attention_points import build_attention_points, requested_attention_count
-from app.agent.report_context import build_report_context
-from app.agent.report_composition import (compose_report, grounded_analysis, ReportOutline,
-                                          outline_schema, OUTLINE_PROMPT, OUTLINE_TOKENS)
+from app.agent.report_composition import (compose_report, grounded_analysis, validate_draft, render_report,
+                                          fallback_report, answer_schema, REPORT_PROMPT, REPORT_TOKENS)
+from app.agent.report_evidence import prepare_report_context, audit_report_context
 from app.tools.financial_analysis import shift_month
 from app.agent.report_values import literal, quantity as q, sanitize_fact
 from app.agent.goal_comparison import add_savings_deadline_facts
@@ -380,54 +379,22 @@ def build_facts(results):
 
 
 
-REPORT_TITLES = {'分析结论', '变化来源', '收入构成', '条件与方案', '统计口径', '记录核查', '需要确认的事项', '补充账本依据'}
-
-
-def validate_draft(draft, facts, findings):
-    """The model may select evidence, never replace a computed interpretation."""
-    valid = {fact['id'] for fact in facts}
-    used = {key for section in draft.sections for key in section.factIds}
-    issues = []
-    if used - valid:
-        issues.append('引用了不存在的证据编号')
-    missing = {row['id'] for row in facts if row.get('required')} - used
-    if missing:
-        issues.append('factIds 遗漏必需证据编号：' + ','.join(sorted(missing)))
-    seen = set()
-    for section in draft.sections:
-        if section.title not in REPORT_TITLES:
-            issues.append('报告标题必须选用中性提纲标题')
-        try:
-            expected = grounded_analysis(section.factIds, facts, findings, seen)
-            if section.analysis != expected:
-                issues.append('解释必须逐字来自同范围、同计算结果的分析发现')
-        except ValueError as exc:
-            issues.append(str(exc))
-    return issues
-
-
-def render_report(draft, facts):
-    by_id = {row['id']: row['text'] for row in facts}
-    return '\n\n'.join('**' + section.title + '**\n\n'
-        + '\n'.join(by_id[key] for key in dict.fromkeys(section.factIds))
-        + ('\n\n' + section.analysis if section.analysis else '') for section in draft.sections)
-
 
 class EvidenceReporter:
     async def _invoke(self, schema, system, payload):
-        if schema is not ReportOutline:
-            raise ValueError('报告模型只允许选择提纲和证据')
+        if schema is not ReportDraft:
+            raise ValueError('报告模型只允许生成有引用的结论')
         started = perf_counter()
         self._last_call = {'schema': schema.__name__}
         settings = get_settings()
-        generation_schema = outline_schema(payload)
+        generation_schema = answer_schema(payload)
         if settings.llm_provider == 'openai_compatible':
             system += '\n必须遵守的 JSON schema：' + json.dumps(generation_schema, ensure_ascii=False, separators=(',', ':'))
-        model = get_structured_model(schema, reasoning=False, num_predict=OUTLINE_TOKENS)
+        model = get_structured_model(schema, reasoning=False, num_predict=REPORT_TOKENS)
         if settings.llm_provider == 'ollama':
             model = model.bind(format=generation_schema)
         elif settings.llm_provider == 'openai':
-            model = model.bind(response_format=response_format('ReportOutline', generation_schema))
+            model = model.bind(response_format=response_format('LedgerConclusion', generation_schema))
         response = await asyncio.wait_for(model.ainvoke([
             ('system', system),
             ('human', json.dumps(payload, ensure_ascii=False, separators=(',', ':')))]),
@@ -447,12 +414,13 @@ class EvidenceReporter:
         async def invoke(schema, system, scoped):
             try:
                 result = await self._invoke(schema, system, scoped)
+                result = schema.model_validate(result)
                 self._last_composition_plan = result.model_dump()
                 return result
             finally:
                 self._last_composition_calls.append({**getattr(self, '_last_call', {}), 'schema': schema.__name__})
 
-        return await compose_report(payload, invoke, num_ctx=get_settings().ollama_num_ctx)
+        return await compose_report(payload, invoke)
 
     async def answer(self, question, context, results, *, history='', instruction='', artifacts=None, understanding=None, analysis_scope=None):
         needs = set((understanding or {}).get('evidenceNeeds', []))
@@ -492,52 +460,39 @@ class EvidenceReporter:
                     'values': [q('原期限', previous, '个月'), q('新期限', projection['months'], '个月'),
                                q('新增结余增量', extra), q('月度结余', projection['monthlyNet'])]})
         attention = build_attention_points(question, focused, facts, findings)
-        attention_ids = {key for point in attention for key in point['factIds']}
-        facts = [{**row, 'required': row['required'] or row['id'] in attention_ids} for row in facts]
-        all_facts, attempts, budget_stats = facts, [], {}
-        status = 'planned'
+        payload.update(facts=facts, analysisFindings=findings, reviewPriorities=attention)
+        report_context = audit_report_context(payload)
+        attempts, calls, status, report = [], [], 'planned', None
         try:
-            settings = get_settings()
-            payload, facts, budget_stats = build_report_context(
-                payload, facts, OUTLINE_PROMPT, ReportOutline, include_values=False,
-                num_ctx=settings.ollama_num_ctx, num_predict=OUTLINE_TOKENS)
-            draft = await self._draft({**payload, 'analysisFindings': findings})
-            issues = validate_draft(draft, facts, findings)
-            if issues:
-                raise ValueError('；'.join(issues))
-            reply = render_report(draft, facts)
-            report = draft.model_dump()
+            report_context = prepare_report_context(payload, REPORT_PROMPT, ReportDraft,
+                num_ctx=get_settings().ollama_num_ctx, num_predict=REPORT_TOKENS)
+            for turn in range(2):
+                try:
+                    draft = await self._draft(report_context)
+                finally:
+                    calls.extend(getattr(self, '_last_composition_calls', []))
+                issues = validate_draft(draft, report_context)
+                if not issues:
+                    reply = render_report(draft, report_context)
+                    report = draft.model_dump()
+                    break
+                attempts.append({'issues': issues, 'stage': 'reference_validation'})
+                if turn:
+                    raise ValueError('；'.join(issues))
+                report_context.payload = {**report_context.payload, 'corrections': issues}
+            else:
+                raise ValueError('结论生成未完成')
         except Exception as exc:
-            # A failed outline never removes known answers or the requested artifacts.
             detail = '; '.join(f"{err['loc']}: {err['msg']}" for err in exc.errors()) if isinstance(exc, ValidationError) else (str(exc) if isinstance(exc, ValueError) else '')
-            attempts.append({'issues': ['报告提纲失败：' + type(exc).__name__ + ' ' + detail[:500]],
-                             'calls': list(getattr(self, '_last_composition_calls', [])),
-                             'contextBudget': budget_stats})
-            facts = all_facts
-            selected = [row for row in facts if row['required']]
-            selected += [row for row in facts if not row['required']][:12]
-            paragraphs, seen = [], set()
-            for row in selected:
-                paragraphs.append(row['text'])
-                explanation = grounded_analysis([row['id']], facts, findings, seen)
-                if explanation:
-                    paragraphs.append(explanation)
-            reply = '以下是本次账本核算与分析：\n\n' + '\n\n'.join(paragraphs)
-            report, status = None, 'fallback'
-        count = requested_attention_count(question)
-        if count:
-            by_id = {row['id']: row for row in all_facts}
-            lines = ['**综合关注点**', '按已核算的资金约束、已记变化、来源结构和待核查线索依次整理：']
-            for index, point in enumerate(attention, 1):
-                scope = by_id[point['factIds'][0]]['binding']['scope']
-                lines.append(f"{index}. **【{scope}】{point['title']}**：{point['reason']}")
-            if len(attention) < count:
-                lines.append(f'现有证据仅支持 {len(attention)} 项关注点，不能据此凑出 {count} 项财务问题。')
-            reply = '\n\n'.join(lines) + '\n\n' + reply
-        table_text = render_artifacts_markdown(artifacts)
-        return reply + ('\n\n' + table_text if table_text else ''), {
-            'status': 'grounded', 'mechanism': 'computed_findings', 'compositionStatus': status,
-            'facts': facts, 'findings': findings, 'report': report, 'attempts': attempts,
+            attempts.append({'issues': ['结论生成失败：' + type(exc).__name__ + ' ' + detail[:500]],
+                             'contextBudget': report_context.budget})
+            reply, status = fallback_report(report_context), 'fallback'
+        return reply, {
+            'status': 'grounded', 'mechanism': 'cited_conclusions', 'compositionStatus': status,
+            'facts': facts, 'composerFactIds': [f['id'] for f in report_context.selected],
+            'valueReferences': report_context.values, 'judgments': report_context.judgments,
+            'findings': findings, 'report': report, 'attempts': attempts,
             'attentionPoints': attention,
             'compositionPlan': getattr(self, '_last_composition_plan', None),
-            'calls': list(getattr(self, '_last_composition_calls', [])), 'contextBudget': budget_stats}
+            'calls': calls or list(getattr(self, '_last_composition_calls', [])),
+            'contextBudget': report_context.budget}

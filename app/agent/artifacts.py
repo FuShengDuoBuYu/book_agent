@@ -206,6 +206,7 @@ def build_artifacts(results, output=None, window=None):
     def add(title, columns, rows, *, kind='table', x_key=None, series=None, notes=None):
         if rows:
             artifacts.append({'id': f'a{len(artifacts) + 1}', 'kind': kind, 'title': title,
+                              'presentation': 'requested' if (output.get('table') or output.get('export') or kind != 'table') and not result.get('supplemental') else 'supporting',
                               'columns': [{'key': key, 'label': label, **({'unit': unit} if unit else {})}
                                           for key, label, unit in columns],
                               'rows': rows, 'notes': notes or [],
