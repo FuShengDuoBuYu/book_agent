@@ -3,7 +3,7 @@
 # by the original service. Stop the staging instance before switching.
 [Service]
 ExecStart=
-ExecStart=/opt/ai-bill/runtimes/ollama-v0.40.16/bin/ollama serve
+ExecStart=/root/runtime/bin/ollama-v0.40.16/bin/ollama serve
 Environment=OLLAMA_NUM_PARALLEL=1
 Environment=OLLAMA_MAX_LOADED_MODELS=1
 Environment=OLLAMA_KEEP_ALIVE=60s

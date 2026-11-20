@@ -48,4 +48,4 @@
 
 本轮没有接入真实用户账本，也没有验证手机 WebView。模型仍可能给出重复、笼统或未覆盖规则边界的解释；`reviewed` 不是正确性的证明。后续应结合实际使用反馈、存储的结构化条件、工具证据和报告校对记录继续回归。
 
-家庭测试原始合成 JSONL 保存在 `/opt/ai-bill/quality-20261112/`。发布继续采用独立版本目录、配置备份和 systemd 切换，并在发布后单独检查 `/ready`、历史接口认证、数据库连通性和开机启动。
+家庭测试原始合成 JSONL 已归位到 `/root/runtime/state/book-agent/evaluations/quality-20261112/`。当前部署沿用主机 apps/runtime/secrets/infra 划分，源码、环境、私有配置和评测分区管理；见[当前发布与归位记录](deployments/2026-11-20.md)。发布后分别检查 `/ready`、历史接口认证、数据库连通性和开机启动。

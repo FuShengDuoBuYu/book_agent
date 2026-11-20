@@ -38,7 +38,9 @@ Agent 默认分支为 `main`，账本后端为 `python`，Android 为 `master`�
 
 ## 家庭主机启动与域名映射
 
-正式环境由 `app-ai-bill-agent.service` 和 `app-ai-bill-ledger.service` 管理，需保持 enabled 和 active。Agent 环境位于 `/etc/ai-bill/agent.env`，凭据不进入仓库。新版本使用独立发布目录和 systemd drop-in 切换，保留旧发布目录及受限权限的配置备份用于回滚。
+正式环境沿用家庭主机的 apps/runtime/secrets/infra 划分。Agent源码在 `/root/apps/book-agent`，账本专用服务在 `/root/apps/ai-bill/ledger`；环境分别在 `/root/runtime/envs/book-agent`、`/root/runtime/envs/ai-bill-ledger`。状态和私有评测在 `/root/runtime/state/book-agent`，缓存及历史源码归档在 `/root/runtime/cache/book-agent`，环境配置在 `/root/secrets/book-agent/{agent,ledger}.env`。凭据不进入仓库。
+
+`app-ai-bill-agent.service` 和 `app-ai-bill-ledger.service` 均enabled/active，通过原有 `apps.target` 开机启动。单元源文件、环境锁、清单、迁移日志及部署工具统一由 `/root/infra` 管理，安装单元使用其 `scripts/deploy-unit.sh`。变更前保存私有配置备份，候选先在模块缓存验证，按依赖顺序切换并验证就绪、资源、权限和真实会话，失败恢复原代码与配置。不得在root顶层或另起 `/opt/ai-bill` 放临时部署树。
 
 服务统一通过 systemd 管理。旧的前台双进程启动脚本已移除，避免使用过时的兼容接口配置或漏掉会话与成员键环境。排障时检查现有单元及日志：
 
@@ -69,7 +71,7 @@ journalctl -u app-ai-bill-agent.service -n 80 --no-pager
 
 家庭主机原有 Ollama 0.21.2 对 Qwen3.5 的 `think=false` 加 JSON Schema 请求曾直接返回普通中文，导致规划或报告在读取账本前后反复失败。这与 [Ollama 上游问题及修复](https://github.com/ollama/ollama/pull/15901) 对应；发布前必须验证实际协议能力，不能只检查版本或模型名称。
 
-固定运行时在 `/opt/ai-bill/runtimes/ollama-v0.40.16`，官方发布包的大小和 SHA-256 直接与 GitHub 发布元数据核对后使用。先以临时 `app-ai-bill-ollama.service` 绑定 `127.0.0.1:11435` 验证，复用现有模型目录；原服务在验证期间保持原配置。
+固定运行时在 `/root/runtime/bin/ollama-v0.40.16`，官方发布包的大小和 SHA-256 直接与 GitHub 发布元数据核对后使用。此前以临时 `app-ai-bill-ollama.service` 绑定 `127.0.0.1:11435` 验证，复用现有模型目录；原服务在验证期间保持原配置。该临时单元现已停用并归档；未来比较应通过infra流程部署引用canonical运行时的新验证单元。
 
 仅选择本地Qwen作为生产模型并明确切换其运行时时，顺序是启动验证实例、通过 `python -m scripts.check_model_contract`、完成模型质量回放，再停止验证实例，通过现有 `app-ollama.service` 的 drop-in 切换到已验证的二进制。原来的监听地址、模型目录和账号由现有服务继续配置，Agent 继续使用 `127.0.0.1:11434`，其他现有 API 路由无需改变。仓库提供 `deploy/ollama-runtime.conf.example`。生产复用同一个运行时，保持单路推理、最多一个驻留模型和一分钟空闲释放；模型不随应用发布复制。比较两个运行时时串行测试，等待前一个模型释放。Agent 发布和运行时配置都保留原版本，方便回滚。
 
@@ -78,6 +80,8 @@ journalctl -u app-ai-bill-agent.service -n 80 --no-pager
 
 ## 正式账号与API就绪探测
 
-正式Agent单元使用DynamicUser和只读系统保护。解压发布包后，在切换前必须以单元实际账号检查工作目录、Python依赖、应用代码与前端文件可读；不要只用root测试。本仓库代码为公开源码，正式发布使用root:root所有、目录0755、普通代码文件0644（保留需要的可执行位），服务只能读取；环境文件和API密钥在发布目录之外，仍为root0600。DynamicUser的临时UID/GID可能变化，不应把代码访问依赖于瞬态组所有权。使用tar数据过滤器并配合umask0077时，目录可能保留0700，需显式处理代码目录访问权限，不能把密钥一起放宽。
+正式Agent和账本单元遵循主机原设计，以root运行，`DynamicUser=no`，不新增服务账号。保留 `NoNewPrivileges`、只读系统及主目录、私有临时目录、空能力集，只为模块状态和缓存配置写权限；源码和环境只读，凭据目录、SSH/Codex目录及infra备份对进程不可见。环境文件以root0600保存在secrets，由systemd在隔离前读取。发布预检必须复用实际单元的namespace保护，确认代码/依赖可读、状态可写且凭据不可读。仅在root交互shell导入成功不能证明隔离单元可用。
+
+Python环境在最终绝对路径新建并核对固定依赖，不能直接移动含绝对shebang的venv。删除旧树前先完成真实授权会话验收、确认进程/单元/配置无旧路径依赖、保留源码与必要回滚配置，并检查目标与所有子目录均无独立挂载。完整当前布局及验证见[发布与归位记录](deployments/2026-11-20.md)。
 
 官方API的/ready探测使用20秒HTTP客户端超时，成功模型列表探测在本进程缓存最多30秒并合并并发请求；配置或API密钥变化立即重新探测。失败不缓存，新探测发现模型消失或连接失败仍返回503，未配置记忆也返回503。HTTP响应携带no-store。外部发布探测超时应大于该探测预算（本次使用30秒），并在同正式账号及保护配置的隔离端口通过后切换。/ready不验证回答语义，真实授权问题和历史恢复仍须单独验收。
