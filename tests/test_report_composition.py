@@ -78,6 +78,25 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(validate_draft(draft('缺少支付方式{{v1}}，会影响相关归集但不证明金额错误。'), data), [])
         self.assertEqual(validate_draft(draft('{{v1}}账单缺少支付方式，会影响归集。'), data), [])
 
+    def test_total_and_bill_count_in_same_sentence_have_a_clear_statistical_object(self):
+        data=context(facts=[fact('f1',values=[{'label':'支出','value':120,'unit':'元'},
+            {'label':'账单笔数','value':3,'unit':'笔'},{'label':'meanTransactionAmount','value':40,'unit':'元'}])])
+        report=draft('个人账本筛选后的支出总额为{{v1}}，共{{v2}}，每笔均额{{v3}}。')
+        self.assertEqual(validate_draft(report,data),[])
+        self.assertTrue(validate_draft(draft('共{{v2}}。'),data))
+
+    async def test_failed_draft_is_retained_for_private_diagnostics(self):
+        from app.agent.evidence_report import EvidenceReporter
+        from unittest.mock import patch
+        from scripts.conclusion_cases import conclusion_cases
+        from datetime import date
+        case=next(c for c in conclusion_cases(date(2026,11,20)) if c['case']=='forecast')
+        invalid=ReportDraft(conclusion={'text':'不存在的引用{{v999999}}。','factIds':['f1']})
+        with patch.object(EvidenceReporter,'_draft',AsyncMock(return_value=invalid)):
+            _,validation=await EvidenceReporter().answer(case['question'],case['context'],case['results'],analysis_scope=case['scope'])
+        self.assertEqual(validation['compositionStatus'],'fallback')
+        self.assertEqual(validation['attempts'][0]['draft'],invalid.model_dump())
+
     def test_parallel_months_and_amounts_are_checked_in_their_respective_order(self):
         facts = [fact('aug', group='g1', tool='trends', month='2026-08', values=[{'label':'已记结余','value':-100,'unit':'元'}]),
                  fact('sep', group='g2', tool='trends', month='2026-09', values=[{'label':'已记结余','value':-200,'unit':'元'}])]
