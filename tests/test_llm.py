@@ -32,23 +32,24 @@ class ModelConfigurationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue({'groupBy', 'periods', 'filters'} <= set(schema['$defs']['AggregateSpec']['required']))
         self.assertTrue({'includeCategories', 'excludeCategories'} <= set(schema['$defs']['AggregateFilters']['required']))
 
-    def test_report_outline_has_an_independent_actual_output_budget(self):
-        from app.agent.report_composition import OUTLINE_TOKENS, ReportOutline
+    def test_report_has_an_independent_actual_output_budget(self):
+        from app.agent.report_composition import REPORT_TOKENS
+        from app.schemas.report import ReportDraft
         with patch.dict(os.environ, {'LLM_PROVIDER': 'ollama', 'PLANNER_NUM_PREDICT': '4096'}, clear=True):
-            outline = get_structured_model(ReportOutline, reasoning=False, num_predict=OUTLINE_TOKENS)
+            outline = get_structured_model(ReportDraft, reasoning=False, num_predict=REPORT_TOKENS)
             planner = get_planner_model()
-        self.assertEqual(outline.bound.num_predict, 768)
+        self.assertEqual(outline.bound.num_predict, 1536)
         self.assertFalse(outline.bound.reasoning)
         self.assertEqual(planner.num_predict, 4096)
         self.assertFalse(planner.reasoning)
 
-    def test_native_report_asks_only_for_an_evidence_outline(self):
-        from app.agent.report_composition import ReportOutline
+    def test_native_report_asks_for_an_evidence_bound_conclusion(self):
+        from app.schemas.report import ReportDraft
         with patch.dict(os.environ, {'LLM_PROVIDER': 'ollama'}, clear=True):
-            outline = get_structured_model(ReportOutline, reasoning=False, num_predict=768)
-        fields = outline.kwargs['format']['$defs']['OutlineSection']['properties']
-        self.assertEqual(set(fields), {'title', 'answerGoal', 'factIds'})
-        self.assertEqual(fields['factIds']['maxItems'], 8)
+            report = get_structured_model(ReportDraft, reasoning=False, num_predict=1536)
+        schema = report.kwargs['format']
+        self.assertTrue({'conclusion', 'reasons', 'nextStep', 'caveat'} <= set(schema['properties']))
+        self.assertEqual(schema['$defs']['ReportStatement']['properties']['factIds']['maxItems'], 8)
 
     def setUp(self):
         for factory in (get_settings, get_chat_model, get_planner_model, get_structured_model):

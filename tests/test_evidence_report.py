@@ -27,6 +27,15 @@ class EvidenceFactTests(unittest.TestCase):
         self.assertEqual(monthly['binding']['scope'], '个人版')
         self.assertIn('month', monthly['binding'])
 
+    def test_recorded_change_driver_has_a_typed_context_role(self):
+        from datetime import date
+        from scripts.conclusion_cases import conclusion_cases
+        result = next(r for r in conclusion_cases(date(2026, 11, 20))[0]['results'] if r['tool'] == 'changes')
+        facts = build_facts([result])
+        driver = next(f for f in facts if '变化来自' in f['text'])
+        self.assertEqual(driver['binding'].get('evidenceRole'), 'change_driver')
+        self.assertEqual(driver['binding'].get('category'), '医疗')
+
     def test_missing_liquidity_is_a_mandatory_fact(self):
         facts = build_facts([{'tool': 'purchase', 'mode': '个人版', 'evidence': {
             'sufficientData': False, 'missingInputs': ['startingBalance'], 'purchaseAmount': 6000}}])
@@ -130,60 +139,40 @@ class EvidenceFactTests(unittest.TestCase):
 
 
 class GroundedReportValidationTests(unittest.TestCase):
-    def setUp(self):
-        self.facts = [
-            {'id': 'f1', 'text': '家庭可动用余额未知。', 'required': True,
-             'binding': {'tool': 'purchase', 'scope': '家庭版', 'resultGroup': 'g1'}},
-            {'id': 'f2', 'text': '个人账本已记录现金余额。', 'required': True,
-             'binding': {'tool': 'purchase', 'scope': '个人版', 'resultGroup': 'g2'}},
-        ]
-        self.findings = {
-            'g1': {'tool': 'purchase', 'scope': '家庭版', 'observations': ['尚缺当前可动用余额。']},
-            'g2': {'tool': 'purchase', 'scope': '个人版', 'observations': ['给定余额可同时覆盖购买和储备。']},
-        }
+    def test_both_books_keep_their_own_fixed_decisions(self):
+        from tests.test_report_composition import context, draft, fact
+        facts = [fact('f1', tool='purchase', scope='家庭版'),
+                 fact('f2', tool='purchase', scope='个人版', group='g2')]
+        findings = {'g1': {'tool': 'purchase', 'scope': '家庭版', 'states': {'sufficientData': False}},
+                    'g2': {'tool': 'purchase', 'scope': '个人版', 'states': {
+                        'sufficientData': True, 'coversPrice': True, 'coversPriceAndReserve': True}}}
+        data = context(facts=facts, findings=findings)
+        report = draft('{{j1}} {{j2}}', ('f1', 'f2'))
+        self.assertEqual(validate_draft(report, data), [])
+        self.assertIn('【家庭版】', render_report(report, data))
+        self.assertIn('【个人版】', render_report(report, data))
+        self.assertTrue(validate_draft(draft('{{j2}}', ('f2',)), data))
 
-    @staticmethod
-    def draft(*sections):
-        return ReportDraft(sections=[
-            {'title': '分析结论', 'factIds': identifiers, 'analysis': analysis}
-            for identifiers, analysis in sections
-        ])
+    def test_unknown_references_cannot_be_rendered_as_evidence(self):
+        from tests.test_report_composition import context, draft
+        self.assertTrue(validate_draft(draft('依据已核对。', ('fabricated',)), context()))
 
-    def test_only_exact_findings_for_the_cited_scopes_are_valid(self):
-        draft = self.draft(
-            (['f1'], '【家庭版】尚缺当前可动用余额。'),
-            (['f2'], '【个人版】给定余额可同时覆盖购买和储备。'),
-        )
-        self.assertEqual(validate_draft(draft, self.facts, self.findings), [])
-        fraud = draft.model_copy(deep=True)
-        fraud.sections[0].analysis = draft.sections[1].analysis
-        self.assertTrue(validate_draft(fraud, self.facts, self.findings))
-        extra = draft.model_copy(deep=True)
-        extra.sections[0].analysis += ' 因此你肯定买不起。'
-        self.assertTrue(validate_draft(extra, self.facts, self.findings))
+    def test_misbound_finding_cannot_authorize_a_decision(self):
+        from tests.test_report_composition import context, fact
+        with self.assertRaisesRegex(ValueError, '范围'):
+            context(facts=[fact('f1', tool='purchase', scope='家庭版')], findings={
+                'g1': {'tool': 'purchase', 'scope': '个人版', 'states': {'coversPrice': True}}})
 
-    def test_unknown_references_and_missing_required_evidence_are_rejected(self):
-        omission = self.draft((['f1'], '【家庭版】尚缺当前可动用余额。'))
-        self.assertTrue(validate_draft(omission, self.facts, self.findings))
-        unknown = self.draft(
-            (['f1'], '【家庭版】尚缺当前可动用余额。'),
-            (['f2', 'fabricated'], '【个人版】给定余额可同时覆盖购买和储备。'),
-        )
-        self.assertTrue(validate_draft(unknown, self.facts, self.findings))
-
-    def test_a_misbound_finding_is_rejected_even_when_its_prose_matches(self):
-        draft = self.draft((['f1', 'f2'], '【个人版】给定余额可同时覆盖购买和储备。'))
-        mismatched = dict(self.findings, g1=self.findings['g2'])
-        self.assertTrue(validate_draft(draft, self.facts, mismatched))
-
-    def test_render_report_keeps_literal_ledger_names_in_facts_and_analysis(self):
-        fact = {**self.facts[0], 'text': '来源“画稿{{v1}}”已记 900 元。',
-                'values': [{'label': '已记收入', 'value': 900, 'unit': '元'}]}
-        prose = '【家庭版】“画稿{{v1}}”需核对原始账单。'
-        draft = self.draft((['f1'], prose))
-        reply = render_report(draft, [fact])
-        self.assertIn(fact['text'], reply)
-        self.assertIn(prose, reply)
+    def test_literal_variable_like_ledger_name_is_not_a_quantity_reference(self):
+        from tests.test_report_composition import context, draft, fact
+        data = context(facts=[fact('f1', source='画稿{{v1}}',
+                                  values=[{'label': '已记收入', 'value': 900, 'unit': '元'}])])
+        label = next(v['id'] for v in data.values if v['unit'] == 'label')
+        report = draft('原始来源{{' + label + '}}已记录{{v1}}，需要核对用途。')
+        self.assertEqual(validate_draft(report, data), [])
+        reply = render_report(report, data)
+        self.assertIn('画稿{{v1}}', reply)
+        self.assertIn('900 元', reply)
 
 
 if __name__ == '__main__':

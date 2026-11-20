@@ -1,339 +1,440 @@
 import unittest
 from copy import deepcopy
+from unittest.mock import AsyncMock
 
-from app.agent.report_composition import ReportOutline, compose_report, grounded_analysis, outline_schema
-
-
-WINDOW = {'startDate': '2026-08-01', 'endDate': '2026-10-31'}
-
-
-def section(title, goal, *identifiers):
-    return {'title': title, 'answerGoal': goal, 'factIds': list(identifiers)}
+from app.agent.report_composition import (REPORT_PROMPT, REPORT_TOKENS, answer_schema,
+    compose_report, grounded_analysis, render_report, validate_draft, fallback_report)
+from app.agent.report_evidence import prepare_report_context
+from app.schemas.report import ReportDraft
 
 
-def bound_fact(identifier, text, group, tool, *, headline=False, primary=True, scope='个人版', window=WINDOW, **extra):
-    binding = {'resultGroup': group, 'tool': tool, 'scope': scope, 'historyWindow': window,
-               'metric': 'income', 'primary': primary, **extra}
-    if headline:
-        binding['headline'] = True
-    return {'id': identifier, 'text': text, 'required': headline and primary, 'binding': binding}
+def fact(key, text='已核算的账单。', *, group='g1', tool='changes', scope='个人版', values=None, **binding):
+    return {'id': key, 'text': text, 'required': True, 'values': values or [],
+            'binding': {'resultGroup': group, 'tool': tool, 'scope': scope, 'primary': True, **binding}}
 
 
-def payload_for_composition():
-    return {
-        'question': '按类别说明支出变化。',
-        'understanding': {'requestedAnswers': ['解释哪些类别增加']},
-        'analysisScope': {'metric': 'expense', 'window': '九月到十月'},
-        'userConditions': {'protectedCategories': ['房租']},
-        'history': '不应回放的旧助手分析。',
-        'facts': [
-            {**bound_fact('f1', '交通支出变化。', 'g1', 'changes'), 'required': True},
-            bound_fact('f2', '餐饮支出变化。', 'g2', 'changes'),
-            bound_fact('f3', '其他账本的已记支出。', 'g3', 'changes', scope='家庭版'),
-        ],
-        'values': {'v1': 'f1 变化额 = 100 元'},
-        'artifacts': [{'id': 'a1', 'title': '分类统计', 'rows': [{'label': '其他资料'}], 'totalRows': 20}],
-    }
+def context(facts=None, findings=None, question='分析变化，给我结论', conditions=None, **kwargs):
+    facts = facts or [fact('f1', values=[{'label': '支出变化', 'value': 900, 'unit': '元'}])]
+    findings = findings or {'g1': {'scope': '个人版', 'tool': 'changes',
+                                 'observations': ['已记录支出上升。'], 'states': {}}}
+    return prepare_report_context({'question': question, 'facts': facts, 'analysisFindings': findings,
+        'understanding': {'requestedAnswers': ['解释变化']}, 'userConditions': conditions or {}},
+        REPORT_PROMPT, ReportDraft, **kwargs)
 
 
-async def compose_fixture(payload, invoke, **kwargs):
-    data = deepcopy(payload)
-    if 'analysisFindings' not in data:
-        data['analysisFindings'] = {}
-        for index, fact in enumerate(data['facts'], 1):
-            binding = fact.setdefault('binding', {})
-            group = binding.setdefault('resultGroup', f'fixture{index}')
-            binding.setdefault('tool', 'changes')
-            binding.setdefault('scope', '个人版')
-            data['analysisFindings'].setdefault(group, {
-                'tool': binding['tool'], 'scope': binding['scope'],
-                'observations': ['本组账单已核对。'],
-            })
-    return await compose_report(data, invoke, **kwargs)
+def draft(text='支出变化集中在已记录的大额项目，应先核对其用途再判断是否持续。', ids=('f1',), **kwargs):
+    return ReportDraft(conclusion={'text': text, 'factIds': list(ids)}, **kwargs)
 
 
-class FakeComposition:
-    def __init__(self, *sections):
-        self.outline = {'sections': list(sections)}
-        self.calls = []
+class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_model_can_synthesize_a_conclusion_instead_of_selecting_canned_prose(self):
+        data = context()
+        invoke = AsyncMock(return_value=draft().model_dump())
+        result = await compose_report(data, invoke)
+        self.assertEqual(validate_draft(result, data), [])
+        self.assertIn('应先核对其用途', render_report(result, data))
+        self.assertNotIn('已记录支出上升', render_report(result, data))
+        invoke.assert_awaited_once()
+        self.assertIs(invoke.await_args.args[0], ReportDraft)
 
-    async def invoke(self, schema, system, payload):
-        self.calls.append((schema, deepcopy(payload)))
-        if schema is ReportOutline:
-            return self.outline
-        raise AssertionError(f'Unexpected schema: {schema}')
+    async def test_only_current_evidence_and_conditions_reach_the_composer(self):
+        data = context()
+        original = deepcopy(data.payload)
+        invoke = AsyncMock(return_value=draft().model_dump())
+        await compose_report(data, invoke)
+        self.assertEqual(data.payload, original)
+        self.assertNotIn('history', invoke.await_args.args[2])
+        self.assertNotIn('artifacts', invoke.await_args.args[2])
+        self.assertIn('computedFindings', invoke.await_args.args[2])
 
+    def test_forecast_basis_question_leads_with_explanation_instead_of_repeating_point(self):
+        data = context(facts=[fact('f1', '下月收入条件估计为 6600 元。', tool='forecast', headline=True)],
+            findings={'g1': {'tool': 'forecast', 'scope': '个人版', 'states': {'sufficientData': True}}},
+            question='你为什么这样预测，依据是什么？')
+        report = draft('这是按近期同来源的历史入账构成估计，不代表未来到账保证。')
+        self.assertFalse(data.payload['answerRequirements']['leadWithJudgment'])
+        self.assertEqual(validate_draft(report, data), [])
+        self.assertTrue(render_report(report, data).startswith('这是按近期'))
+        self.assertNotIn('6600', render_report(report, data))
 
-class ReportCompositionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_outline_only_renders_code_findings_and_keeps_literal_variable_like_names(self):
-        payload = payload_for_composition()
-        payload['analysisFindings'] = {
-            'g1': {'tool': 'changes', 'scope': '个人版',
-                   'observations': ['“翻译{{v1}}”的已记支出上升。'],
-                   'limitations': ['单笔记录无法确认日后是否持续。'],
-                   'actions': ['核对该条原始账单。']},
-            'g3': {'tool': 'changes', 'scope': '家庭版', 'observations': ['无关事实。']},
-        }
-        initial = deepcopy(payload)
-        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'))
-        draft = await compose_report(payload, fake.invoke)
-        self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline])
-        exactly = '【个人版】“翻译{{v1}}”的已记支出上升。 单笔记录无法确认日后是否持续。 核对该条原始账单。'
-        self.assertEqual(draft.sections[0].analysis, exactly)
-        outline = fake.calls[0][1]
-        for key in ('question', 'understanding', 'analysisScope', 'userConditions', 'facts', 'artifacts'):
-            self.assertEqual(outline[key], payload[key])
-        for key in ('analysisFindings', 'values', 'quantityReferences', 'history'):
-            self.assertNotIn(key, outline)
-        self.assertEqual(payload, initial)
+    def test_audited_past_window_and_recent_comparison_are_not_new_numeric_claims(self):
+        facts = [fact('f1', historyWindow={'startDate': '2026-06-01', 'endDate': '2026-11-20'})]
+        data = context(facts=facts, question='分析最近半年收支变化和主要原因')
+        self.assertEqual(validate_draft(draft('最近半年收入持平，最近一次完整月对比显示支出上升。'), data), [])
+        self.assertTrue(validate_draft(draft('未来半年就能达成目标。'), data))
+        short = context(facts=[fact('f1', historyWindow={'startDate': '2026-10-01','endDate':'2026-11-20'})], question='分析最近半年')
+        self.assertTrue(validate_draft(draft('最近半年收入持平。'), short))
+        months = [fact(f'm{i}', tool='trends', month=f'2026-{i:02}', aggregation='recorded_month_total') for i in range(6,12)]
+        calendar = context(facts=months, findings={'g1': {'scope':'个人版','tool':'trends','states':{}}}, question='分析最近半年的收支')
+        calendar.payload['asOfDate'] = '2026-11-20'
+        self.assertEqual(validate_draft(draft('最近半年的收支存在波动。', ids=('m6',)), calendar), [])
 
-    async def test_missing_findings_raise_instead_of_substituting_another_group(self):
-        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'))
-        with self.assertRaisesRegex(ValueError, '分析发现'):
-            await compose_report(payload_for_composition(), fake.invoke)
-        self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline])
+    def test_project_grouping_words_are_not_financial_count_claims(self):
+        self.assertEqual(validate_draft(draft('按同一项目合并不同工序，这项历史入账不计入持续收入。'), context()), [])
 
-    async def test_native_outline_uses_available_facts_goals_and_dependency_capacity(self):
-        payload = payload_for_composition()
-        payload['answerGoals'] = payload['understanding']['requestedAnswers']
-        payload['facts'] = [bound_fact('f1', '已算出主结论。', 'g1', 'forecast', headline=True),
-                            bound_fact('f2', '已确认方法。', 'g1', 'forecast', headline=True),
-                            bound_fact('f3', '来源明细。', 'g1', 'forecast')]
-        schema = outline_schema(payload)['$defs']['OutlineSection']['properties']
-        self.assertEqual(schema['factIds']['maxItems'], 6)
-        self.assertEqual(schema['factIds']['items']['enum'], ['f1', 'f2', 'f3'])
-        self.assertEqual(schema['answerGoal']['enum'], ['解释哪些类别增加'])
-        self.assertNotIn('抗风险弱', schema['title']['enum'])
+    def test_bare_counter_is_not_a_complete_evidence_explanation(self):
+        data = context(facts=[fact('f1', values=[{'label': 'missingPaymentMethodCount', 'value': 31, 'unit': '笔'}])])
+        self.assertTrue(validate_draft(draft('{{v1}}，会影响按账户或支付方式分析。'), data))
+        self.assertEqual(validate_draft(draft('缺少支付方式{{v1}}，会影响相关归集但不证明金额错误。'), data), [])
+        self.assertEqual(validate_draft(draft('{{v1}}账单缺少支付方式，会影响归集。'), data), [])
 
-    async def test_outline_cannot_invent_a_new_answer_goal(self):
-        fake = FakeComposition(section('分析结论', '证明收入单一所以抗风险能力弱', 'f1'))
-        with self.assertRaisesRegex(ValueError, '目标'):
-            await compose_fixture(payload_for_composition(), fake.invoke)
+    def test_parallel_months_and_amounts_are_checked_in_their_respective_order(self):
+        facts = [fact('aug', group='g1', tool='trends', month='2026-08', values=[{'label':'已记结余','value':-100,'unit':'元'}]),
+                 fact('sep', group='g2', tool='trends', month='2026-09', values=[{'label':'已记结余','value':-200,'unit':'元'}])]
+        for f in facts:f['calendars']=[f['binding']['month']]
+        data = context(facts=facts, findings={g:{'scope':'个人版','tool':'trends','states':{}} for g in ['g1','g2']})
+        refs = {(v['factId'],v['unit']): '{{'+v['id']+'}}' for v in data.values if '绝对值' not in v['role']}
+        text = refs['aug','month']+'和'+refs['sep','month']+'分别结余'+refs['aug','元']+'、'+refs['sep','元']+'。'
+        self.assertEqual(validate_draft(draft(text,ids=('aug','sep')),data),[])
+        swapped = refs['aug','month']+'和'+refs['sep','month']+'分别结余'+refs['sep','元']+'、'+refs['aug','元']+'。'
+        self.assertTrue(validate_draft(draft(swapped,ids=('aug','sep')),data))
 
-    async def test_outline_cannot_supply_free_analysis(self):
-        answer = {**section('变化来源', '解释哪些类别增加', 'f1'), 'analysis': '文案不能进入最终报告。'}
-        fake = FakeComposition(answer)
-        with self.assertRaisesRegex(ValueError, 'analysis'):
-            await compose_fixture(payload_for_composition(), fake.invoke)
+    def test_short_reference_month_question_answers_the_method_first(self):
+        from app.agent.report_evidence import judgment_leads
+        self.assertFalse(judgment_leads({'question': '这个预测参考哪几个月？'}))
+        self.assertTrue(judgment_leads({'question': '几个月能存到目标？'}))
 
-    async def test_unknown_outline_reference_is_rejected(self):
-        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'),
-                               section('需要确认的事项', '解释哪些类别增加', 'fabricated'))
-        with self.assertRaisesRegex(ValueError, '证据'):
-            await compose_fixture(payload_for_composition(), fake.invoke)
+    def test_schema_references_only_facts_present_in_the_bounded_context(self):
+        data = context()
+        schema = answer_schema(data.payload)
+        self.assertEqual(schema['$defs']['ReportStatement']['properties']['factIds']['items']['enum'], ['f1'])
+        self.assertNotIn('sections', schema['properties'])
 
-    async def test_omitted_required_evidence_gets_its_own_grounded_analysis(self):
-        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'))
-        payload = payload_for_composition()
-        payload['facts'] = [{'id': f'f{n}', 'text': '原始必需证据。', 'required': True}
-                            for n in range(1, 12)]
-        draft = await compose_fixture(payload, fake.invoke)
-        model, first, second = draft.sections
-        self.assertEqual(model.factIds, ['f1'])
-        self.assertEqual(first.factIds, [f'f{n}' for n in range(2, 10)])
-        self.assertEqual(second.factIds, ['f10', 'f11'])
-        self.assertTrue(all('本组账单已核对。' in item.analysis for item in draft.sections))
-        self.assertEqual([schema for schema, _ in fake.calls], [ReportOutline])
+    def test_typed_number_is_substituted_only_with_its_exact_fact(self):
+        data = context()
+        report = draft('这项已记支出变化为{{v1}}，应核对是否对应后续安排。')
+        self.assertEqual(validate_draft(report, data), [])
+        self.assertIn('900 元', render_report(report, data))
+        self.assertNotIn('{{v1}}', render_report(report, data))
 
-    async def test_too_many_required_evidence_sections_raise(self):
-        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'))
-        payload = payload_for_composition()
-        payload['facts'] = [{'id': f'f{n}', 'text': '必需证据。', 'required': True}
-                            for n in range(1, 43)]
-        with self.assertRaisesRegex(ValueError, '必需证据'):
-            await compose_fixture(payload, fake.invoke)
+    def test_arabic_and_chinese_fabricated_amounts_are_rejected(self):
+        for text in ['预计能赚999999元。', '预计能赚两万元。', '明年收入翻三倍并保证到账。', '预计收入提高一半。', '这笔款半个月内到账。', '疑似重复增加一组。']:
+            with self.subTest(text=text):
+                self.assertTrue(validate_draft(draft(text), context()))
 
-    async def test_outline_retry_sees_corrections_without_any_old_analysis(self):
-        payload = payload_for_composition()
-        payload['previousReport'] = {'sections': [
-            {'title': '变化来源', 'factIds': ['f1'], 'analysis': '旧段落错误结论'},
-        ]}
-        payload['corrections'] = ['第1段把支出变化当成余额。', '保留用户明确保护的房租。']
-        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'))
-        draft = await compose_fixture(payload, fake.invoke)
-        self.assertEqual(fake.calls[0][1]['corrections'], payload['corrections'])
-        self.assertNotIn('旧段落错误结论', repr(fake.calls))
-        self.assertNotIn('支出变化当成余额', draft.sections[0].analysis)
+    def test_unknown_reference_and_foreign_value_ownership_are_rejected(self):
+        facts = [fact('f1'), fact('f2', group='g2', scope='家庭版',
+                                values=[{'label': '金额', 'value': 900, 'unit': '元'}])]
+        data = context(facts=facts)
+        self.assertTrue(validate_draft(draft('收入为{{v9999}}。'), data))
+        issues = validate_draft(draft('原始备注是{{n9999}}。'), data)
+        self.assertIn('{{n9999}}', ' '.join(issues))
+        self.assertTrue(validate_draft(draft('收入为{{v1}}。'), data))
+        self.assertIn('f2', ' '.join(validate_draft(draft('收入为{{v1}}。'), data)))
+        self.assertTrue(validate_draft(draft(ids=('unknown',)), data))
 
-    async def test_long_code_finding_is_rendered_complete_under_small_outline_budget(self):
-        payload = payload_for_composition()
-        text = '必须保留的已绑定分析依据。' * 85
-        payload['analysisFindings'] = {'g1': {'tool': 'changes', 'scope': '个人版', 'observations': [text]}}
-        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f1'))
-        draft = await compose_report(payload, fake.invoke, num_ctx=2500)
-        self.assertEqual(draft.sections[0].analysis, '【个人版】' + text)
+    def test_same_amount_does_not_make_a_historical_sample_a_forecast(self):
+        data = context(facts=[fact('f1', values=[{'label': '该来源历史样本入账', 'value': 900, 'unit': '元'}])])
+        self.assertTrue(validate_draft(draft('预计下个月收入为{{v1}}。'), data))
 
-    async def test_forecast_parts_share_the_computed_headline_and_merge(self):
-        payload = payload_for_composition()
-        goals = ['解释收入构成', '核对预测合计', '说明数据来源']
-        payload['understanding']['requestedAnswers'] = goals
-        payload['facts'] = [
-            bound_fact('f1', '条件预测为 3,700 元。', 'g1', 'forecast', headline=True),
-            bound_fact('f5', '各来源按参考月份分别计算。', 'g1', 'forecast', headline=True),
-            bound_fact('f2', '历史样本共 19,000 元。', 'g1', 'forecast', source='项目收入'),
-            bound_fact('f3', '同范围历史来源汇总。', 'g2', 'sources', source='项目明细', primary=False),
-            bound_fact('f4', '另一个账本的总额是 83,700 元。', 'g3', 'aggregate', scope='家庭版'),
-        ]
-        payload['analysisFindings'] = {
-            'g1': {'tool': 'forecast', 'scope': '个人版', 'observations': ['预测沿用已记录的持续性来源。']},
-            'g2': {'tool': 'sources', 'scope': '个人版', 'observations': ['查看历史来源需要区分成员。']},
-            'g3': {'tool': 'aggregate', 'scope': '家庭版', 'observations': ['另一账本的解释。']},
-        }
-        fake = FakeComposition(section('收入构成', goals[0], 'f2'), section('分析结论', goals[1], 'f1'),
-                               section('统计口径', goals[2], 'f3'))
-        draft = await compose_report(payload, fake.invoke)
-        self.assertEqual(len(draft.sections), 1)
-        self.assertEqual(set(draft.sections[0].factIds), {'f1', 'f2', 'f3', 'f5'})
-        self.assertIn('持续性来源', draft.sections[0].analysis)
-        self.assertIn('区分成员', draft.sections[0].analysis)
-        self.assertNotIn('另一账本', draft.sections[0].analysis)
+    def test_expense_share_cannot_be_relabelled_as_share_of_income(self):
+        data = context(facts=[fact('f1', tool='aggregate', metric='expense',
+            values=[{'label': '同区间筛选后方向占比', 'value': 20, 'unit': '%'}])],
+            findings={'g1': {'tool': 'aggregate', 'scope': '个人版', 'states': {}}})
+        self.assertTrue(validate_draft(draft('这个项目占收入{{v1}}。'), data))
 
-    async def test_history_with_different_scope_window_or_missing_window_does_not_inherit_headline(self):
-        payload = payload_for_composition()
-        goal = payload['understanding']['requestedAnswers'][0]
-        payload['facts'] = [
-            bound_fact('f1', '预测合计为 3,700 元。', 'g1', 'forecast', headline=True),
-            bound_fact('f2', '另一期间的个人账本来源。', 'g2', 'sources',
-                       window={'startDate': '2026-07-01', 'endDate': '2026-07-31'}),
-            bound_fact('f3', '同一期间的家庭账本来源。', 'g3', 'sources', scope='家庭版'),
-            bound_fact('f4', '范围未确认的来源。', 'g4', 'sources', window=None),
-        ]
-        fake = FakeComposition(section('变化来源', goal, 'f2'), section('收入构成', goal, 'f3'),
-                               section('统计口径', goal, 'f4'))
-        draft = await compose_fixture(payload, fake.invoke)
-        self.assertEqual([row.factIds for row in draft.sections], [['f1'], ['f2'], ['f3'], ['f4']])
-        self.assertTrue(draft.sections[0].analysis.startswith('【个人版】'))
-        self.assertTrue(draft.sections[2].analysis.startswith('【家庭版】'))
+    def test_cross_book_statement_must_identify_both_books(self):
+        data = context(facts=[fact('f1'), fact('f2', group='g2', scope='家庭版')],
+            findings={'g1': {'tool': 'changes', 'scope': '个人版', 'states': {}},
+                      'g2': {'tool': 'changes', 'scope': '家庭版', 'states': {}}})
+        self.assertTrue(validate_draft(draft('收入来源比较集中。', ('f1', 'f2')), data))
+        self.assertEqual(validate_draft(draft('个人版和家庭版分别核算，不能混作个人余额。', ('f1', 'f2')), data), [])
 
-    async def test_identical_explicit_query_bindings_share_the_primary_decision(self):
-        payload = payload_for_composition()
-        payload['facts'] = [
-            bound_fact('f1', '每月改善目标已经确认。', 'g1', 'optimization', headline=True,
-                       window=None, queryIds=['ledger'], filters=[{'category': '不限', 'remark': ''}]),
-            bound_fact('f2', '保护项已排除。', 'g1', 'optimization', headline=True,
-                       window=None, queryIds=['ledger'], filters=[{'category': '不限', 'remark': ''}]),
-            bound_fact('f3', '该账本的历史收支结构。', 'g2', 'cashflow',
-                       window=None, queryIds=['ledger'], filters=[{'category': '不限', 'remark': ''}]),
-        ]
-        fake = FakeComposition(section('变化来源', '解释哪些类别增加', 'f3'))
-        draft = await compose_fixture(payload, fake.invoke)
-        self.assertEqual(set(draft.sections[0].factIds), {'f1', 'f2', 'f3'})
+    def test_protected_spend_cannot_become_a_cut_recommendation(self):
+        data = context(conditions={'protectedCategories': ['房租']})
+        self.assertTrue(validate_draft(draft('建议先削减房租。'), data))
+        self.assertEqual(validate_draft(draft('保留房租，先核查其他项目的用途。'), data), [])
 
-    async def test_same_window_alternative_forecasts_are_not_borrowed_by_history(self):
-        payload = payload_for_composition()
-        goal = payload['understanding']['requestedAnswers'][0]
-        payload['facts'] = [
-            bound_fact('f1', '第一种预测。', 'g1', 'forecast', headline=True),
-            bound_fact('f2', '第二种预测。', 'g2', 'forecast', headline=True),
-            bound_fact('f3', '历史来源。', 'g3', 'sources', primary=False),
-        ]
-        fake = FakeComposition(section('统计口径', goal, 'f3'))
-        draft = await compose_fixture(payload, fake.invoke)
-        self.assertEqual([row.factIds for row in draft.sections], [['f1', 'f2'], ['f3']])
-        self.assertTrue(draft.sections[0].analysis)
+    def test_certain_negative_cause_is_not_justified_by_an_evidence_reference(self):
+        self.assertTrue(validate_draft(draft('这并非学费造成的现金流变化。'), context()))
+        self.assertEqual(validate_draft(draft('不能据此断定现实消费原因，还需核对转账用途。'), context()), [])
 
-    async def test_different_filters_do_not_inherit_headline_in_same_book_and_window(self):
-        payload = payload_for_composition()
-        goal = payload['understanding']['requestedAnswers'][0]
-        payload['facts'] = [
-            bound_fact('f1', '目标分类的条件预测。', 'g1', 'forecast', headline=True, filters=[{'category': '工资'}]),
-            bound_fact('f2', '另一分类的历史来源。', 'g2', 'sources', filters=[{'category': '稿费'}]),
-        ]
-        fake = FakeComposition(section('统计口径', goal, 'f2'))
-        draft = await compose_fixture(payload, fake.invoke)
-        self.assertEqual([row.factIds for row in draft.sections], [['f1'], ['f2']])
-        self.assertTrue(draft.sections[0].analysis)
+    def test_misbound_findings_do_not_authorize_a_purchase_decision(self):
+        with self.assertRaisesRegex(ValueError, '范围'):
+            context(facts=[fact('f1', tool='purchase')],
+                    findings={'g1': {'tool': 'purchase', 'scope': '家庭版', 'states': {'coversPrice': True}}})
 
-    async def test_headline_dependency_over_capacity_raises_without_discarding_facts(self):
-        payload = payload_for_composition()
-        goal = payload['understanding']['requestedAnswers'][0]
-        payload['facts'] = [bound_fact('f1', '预测合计。', 'g1', 'forecast', headline=True)] + [
-            bound_fact(f'f{i}', '来源预测贡献。', 'g1', 'forecast') for i in range(2, 10)
-        ]
-        fake = FakeComposition(section('收入构成', goal, *(f'f{i}' for i in range(2, 10))))
-        with self.assertRaisesRegex(ValueError, '主结论.*8'):
-            await compose_fixture(payload, fake.invoke)
+    def test_critical_decision_lead_cannot_be_freely_reinterpreted(self):
+        data = context(facts=[fact('f1', tool='purchase')], findings={
+            'g1': {'tool': 'purchase', 'scope': '个人版', 'states': {
+                'sufficientData': True, 'coversPrice': True, 'coversPriceAndReserve': False}}})
+        self.assertTrue(validate_draft(draft('我看这样就稳了。'), data))
+        fixed = draft('{{j1}}')
+        self.assertEqual(validate_draft(fixed, data), [])
+        self.assertIn('达不到', render_report(fixed, data))
 
-    async def test_group_wider_than_eight_keeps_all_facts_and_explains_once(self):
-        payload = payload_for_composition()
-        goal = payload['understanding']['requestedAnswers'][0]
-        payload['facts'] = [bound_fact(f'f{i}', '某条已算结果。', 'g1', 'aggregate') for i in range(1, 11)]
-        first = [f'f{i}' for i in range(1, 7)]
-        second = [f'f{i}' for i in range(7, 11)]
-        fake = FakeComposition(section('变化来源', goal, *first), section('统计口径', goal, *second))
-        draft = await compose_fixture(payload, fake.invoke)
-        self.assertEqual([row.factIds for row in draft.sections], [first, second])
-        self.assertTrue(draft.sections[0].analysis)
-        self.assertEqual(draft.sections[1].analysis, '')
+    def test_missing_reserve_is_unknown_and_does_not_reverse_known_payment_capacity(self):
+        data = context(facts=[fact('f1', tool='purchase')], findings={
+            'g1': {'tool': 'purchase', 'scope': '个人版', 'states': {
+                'sufficientData': True, 'coversPrice': True, 'coversPriceAndReserve': None}}})
+        self.assertIn('可以支付', data.judgments[0]['text'])
+        self.assertIn('尚未给出', data.judgments[0]['text'])
+        self.assertNotIn('买不起', data.judgments[0]['text'])
 
-    async def test_duplicate_evidence_sections_only_explain_the_group_once(self):
-        payload = payload_for_composition()
-        goals = ['解释哪些类别增加', '核对统计口径']
-        payload['understanding']['requestedAnswers'] = goals
-        fake = FakeComposition(section('变化来源', goals[0], 'f1'), section('统计口径', goals[1], 'f1'))
-        draft = await compose_fixture(payload, fake.invoke)
-        self.assertEqual([row.factIds for row in draft.sections], [['f1']])
-        self.assertEqual(draft.sections[0].analysis.count('本组账单已核对。'), 1)
+    def test_long_notes_are_bounded_without_losing_full_audit(self):
+        facts = [fact(f'f{i}', text='原始长备注。' * 1000) for i in range(1, 70)]
+        data = context(facts=facts)
+        self.assertEqual(len(data.facts), 69)
+        self.assertLessEqual(len(data.selected), 36)
+        self.assertLess(data.budget['estimatedPromptTokens'], data.budget['promptBudgetTokens'])
+        self.assertEqual(data.facts[0]['text'], facts[0]['text'])
 
-    async def test_shared_headlines_only_appear_at_first_use_when_briefs_cannot_merge(self):
-        payload = payload_for_composition()
-        goal = payload['understanding']['requestedAnswers'][0]
-        payload['facts'] = [
-            bound_fact('f1', '条件推演合计。', 'g1', 'projection', headline=True),
-            bound_fact('f2', '已采用用户所设条件。', 'g1', 'projection', headline=True),
-        ] + [
-            bound_fact(f'f{i}', '推演的分项数据。', 'g1', 'projection') for i in range(3, 8)
-        ] + [
-            bound_fact(f'f{i}', '历史已记的收支。', 'g2', 'cashflow', primary=False) for i in range(8, 12)
-        ]
-        payload['analysisFindings'] = {
-            'g1': {'tool': 'projection', 'scope': '个人版', 'observations': ['结果已经按本次条件推演。']},
-            'g2': {'tool': 'cashflow', 'scope': '个人版', 'observations': ['历史现金流是参考依据。']},
-        }
-        main = [f'f{i}' for i in range(1, 8)]
-        support = [f'f{i}' for i in range(8, 12)]
-        fake = FakeComposition(section('条件与方案', goal, *main), section('统计口径', goal, *support))
-        draft = await compose_report(payload, fake.invoke)
-        self.assertEqual([entry.factIds for entry in draft.sections], [main, support])
-        self.assertIn('结果已经按本次条件推演。', draft.sections[0].analysis)
-        self.assertNotIn('已按本次条件推演', draft.sections[1].analysis)
-        self.assertIn('历史现金流是参考依据。', draft.sections[1].analysis)
+    def test_reference_ids_are_stable_when_the_context_budget_changes(self):
+        facts = [fact(f'f{i}', text='账单内容。' * 30,
+                      values=[{'label': '金额', 'value': i, 'unit': '元'}]) for i in range(1, 50)]
+        wide, narrow = context(facts=facts), context(facts=facts, num_ctx=5000)
+        index = lambda data: {(v['factId'], v['role']): v['id'] for v in data.values}
+        self.assertEqual(index(wide), index(narrow))
+        self.assertLess(len(narrow.selected), len(wide.selected))
 
-    async def test_primary_decision_leads_even_when_merged_with_earlier_support(self):
-        payload = payload_for_composition()
-        goal = payload['understanding']['requestedAnswers'][0]
-        payload['facts'] = [
-            bound_fact('f1', '已核算改善目标。', 'g1', 'optimization', headline=True),
-            bound_fact('f2', '历史完整月份的收支。', 'g2', 'cashflow', primary=False),
-        ]
-        payload['analysisFindings'] = {
-            'g1': {'tool': 'optimization', 'scope': '个人版', 'observations': ['改善目标以已核对的候选开销评估。']},
-            'g2': {'tool': 'cashflow', 'scope': '个人版', 'observations': ['历史收支只提供比较口径。']},
-        }
-        fake = FakeComposition(section('统计口径', goal, 'f2'), section('条件与方案', goal, 'f1'))
-        draft = await compose_report(payload, fake.invoke)
-        main, = draft.sections
-        self.assertEqual((main.title, main.factIds), ('条件与方案', ['f1', 'f2']))
-        self.assertTrue(main.analysis.startswith('【个人版】改善目标'))
-        self.assertIn('历史收支只提供比较口径。', main.analysis)
+    def test_internal_planning_bulk_cannot_crowd_out_months_and_change_sources(self):
+        facts = [fact('warning', text='通用统计口径说明。' * 20, tool='trends')]
+        facts += [fact(f'm{i}', text=f'月份账单已经核算，主要金额如下。', tool='trends',
+                       month=f'2026-{i:02}', aggregation='recorded_month_total',
+                       values=[{'label': '月份', 'value': f'2026-{i:02}', 'unit': 'month'},
+                               {'label': '已记支出', 'value': i * 900, 'unit': '元'}]) for i in range(6, 12)]
+        facts += [fact('driver', text='学费是已记大额支出，需要核查是否重复。', group='g2', tool='aggregate',
+                       values=[{'label': 'expense', 'value': 12000, 'unit': '元'}])]
+        payload = {'question': '分析近半年收支变化和主要原因', 'facts': facts,
+                   'analysisFindings': {'g1': {'scope': '个人版', 'tool': 'trends', 'states': {}},
+                                        'g2': {'scope': '个人版', 'tool': 'aggregate', 'states': {}}},
+                   'analysisScope': {'historyWindow': None,
+                       'primaryTasks': [{'tool': 'aggregate', 'queryIds': ['opaque-query-id' * 8],
+                                         'unusedOptional': None} for _ in range(12)],
+                       'sourceGroups': [{'label': '业务来源', 'sourceKeys': ['opaque-source-key' * 8] * 40}]},
+                   'userConditions': {'sourceGroups': [{'label': '已确认来源', 'sourceKeys': ['opaque-key' * 8] * 40}]}}
+        data = prepare_report_context(payload, REPORT_PROMPT, ReportDraft)
+        self.assertTrue({f'm{i}' for i in range(6, 12)} | {'driver'} <= {f['id'] for f in data.selected})
+        self.assertNotIn('opaque-key', repr(data.payload))
+        self.assertNotIn('opaque-source-key', repr(data.payload))
+
+    def test_causal_detail_is_not_dropped_behind_repeated_aggregate_totals(self):
+        facts = [fact(f't{i}', text='按查询范围汇总得到总计。', tool='aggregate',
+                      values=[{'label': 'expense', 'value': 100, 'unit': '元'}]) for i in range(1, 44)]
+        facts.append(fact('cause', text='month=九月、source=学费：支出12000元。', tool='aggregate',
+                          values=[{'label': 'expense', 'value': 12000, 'unit': '元'}]))
+        data = context(facts=facts, findings={'g1': {'tool': 'aggregate', 'scope': '个人版', 'states': {}}})
+        self.assertIn('cause', {f['id'] for f in data.selected})
+
+    def test_typed_change_driver_survives_many_optional_totals(self):
+        facts = [fact(f't{i}', tool='changes', values=[{'label': '支出', 'value': 100, 'unit': '元'}]) for i in range(44)]
+        facts.append(fact('cause', tool='changes', evidenceRole='change_driver', category='医疗', metric='expense',
+            text='医疗是该期支出变化的账面贡献。', values=[{'label': '金额变化', 'value': 900, 'unit': '元'}]))
+        data = context(facts=facts)
+        self.assertIn('cause', {f['id'] for f in data.selected})
+
+    def test_later_large_monthly_driver_is_not_hidden_by_early_chronological_rows(self):
+        from app.agent.report_evidence import _ordered
+        months = [fact('june', tool='trends', aggregation='recorded_month_total', month='2026-06'),
+                  fact('september', tool='trends', aggregation='recorded_month_total', month='2026-09')]
+        rows = [fact(f'early{i}', text='month=2026-06、category=日常：支出100元。', group='g2', tool='aggregate',
+            values=[{'label':'expense','value':100,'unit':'元'}]) for i in range(3)]
+        later = fact('large', text='month=2026-09、category=学习：支出2300元。', group='g2', tool='aggregate',
+            values=[{'label':'expense','value':2300,'unit':'元'}])
+        detail = fact('tuition', text='month=2026-09、category=学习、source=学费：支出2100元。',
+            group='g3', tool='aggregate', month='2026-09',
+            values=[{'label':'expense','value':2100,'unit':'元'}])
+        detail['binding']['primary'] = False
+        outside = deepcopy(detail);outside['id']='outside';outside['binding']['month']='2026-01'
+        outside['text']='month=2026-01、source=窗外支出：支出99999元。'
+        outside['values'][0]['value']=99999
+        mandatory, _ = _ordered([*months,*rows,later,detail,outside],[],[],'分析最近半年收支变化和主要原因')
+        ids = {f['id'] for f in mandatory}
+        self.assertTrue({'large','tuition'} <= ids)
+        self.assertNotIn('outside',ids)
+
+    def test_priority_context_does_not_repeat_private_computed_analysis(self):
+        from datetime import date
+        from scripts.conclusion_cases import conclusion_cases
+        from app.agent.evidence_report import build_facts
+        from app.agent.analysis_findings import build_analysis_findings
+        from app.agent.attention_points import build_attention_points
+        case = conclusion_cases(date(2026, 11, 20))[1]
+        facts = build_facts(case['results'])
+        findings = build_analysis_findings(case['results'])
+        priorities = build_attention_points(case['question'], case['results'], facts, findings)
+        data = prepare_report_context({'question': case['question'], 'facts': facts, 'analysisFindings': findings,
+            'reviewPriorities': priorities, 'analysisScope': case['scope'], 'userConditions': case['context'],
+            'understanding': {'requestedAnswers': [case['question']], 'evidenceNeeds': [r['tool'] for r in case['results']]}}, REPORT_PROMPT, ReportDraft)
+        self.assertEqual(len(data.payload['reviewPriorities']), 3)
+        self.assertTrue(all('analysis' not in p for p in data.payload['reviewPriorities']))
+        self.assertTrue(all(set(p['factIds']) <= {f['id'] for f in data.selected} for p in priorities))
+        self.assertTrue(priorities[0]['analysis'])
+
+    def test_method_followup_keeps_source_contributions_and_exclusion_in_context(self):
+        facts = [fact(f'f{i}', tool='forecast', headline=i==0,
+            values=[{'label': '历史摘要', 'value': i, 'unit': '元'}]) for i in range(44)]
+        facts += [fact('method', tool='forecast', headline=False, evidenceRole='forecast_method', text='按来源中位数相加。'),
+                  fact('source', tool='forecast', headline=False, source='项目结算', evidenceRole='forecast_source',
+                       values=[{'label': '该来源预测贡献', 'value': 500, 'unit': '元'}]),
+                  fact('excluded', tool='forecast', headline=False, source='出售', evidenceRole='forecast_source', excluded=True,
+                       text='按已应用规则剔除出售款，归类仍可核查。')]
+        data = context(facts=facts, findings={'g1': {'tool': 'forecast', 'scope': '个人版', 'states': {}}},
+            question='刚才那个月拿哪几个月参照，具体怎么从项目算到总数，一次性款项怎么处理？')
+        self.assertFalse(data.payload['answerRequirements']['leadWithJudgment'])
+        self.assertTrue({'method','source','excluded'} <= {f['id'] for f in data.selected})
+        direct = context(facts=facts, findings={'g1': {'tool': 'forecast', 'scope': '个人版', 'states': {}}}, question='按项目预计下个月收入多少？')
+        self.assertTrue({'source','excluded'} <= {f['id'] for f in direct.selected})
+
+    def test_source_method_budget_does_not_duplicate_all_original_remarks(self):
+        from app.agent.evidence_report import build_facts
+        from app.agent.analysis_findings import build_analysis_findings
+        evidence = {'metric': 'income', 'targetMonth': '2026-12', 'sufficientData': True,
+            'estimate': 6000, 'lower': 4800, 'upper': 7200,
+            'baselineMonths': ['2026-08','2026-09','2026-10'],
+            'observedMonths': ['2026-05','2026-06','2026-07','2026-08','2026-09','2026-10'],
+            'method': '各来源按最近有记录的完整月份取月金额中位数，再加总来源贡献。',
+            'excludedIncomeTotal': 0, 'sourceForecasts': []}
+        for i in range(8):
+            notes = [(f'项目{i}第{j}期设计交付已确认并按约结算。' + '已完成设计交付并核对客户的结算安排。'*12)[:40] for j in range(4)]
+            evidence['sourceForecasts'].append({'source': f'项目{i}', 'member': '成员甲', 'amount': 2250,
+                'estimate': 750, 'lower': 600, 'upper': 900, 'remarks': notes, 'excluded': False, 'monthlyAmounts': {'2026-08':750,'2026-09':750,'2026-10':750}})
+        results = [{'tool': 'forecast', 'mode': '个人版',
+            'historyWindow': {'startDate': '2026-05-01', 'endDate': '2026-11-20'}, 'evidence': evidence}]
+        facts = build_facts(results)
+        data = prepare_report_context({'question': '具体怎么从项目算到总数？', 'facts': facts,
+            'analysisFindings': build_analysis_findings(results)}, REPORT_PROMPT, ReportDraft, num_ctx=8192)
+        self.assertLessEqual(data.budget['estimatedPromptTokens'], data.budget['promptBudgetTokens'])
+        original = evidence['sourceForecasts'][0]['remarks'][0]
+        self.assertIn(original, repr(data.facts))
+        self.assertNotIn(original, repr(data.payload))
+        self.assertTrue(any(f['binding'].get('evidenceRole')=='forecast_source' for f in data.selected))
+
+    def test_method_source_fact_contains_audited_month_samples_without_repeating_catalogs(self):
+        from app.agent.evidence_report import build_facts
+        from app.agent.analysis_findings import build_analysis_findings
+        from tests.test_analysis_artifacts import forecast_result
+        result = forecast_result()
+        result['evidence']['sourceForecasts'][0]['monthlyAmounts'] = {'2026-08':1000,'2026-09':1200,'2026-10':1600}
+        facts = build_facts([result])
+        payload = {'question':'具体怎么从各来源算到总数？','facts':facts,'analysisFindings':build_analysis_findings([result])}
+        data = prepare_report_context(payload, REPORT_PROMPT, ReportDraft)
+        source = next(f for f in data.selected if f['binding'].get('source')=='带球')
+        visible = next(f for f in data.payload['facts'] if f['id']==source['id'])
+        self.assertIn('2026-08',visible['text'])
+        sample = next(v for v in data.values if v['factId']==source['id'] and v['role']=='该来源历史月入账（2026-08）')
+        self.assertEqual(sample['value'],1000)
+        self.assertEqual(sample['binding']['month'],'2026-08')
+        self.assertIn(sample['id'],data.payload['values'])
+        direct = prepare_report_context({**payload,'question':'预计下个月收入多少？'}, REPORT_PROMPT, ReportDraft)
+        self.assertNotIn(sample['id'],direct.payload['values'])
+        self.assertIn('monthlyAmounts',str(result))
+
+    def test_monthly_improvement_gap_is_not_solved_by_postponing_a_goal(self):
+        data = context(facts=[fact('f1', tool='optimization')], findings={
+            'g1': {'tool': 'optimization', 'scope': '个人版', 'states': {},
+                   'observations': ['候选开销不足以覆盖每月改善目标。']}})
+        report = draft('{{j1}}', nextStep={'text': '如果目标期限可以调整，也可考虑延后达成。', 'factIds': ['f1']})
+        self.assertTrue(validate_draft(report, data))
+        self.assertEqual(validate_draft(draft('{{j1}}', nextStep={'text': '继续核查保护项以外的开销及可实现增收。', 'factIds': ['f1']}), data), [])
+
+    def test_one_sentence_request_does_not_accept_extra_reason_paragraphs(self):
+        report = draft(reasons=[{'text': '还有额外分析。', 'factIds': ['f1']}])
+        self.assertTrue(validate_draft(report, context(question='一句话给结论，别堆数据')))
+        self.assertEqual(context(question='不要只给结论，详细解释').char_limit, 3200)
+
+    def test_decision_cannot_be_reversed_by_citing_a_non_anchor_fact_or_synonym(self):
+        data = context(facts=[fact('f1', tool='purchase'), fact('f2', tool='purchase')], findings={
+            'g1': {'tool': 'purchase', 'scope': '个人版', 'states': {
+                'sufficientData': True, 'coversPrice': True, 'coversPriceAndReserve': False}}})
+        for text in ['放心买，完全不会影响生活。', '资金绰绰有余，可以直接下单，不必担心储备。']:
+            report = draft('{{j1}}', reasons=[{'text': text, 'factIds': ['f2']}])
+            self.assertTrue(validate_draft(report, data), text)
+
+    def test_historical_net_is_not_current_cash_even_when_value_is_owned(self):
+        data = context(facts=[fact('f1', tool='cashflow', values=[
+            {'label': '完整月份月均结余', 'value': 2300, 'unit': '元'}])],
+            findings={'g1': {'tool': 'cashflow', 'scope': '个人版', 'states': {}}})
+        self.assertTrue(validate_draft(draft('目前可动用余额为{{v1}}，可以据此安排付款。'), data))
+
+    def test_single_book_and_month_cannot_be_relabelled(self):
+        data = context(facts=[fact('f1', tool='trends', scope='家庭版', month='2026-10',
+                                  values=[{'label': '已记收入', 'value': 8400, 'unit': '元'}])],
+            findings={'g1': {'tool': 'trends', 'scope': '家庭版', 'states': {}}})
+        data.payload['asOfDate'] = '2026-11-20'
+        self.assertTrue(validate_draft(draft('个人版本月收入为{{v1}}。'), data))
+        self.assertTrue(validate_draft(draft('家庭版本月收入为{{v1}}。'), data))
+
+    def test_chinese_multipliers_percentages_and_time_need_references_independently(self):
+        for text in ['收入翻三倍。', '未来收入增加百分之六十。', '这笔收入三天内到账。']:
+            self.assertTrue(validate_draft(draft(text), context()), text)
+
+    def test_priority_fallback_keeps_the_missing_purchase_balance(self):
+        data = context(facts=[fact('f1', text='家庭可动用余额未知。', tool='purchase', scope='家庭版')],
+            findings={'g1': {'tool': 'purchase', 'scope': '家庭版', 'states': {'sufficientData': False}}})
+        data.payload['reviewPriorities'] = [{'title': '已记收支', 'reason': '历史收支存在需要核对的波动。', 'factIds': ['f1']}]
+        self.assertIn('余额未知', fallback_report(data))
+
+    def test_one_sentence_runway_and_savings_leads_contain_the_calculated_time(self):
+        cases = [('runway', 'runwayMonths', 3.85,
+                  {'sufficientData': True, 'hasDeficit': True}, '当前情景有月度资金缺口，覆盖时长按余额除以缺口计算。'),
+                 ('savings', 'estimatedMonthsToTarget', 3,
+                  {'sufficientData': True, 'meetsDeadline': None}, '未指定截止期限，若当前情景持续，可以估计达标所需时间。')]
+        for tool, label, value, states, observation in cases:
+            data = context(facts=[fact('f1', tool=tool, values=[{'label': label, 'value': value, 'unit': '个月'}])],
+                findings={'g1': {'tool': tool, 'scope': '个人版', 'states': states, 'observations': [observation]}},
+                question='一句话告诉我多久')
+            self.assertIn(str(value), render_report(draft('{{j1}}'), data))
+
+    def test_postposed_labels_and_comma_separated_book_labels_cannot_retype_values(self):
+        net = context(facts=[fact('f1', values=[{'label': '月均结余', 'value': 2300, 'unit': '元'}])])
+        self.assertTrue(validate_draft(draft('{{v1}}就是你现在的可动用余额。'), net))
+        family = context(facts=[fact('f1', scope='家庭版', month='2026-10',
+            values=[{'label': '已记收入', 'value': 900, 'unit': '元'}])],
+            findings={'g1': {'tool': 'changes', 'scope': '家庭版', 'states': {}}})
+        for text in ['个人版，收入合计为{{v1}}。', '{{v1}}是个人版的本月收入。']:
+            with self.subTest(text=text): self.assertTrue(validate_draft(draft(text), family))
+        self.assertEqual(validate_draft(draft('家庭版，已记收入为{{v1}}。'), family), [])
+
+    def test_calculated_cash_deficit_and_positive_gap_magnitude_keep_their_roles(self):
+        flow = context(facts=[fact('f1', values=[{'label': 'monthlyDeficit', 'value': 2600, 'unit': '元'}])])
+        self.assertEqual(validate_draft(draft('收入全部停止时，估算每月现金缺口为{{v1}}。'), flow), [])
+        reserve = context(facts=[fact('f1', values=[{'label': 'cashAfterPurchase', 'value': 4000, 'unit': '元'},
+            {'label': 'reserveMargin', 'value': -1000, 'unit': '元'}])])
+        self.assertEqual(validate_draft(draft('购买后剩余{{v1}}，比应急储备底线少{{v3}}。'), reserve), [])
+        self.assertEqual(validate_draft(draft('购买后剩余{{v1}}，比希望保留的应急储备少{{v3}}。'), reserve), [])
+        self.assertEqual(validate_draft(draft('若还要留足储备，资金共缺{{v3}}。'), reserve), [])
+
+    def test_financial_assurance_paraphrases_cannot_reverse_immutable_judgment(self):
+        data = context(facts=[fact('f1', tool='purchase')], findings={
+            'g1': {'tool': 'purchase', 'scope': '个人版', 'states': {
+                'sufficientData': True, 'coversPrice': True, 'coversPriceAndReserve': False}}})
+        for text in ['当前储备底线已经满足。', '购买后生活开销不受影响。', '这笔购买完全负担得起。', '不能确定会不会影响生活，所以可以直接下单。', '不能保证但可以直接下单。']:
+            with self.subTest(text=text):
+                report = draft('{{j1}}', reasons=[{'text': text, 'factIds': ['f1']}])
+                self.assertTrue(validate_draft(report, data))
+        self.assertEqual(validate_draft(draft('{{j1}}', reasons=[{'text': '若还要留足储备，需要调整购买时间。', 'factIds': ['f1']}]), data), [])
+
+    def test_quantity_bearing_original_remark_has_an_inert_label_reference(self):
+        original = fact('f1', text='同期医疗支出发生变化，备注为一次就诊。')
+        original['literals'] = ['一次就诊']
+        data = context(facts=[original])
+        label = next((v for v in data.values if v['unit'] == 'label' and v['value'] == '一次就诊'), None)
+        self.assertIsNotNone(label)
+        report = draft('备注为{{' + label['id'] + '}}，不能据此认定今后还会发生。')
+        self.assertEqual(validate_draft(report, data), [])
+
+    def test_numeric_ledger_label_is_inert_and_not_recursively_substituted(self):
+        data = context(facts=[fact('f1', source='画稿{{v1}}',
+                                  values=[{'label': '已记收入', 'value': 900, 'unit': '元'}])])
+        label = next(v['id'] for v in data.values if v['unit'] == 'label')
+        report = draft('需要核对{{' + label + '}}的原始用途，金额为{{v1}}。')
+        self.assertEqual(validate_draft(report, data), [])
+        self.assertIn('画稿{{v1}}', render_report(report, data))
+        self.assertIn('900 元', render_report(report, data))
+
+    def test_length_applies_to_complete_reply_and_explicit_detail_can_expand(self):
+        report = draft('核对原始账单并说明边界。' * 110)
+        self.assertTrue(validate_draft(report, context()))
+        self.assertEqual(validate_draft(report, context(question='详细展开分析')), [])
 
 
 class GroundedAnalysisTests(unittest.TestCase):
-    def test_fallback_helper_validates_scope_even_for_seen_groups(self):
-        fact = bound_fact('f1', '原始账本事实。', 'g1', 'changes')
-        findings = {'g1': {'tool': 'changes', 'scope': '家庭版', 'observations': ['不同账本的发现。']}}
-        seen = {'g1'}
-        with self.assertRaisesRegex(ValueError, '范围'):
-            grounded_analysis(['f1'], [fact], findings, seen)
-
-    def test_fallback_helper_deduplicates_across_calls(self):
-        fact = bound_fact('f1', '原始账本事实。', 'g1', 'changes')
-        findings = {'g1': {'tool': 'changes', 'scope': '个人版', 'observations': ['本范围已核对。']}}
+    def test_private_computed_findings_remain_scope_checked_and_deduplicated(self):
+        facts = [fact('f1')]
         seen = set()
-        self.assertEqual(grounded_analysis(['f1'], [fact], findings, seen), '【个人版】本范围已核对。')
-        self.assertEqual(grounded_analysis(['f1'], {'f1': fact}, findings, seen), '')
-        self.assertEqual(seen, {'g1'})
-
-
-if __name__ == '__main__':
-    unittest.main()
+        findings = {'g1': {'tool': 'changes', 'scope': '个人版', 'observations': ['本范围已核对。']}}
+        self.assertEqual(grounded_analysis(['f1'], facts, findings, seen), '【个人版】本范围已核对。')
+        self.assertEqual(grounded_analysis(['f1'], facts, findings, seen), '')
+        with self.assertRaisesRegex(ValueError, '范围'):
+            grounded_analysis(['f1'], facts, {'g1': {**findings['g1'], 'scope': '家庭版'}})

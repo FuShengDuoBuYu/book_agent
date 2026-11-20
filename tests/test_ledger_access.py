@@ -50,9 +50,9 @@ class LedgerAccessTests(unittest.IsolatedAsyncioTestCase):
         metadata = agent.memory.messages[-1]["metadata"]
         self.assertTrue(metadata["evidence"]["analysisResults"])
         self.assertIsInstance(metadata["durationMs"], int)
-        self.assertEqual(metadata["analysisVersion"], 5)
+        self.assertEqual(metadata["analysisVersion"], 6)
         self.assertIn("releaseRevision", metadata)
-        self.assertEqual(metadata["model"]["reportMechanism"], "computed_findings")
+        self.assertEqual(metadata["model"]["reportMechanism"], "cited_conclusions")
 
     async def test_analysis_payload_is_safe_for_answer_generation(self):
         agent = BookAgent(BookkeepingApiClient("fixture"))

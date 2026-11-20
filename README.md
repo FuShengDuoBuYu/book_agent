@@ -72,15 +72,15 @@ OLLAMA_NUM_CTX=8192
 
 规划还可沿用上一轮完整、同账本与筛选范围的来源目录，仅投影来源名和收支方向，用于消解“家教少一半”等追问，不从旧助手措辞猜方向。同一简称对应多个来源或收支两向时保留歧义。模型为无约束筛选填写的 `all`、`不限` 等占位不会作为成员或类别名执行；用户明确引用同名类别时仍按字面筛选。用户已提供的价格、余额和目标需绑定到对应决策，不能再次当作未知条件询问。
 
-`analysisVersion=5` 的内部元数据记录 `understanding`（目标、指代、需回答的事项和证据需求）、原始计划、初次核算后的 `investigation`、最终证据、上下文、耗时、报告证据绑定和发布修订。历史 API 仅公开消息和校验过的 `artifacts`，不返回私有证据或内部元数据。表格、折线图和柱状图经过 SSE 发送并随历史恢复，可在支持下载的浏览器中导出 CSV 和 PNG；Android WebView 的文件下载需要单独在设备验证。
+`analysisVersion=6` 的内部元数据记录 `understanding`（目标、指代、需回答的事项和证据需求）、原始计划、初次核算后的 `investigation`、最终证据、上下文、耗时、报告证据绑定和发布修订。历史 API 仅公开消息和校验过的 `artifacts`，不返回私有证据或内部元数据。表格、折线图和柱状图经过 SSE 发送并随历史恢复，可在支持下载的浏览器中导出 CSV 和 PNG；Android WebView 的文件下载需要单独在设备验证。
 
 调查阶段读取实际备注目录和初次计算结果，可在已授权查询内补充只读分析并归并同义来源，再重新计算。补查不会覆盖原分析目标。业务归组须有实际名称或备注中的共同依据，不能把同一人的独立工资、项目和出售款统称为一个来源；证据不足时保留原名分列。分组只能引用已观察到的来源键，不能编造来源、混入其他账号或改变用户条件。为跨进程、跨重启保持脱敏成员键一致，部署时设置专用随机 `AGENT_MEMBER_KEY_SECRET`。
 
-报告只调用一次模型来选择中性提纲、本轮用户要求的目标和已有事实编号。随后程序从同账本、同计算结果生成变化归因、笔数与均额变化、目标可行性、已应用假设、未知条件及可执行的下一步；不让模型自由重写财务结论。金额、日期和表格仍由计算工具展示。每段最多八条事实，报告至多六段；必需证据即使被提纲遗漏也会连同解释补齐，同一计算结果只解释一次。
+报告由模型结合当前证据生成结论、少量理由，以及必要的下一步或限制。默认先直接回答问题，通常不超过500字；简单结论、普通分析和明确要求的详细分析分别有250、1200和3200字符的完整正文上限。问“为什么这样预测”时先解释依据，不机械重复预测金额。支持数据、来源明细和备注映射默认折叠；用户明确要求的表格或图表展开，仍可导出和随历史恢复。流式和保存的正文不再自动拼接所有表格；旧纯文本聊天接口只附上明确要求的展示表格。
 
-这项约束来自实际模型回放：正确取数后，模型仍曾把历史医疗增长误说成已计入未来，或把月结余能力不变误说成延后目标的储蓄压力不变。模型自审也未可靠拦住这些错误，因此移除了自由正文写作、数量占位符修复及整篇模型自审。意图理解、计划核对和来源调查仍使用模型；财务结论由可核对的计算发现生成。提纲超时、越权引用或缺少绑定时直接返回相关核算、解释、缺失条件和表格，不再重复消耗模型做正文纠错。
+金额、比例、日期、时长和含数量的备注用绑定事实的引用生成，不能自由改算或挪用其他账本、月份的数。购买、目标、可维持时长等关键判断仍由程序核算，模型不能把未知改成可行，或把月结余改成当前存款。完整审计证据与模型上下文、正文分别管理；有限上下文优先保留月份变化、主要贡献项和关键决策条件，不能把省略的证据说成账本缺失。默认一次报告调用，引用错误可定向修复一次；超时或仍失败时简短说明已核算的关键约束，不再退回数据堆砌。
 
-内部 `validation.status=grounded` 表示报告与计算发现一致，不代表用户意图理解已经完美。`compositionStatus=planned/fallback` 区分模型提纲和程序回退，`compositionPlan` 保留目标与证据引用，`findings` 保留分析发现，`calls` 记录提纲耗时与 token 数。独立的 `modelUsage` 记录各阶段调用次数、输入/输出、缓存与推理 token、耗时和估算 API 费用；推理 token 已计入输出，不重复收费。缺少用量的失败调用标记费用未知，本地 Qwen 的 API 调用费为零，不含电费和硬件成本。`analysisVersion=5`、`releaseRevision`、意图/规划/调查记录和模型配置保存在私有回答元数据，供后续定位问题；本地未设发布 SHA 时 `releaseRevision=null`。这些内部记录不通过页面历史 API 公开。
+内部 `validation.status=grounded` 只表示通过引用与规则校验，不能证明解释语义或意图已经正确。`compositionStatus=planned/fallback` 区分正常生成与程序回退，私有记录保留完整事实、模型实际可见事实、稳定引用、程序判断、结构化草稿和失败原因。独立的 `modelUsage` 记录各阶段调用次数、输入/输出、缓存与推理 token、耗时和估算 API 费用；推理 token 已计入输出，不重复收费。缺少用量的失败调用标记费用未知，本地 Qwen 的 API 调用费为零，不含电费和硬件成本。`analysisVersion=6`、`releaseRevision`、意图/规划/调查记录和模型配置均保存在私有回答元数据，页面历史 API 不公开这些内部记录；本地未设发布 SHA 时 `releaseRevision=null`。旧历史按原内容保留。
 
 收入稳定性明确标注完整月样本和按备注识别的非持续入账剔除口径；来源比例显示自己的分母。现金流同时区分实际查询窗口和完整月均值样本，非连续查询保留日期空档，避免与其他滚动区间混用。
 
@@ -89,6 +89,7 @@ OLLAMA_NUM_CTX=8192
 ```sh
 python -m scripts.check_model_contract
 python -m scripts.evaluate_analysis
+python -m scripts.evaluate_conclusions --output conclusion-results.jsonl --revision <git-sha>
 python -m scripts.evaluate_analysis --case scenario --case forecast
 python -m scripts.evaluate_acceptance
 python -m scripts.evaluate_acceptance --case chain
@@ -96,6 +97,8 @@ python -m scripts.evaluate_intent
 python -m scripts.evaluate_intent --case forecast_followups --output intent-results.jsonl
 python -m scripts.evaluate_dialogues --output dialogue-results.jsonl --max-cost-usd 1
 ```
+
+`evaluate_conclusions` 对16个虚构证据快照检查结论、依据、条件、篇幅及请求表格的交付，固定语义标准供独立逐条审阅；结构检查和语义评分分开记录。它用于定位报告层，不能替代正常 Agent 全链路测试。
 
 `evaluate_dialogues` 包含十组、三十轮接近日常表达的问答，覆盖来源拆解、假设撤回、期限更改、条件补充、跨维筛选、家庭归属、数据质量和上下文重置。它独立核对实际查询、执行窗口、参考月份、计算结果和交付表格；数字一致不能掩盖用了错误样本。默认遇到未知费用就停止。有限题集可显式指定 `--unknown-turn-reserve-usd 0.10`，每个未知费用轮增加预算预留；承诺额达到 `--max-cost-usd` 停止。预留不是实际费用或费用上界，真实估算仍保持未知。
 
@@ -107,10 +110,11 @@ python -m scripts.evaluate_dialogues --output dialogue-results.jsonl --max-cost-
 
 `evaluate_acceptance` 覆盖八类分析问题、四轮连续追问及四个输入变体，共十六次回答；`--case variants` 可单独执行来源比例、购买储备、目标期限与全部停薪变体。本轮方法、样本标准值和验收边界见 [意图与分析验收](docs/analysis-agent-v2-evaluation.md)；[早期基线](docs/analysis-quality-evaluation.md)保留当时版本的结果。
 
-原生 Ollama 先使用较小的意图 Schema 理解目标、指代和交付项，再使用 `AgentPlan` JSON Schema 生成执行计划。默认 `LLM_INTENT_REASONING=false`、`LLM_PLANNING_REASONING=false`：实测这台机器的 9B 模型开启深度推理会耗尽输出长度而不返回计划。保留分阶段结构化理解与计划核对，避免依赖无界推理。`PLANNER_NUM_PREDICT=2048` 限制计划输出，`OLLAMA_NUM_CTX` 控制上下文长度。隐藏推理不展示或落库；记录的是目标理解、执行参数和阶段耗时。规划、报告和重试分别保留当前目标及明确条件，再按预算压缩历史与证据预览。报告提纲关闭推理，使用独立输出预算。按机器能力设置 `PLANNER_TIMEOUT_SECONDS` 和 `REQUEST_TIMEOUT_SECONDS`，并用上述回归验证后再发布。
+原生 Ollama 先使用较小的意图 Schema 理解目标、指代和交付项，再使用 `AgentPlan` JSON Schema 生成执行计划。默认 `LLM_INTENT_REASONING=false`、`LLM_PLANNING_REASONING=false`：实测这台机器的 9B 模型开启深度推理会耗尽输出长度而不返回计划。保留分阶段结构化理解与计划核对，避免依赖无界推理。`PLANNER_NUM_PREDICT=2048` 限制计划输出，`OLLAMA_NUM_CTX` 控制上下文长度。隐藏推理不展示或落库；记录的是目标理解、执行参数和阶段耗时。规划、报告和重试分别保留当前目标及明确条件，再按预算压缩历史与证据预览。报告生成关闭推理，使用独立输出预算。按机器能力设置 `PLANNER_TIMEOUT_SECONDS` 和 `REQUEST_TIMEOUT_SECONDS`，并用上述回归验证后再发布。
 
-复杂分析的结构化理解、规划和报告提纲使用零温度、关闭推理；普通聊天仍使用聊天配置。原生 Ollama 默认请求 8K 上下文，`OLLAMA_KEEP_ALIVE=60s` 表示请求完成后空闲一分钟释放模型。共享显卡时可设置 `OLLAMA_NUM_GPU` 限制 GPU 执行的层数，其他层由 CPU 执行；应实测显存余量和延迟，不把该值当作显存容量。对话元数据同时记录上下文、GPU 层数及驻留配置。
+复杂分析的结构化理解、规划和报告生成使用零温度、关闭推理；普通聊天仍使用聊天配置。原生 Ollama 默认请求 8K 上下文，`OLLAMA_KEEP_ALIVE=60s` 表示请求完成后空闲一分钟释放模型。共享显卡时可设置 `OLLAMA_NUM_GPU` 限制 GPU 执行的层数，其他层由 CPU 执行；应实测显存余量和延迟，不把该值当作显存容量。对话元数据同时记录上下文、GPU 层数及驻留配置。
 
+- [结论式分析验收](docs/conclusion-quality-2026-11-20.md)
 - [本次验证与发布记录](docs/deployments/2026-11-20.md)
 - [架构与部署](docs/ai-bill-architecture.md)
 - [家庭部署信息清单](docs/home-agent-checklist.md)

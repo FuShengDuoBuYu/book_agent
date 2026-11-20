@@ -7,7 +7,6 @@ from pydantic import ValidationError
 from app.agent.analysis_findings import build_analysis_findings
 from app.agent.evidence_pipeline import collect_analysis_results
 from app.agent.evidence_report import build_facts, render_report, validate_draft
-from app.agent.report_composition import grounded_analysis
 from app.schemas.plan import AgentPlan, AnalysisRequest
 from app.schemas.report import ReportDraft
 from tests.test_aggregate_analysis import row, period
@@ -107,16 +106,17 @@ class AggregatePipelineTests(unittest.TestCase):
         self.assertIn('房租', text)
         self.assertIn('20', text)
         findings = build_analysis_findings([data[0]])
-        sections, seen = [], set()
-        for offset in range(0, len(facts), 8):
-            identifiers = [fact['id'] for fact in facts[offset:offset + 8]]
-            sections.append({'title': '统计口径', 'factIds': identifiers,
-                             'analysis': grounded_analysis(identifiers, facts, findings, seen)})
-        draft = ReportDraft(sections=sections)
-        self.assertFalse(validate_draft(draft, facts, findings))
-        reply = render_report(draft, facts)
+        from app.agent.report_evidence import prepare_report_context
+        from app.agent.report_composition import REPORT_PROMPT
+        data = prepare_report_context({'question': '解释餐饮变化', 'facts': facts,
+                                       'analysisFindings': findings}, REPORT_PROMPT, ReportDraft)
+        change = next(v for v in data.values if v['label'] == 'change' and v['value'] == 20)
+        draft = ReportDraft(conclusion={'text': '餐饮支出变化为{{' + change['id'] + '}}，应先核对这项账面增量。',
+                                       'factIds': [change['factId']]})
+        self.assertFalse(validate_draft(draft, data))
+        reply = render_report(draft, data)
         self.assertIn('餐饮', reply)
-        self.assertIn('变化 20 元', reply)
+        self.assertIn('20 元', reply)
 
     def test_count_and_mean_changes_are_reported_as_ledger_statistics(self):
         from app.tools.financial_analysis import run_analysis

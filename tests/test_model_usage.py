@@ -134,10 +134,10 @@ class ModelUsageTests(unittest.IsolatedAsyncioTestCase):
                 'output_tokens_details': {'reasoning_tokens': 150_000}}}))]])
         with capture_usage() as usage:
             await record(UsageRecorder('openai', 'gpt-6-luna'), response,
-                         invocation_params={'text': {'format': {'type': 'json_schema', 'name': 'ReportOutline'}}})
+                         invocation_params={'text': {'format': {'type': 'json_schema', 'name': 'ReportDraft'}}})
             snapshot = usage.snapshot()
         self.assertEqual(snapshot['reasoningTokens'], 150_000)
-        self.assertEqual(snapshot['calls'][0]['stage'], 'ReportOutline')
+        self.assertEqual(snapshot['calls'][0]['stage'], 'ReportDraft')
         self.assertEqual(Decimal(str(snapshot['estimatedCostUsd'])), Decimal('0.191'))
 
     async def test_llm_output_usage_and_chat_response_format_stage_are_supported(self):

@@ -1,4 +1,4 @@
-"""Compose a scoped outline and render only computed financial findings."""
+"""Compose scoped conclusions while retaining full computed audit evidence."""
 
 import asyncio
 import json
@@ -11,12 +11,11 @@ from app.core.openai_adapter import response_format
 from app.schemas.report import ReportDraft
 from pydantic import ValidationError
 from time import perf_counter
-from app.agent.artifacts import render_artifacts_markdown
 from app.agent.analysis_findings import build_analysis_findings
 from app.agent.attention_points import build_attention_points, requested_attention_count
-from app.agent.report_context import build_report_context
-from app.agent.report_composition import (compose_report, grounded_analysis, ReportOutline,
-                                          outline_schema, OUTLINE_PROMPT, OUTLINE_TOKENS)
+from app.agent.report_composition import (compose_report, grounded_analysis, validate_draft, render_report,
+                                          fallback_report, answer_schema, REPORT_PROMPT, REPORT_TOKENS)
+from app.agent.report_evidence import prepare_report_context, audit_report_context
 from app.tools.financial_analysis import shift_month
 from app.agent.report_values import literal, quantity as q, sanitize_fact
 from app.agent.goal_comparison import add_savings_deadline_facts
@@ -30,12 +29,25 @@ def money(value):
     return f'{value:,.2f}'.rstrip('0').rstrip('.') if isinstance(value, (int, float)) else '未知'
 
 
+def _ledger_literals(value):
+    labels = set()
+    def visit(item, field=''):
+        if isinstance(item, dict):
+            for key, child in item.items():visit(child, key)
+        elif isinstance(item, list):
+            for child in item:visit(child, field)
+        elif isinstance(item, str) and field in {'source', 'member', 'name', 'category', 'remark', 'remarks', 'afterRemarks'}:
+            if item and len(item) <= 160:labels.add(item)
+    visit(value)
+    return labels
+
+
 def build_facts(results):
     from app.agent.evidence_pipeline import computed_metric
 
     facts = []
 
-    def add(text, required=False, values=(), model_text=None, binding=None):
+    def add(text, required=False, values=(), model_text=None, binding=None, method_text=None):
         values = list(values)
         inputs = {
             'savings': ('startingBalance', 'targetAmount', 'months'),
@@ -81,6 +93,7 @@ def build_facts(results):
         fact = {'id': f'f{len(facts) + 1}', 'text': sanitize_fact(prefix + text, result),
                 'required': required and not result.get('supplemental', False), 'values': values,
                 'binding': {**base_binding, **(binding or {})}}
+        fact['literals'] = sorted(label for label in result_literals if label in text)
         if tool in {'forecast', 'projection', 'scenario', 'savings', 'purchase', 'budget', 'runway', 'optimization'}:
             fact['binding']['headline'] = len(facts) - result_start < 2
         if tool == 'cashflow' and text == e.get('computedConclusion'):
@@ -96,11 +109,14 @@ def build_facts(results):
             fact['calendars'] = [e[key] for key in ('from', 'to') if e.get(key)]
         if model_text:
             fact['modelText'] = sanitize_fact(prefix + model_text, result)
+        if method_text:
+            fact['methodText'] = sanitize_fact(prefix + method_text, result)
         facts.append(fact)
 
     for result_number, result in enumerate(results, 1):
         result_start = len(facts)
         tool, e = result['tool'], result['evidence']
+        result_literals = _ledger_literals(e)
         scope = result.get('mode', '当前账本')
         base_binding = {key: value for key, value in {
             'resultGroup': f'g{result_number}', 'primary': not result.get('supplemental', False),
@@ -260,7 +276,7 @@ def build_facts(results):
                     values=[q('前期总支出', e['before']['expenseTotal']), q('后期总支出', e['after']['expenseTotal'])])
             for direction, label in (('expense', '支出'), ('income', '收入')):
                 for row in [r for r in e[direction + 'Drivers'] if r['change']][:3]:
-                    add(f"同期{label}变化来自“{row['name']}”：{money(row['before'])} → {money(row['after'])} 元，变化 {money(row['change'])} 元。记录备注：{'、'.join(row.get('afterRemarks', []))}。备注只能说明记录内容，不能确认现实原因或是否再次发生。", True, values=[q('前期金额', row['before']), q('后期金额', row['after']), q('金额变化', row['change'])])
+                    add(f"同期{label}变化来自“{row['name']}”：{money(row['before'])} → {money(row['after'])} 元，变化 {money(row['change'])} 元。记录备注：{'、'.join(row.get('afterRemarks', []))}。备注只能说明记录内容，不能确认现实原因或是否再次发生。", True, binding={'evidenceRole': 'change_driver', 'category': row['name'], 'metric': direction}, values=[q('前期金额', row['before']), q('后期金额', row['after']), q('金额变化', row['change'])])
                     if row.get('countContribution') is not None:
                         add(f"“{row['name']}”的账单笔数由 {row['beforeCount']} 笔变为 {row['afterCount']} 笔，每笔均额由 {money(row['meanAmountBefore'])} 元变为 {money(row['meanAmountAfter'])} 元；对称分解中笔数变化贡献 {money(row['countContribution'])} 元、每笔均额变化贡献 {money(row['meanContribution'])} 元。两项相加为上面的金额变化；这是记账层面的分解，不能推断商品单价或实际购买数量变化。",
                             values=[q('前期笔数', row['beforeCount'], '笔'), q('后期笔数', row['afterCount'], '笔')] +
@@ -286,18 +302,28 @@ def build_facts(results):
             add(f"假设历史模式延续，{e['targetMonth']} 的月度{label}基准 {money(e['estimate'])} 元，历史情景范围 {money(e['lower'])}～{money(e['upper'])} 元。基准参考月份：{'、'.join(e['baselineMonths'])}。这是条件估计，历史范围不是保证或置信区间。", True, values=[q('预测月份', e['targetMonth'], 'month'), q('预测基准', e['estimate']), q('历史情景下界', e['lower']), q('历史情景上界', e['upper'])])
             if e.get('method'):
                 observed = '历史观察月份：' + '、'.join(e['observedMonths']) + '。' if e.get('observedMonths') else ''
-                add('计算方法：' + e['method'] + observed,
+                add('计算方法：' + e['method'] + observed, binding={'evidenceRole': 'forecast_method'},
                     values=[q('历史观察月份', month, 'month') for month in e.get('observedMonths', [])])
             for row in e.get('sourceForecasts', [])[:8]:
                 historical = f"历史样本入账 {money(row['amount'])} 元，" if row.get('amount') is not None else ''
                 summary = f"{row.get('member', '归属未知')}的“{row['source']}”{historical}条件估计 {money(row.get('estimate'))} 元。备注依据："
                 exclusion = '此项为已剔除的入账，不计入持续收入。' if row.get('excluded') else ''
-                add(summary + '；'.join(row.get('remarks', [])) + '。' + exclusion,
-                    binding={'metric': 'income', **{key: row[key] for key in ('member', 'memberKey', 'source', 'sourceKey') if key in row}},
-                    model_text=summary + '；'.join(str(remark)[:80] for remark in row.get('remarks', [])[:2]) + '。' + exclusion,
-                    values=[q('该来源预测贡献', row.get('estimate')), q('该来源历史样本入账', row.get('amount'))])
+                short_notes = [str(remark) for remark in row.get('remarks', [])[:4]]
+                note_preview = '；'.join(short_notes) if sum(map(len, short_notes)) <= 80 else ''
+                if note_preview and len(row.get('remarks', [])) > 4:
+                    note_preview += '；这里只展示备注样例，完整映射见数据依据。'
+                samples = {month: row['monthlyAmounts'].get(month, 0) for month in e.get('baselineMonths', [])
+                           if isinstance(row.get('monthlyAmounts'), dict)}
+                sample_text = ('基准月份已记入账：' + '、'.join(month + '=' + money(amount) + '元' for month, amount in samples.items())
+                               + '。未出现来源的有账单月份记为零贡献；剔除项的历史入账仍保留，但预测贡献为零。') if samples else ''
+                model_summary = (summary + note_preview + '。' if note_preview else summary.removesuffix('备注依据：')) + exclusion
+                add(summary + '；'.join(row.get('remarks', [])) + '。' + exclusion + sample_text,
+                    binding={'metric': 'income', 'evidenceRole': 'forecast_source', 'excluded': bool(row.get('excluded')), **{key: row[key] for key in ('member', 'memberKey', 'source', 'sourceKey') if key in row}},
+                    model_text=model_summary, method_text=model_summary + sample_text,
+                    values=[q('该来源预测贡献', row.get('estimate')), q('该来源历史样本入账', row.get('amount'))]
+                        + [q('该来源历史月入账（' + month + '）', amount) for month, amount in samples.items()])
             if e.get('excludedIncomeTotal'):
-                add(f"历史样本中按备注识别并剔除非持续性入账 {money(e['excludedIncomeTotal'])} 元；归类仍需核查。", values=[q('excludedIncomeTotal', e['excludedIncomeTotal'])])
+                add(f"历史样本中按备注识别并剔除非持续性入账 {money(e['excludedIncomeTotal'])} 元；归类仍需核查。", binding={'evidenceRole': 'forecast_exclusions'}, values=[q('excludedIncomeTotal', e['excludedIncomeTotal'])])
         elif tool == 'scenario':
             add(e['computedConclusion'], True)
         elif tool == 'savings':
@@ -312,6 +338,10 @@ def build_facts(results):
             if e.get('requiredMonthlySaving') is not None:
                 add(f"按 {e['months']} 个月期限，目标所需月结余 {money(e['requiredMonthlySaving'])} 元。", True, values=[q('months', e['months'], '个月'), q('requiredMonthlySaving', e['requiredMonthlySaving'])])
         elif tool == 'budget':
+            if e.get('hasRecords') is False:
+                add(f"{e['month']} 尚未见账单，实际支出和预算余量未知，不能把未记录当作零支出或预算全部可用。", True,
+                    values=[q('月份', e['month'], 'month'), q('budgetAmount', e['budgetAmount'])])
+                continue
             add(f"{e['month']} 用户预算 {money(e['budgetAmount'])} 元，已记支出 {money(e['spent'])} 元，剩余 {money(e['remaining'])} 元。按含今天的剩余 {e['remainingDaysIncludingToday']} 天，日均可用额度 {money(e['dailyAllowance'])} 元。未记录支出会改变结果。", True, values=[q('月份', e['month'], 'month'), q('budgetAmount', e['budgetAmount']), q('spent', e['spent']), q('remaining', e['remaining']), q('remainingDaysIncludingToday', e['remainingDaysIncludingToday'], '天'), q('dailyAllowance', e['dailyAllowance'])])
         elif tool == 'projection':
             add(f"假设收支模式及所列变化延续，{e['startMonth']} 至 {e['endMonth']} 共 {e['months']} 个月：月收入 {money(e['monthlyIncome'])} 元，月支出 {money(e['monthlyExpense'])} 元，月结余 {money(e['monthlyNet'])} 元；累计新增结余 {money(e['totalNet'])} 元。", True, values=[q('startMonth', e['startMonth'], 'month'), q('endMonth', e['endMonth'], 'month'), q('months', e['months'], '个月'), q('monthlyIncome', e['monthlyIncome']), q('monthlyExpense', e['monthlyExpense']), q('monthlyNet', e['monthlyNet']), q('totalNet', e['totalNet'])])
@@ -380,54 +410,22 @@ def build_facts(results):
 
 
 
-REPORT_TITLES = {'分析结论', '变化来源', '收入构成', '条件与方案', '统计口径', '记录核查', '需要确认的事项', '补充账本依据'}
-
-
-def validate_draft(draft, facts, findings):
-    """The model may select evidence, never replace a computed interpretation."""
-    valid = {fact['id'] for fact in facts}
-    used = {key for section in draft.sections for key in section.factIds}
-    issues = []
-    if used - valid:
-        issues.append('引用了不存在的证据编号')
-    missing = {row['id'] for row in facts if row.get('required')} - used
-    if missing:
-        issues.append('factIds 遗漏必需证据编号：' + ','.join(sorted(missing)))
-    seen = set()
-    for section in draft.sections:
-        if section.title not in REPORT_TITLES:
-            issues.append('报告标题必须选用中性提纲标题')
-        try:
-            expected = grounded_analysis(section.factIds, facts, findings, seen)
-            if section.analysis != expected:
-                issues.append('解释必须逐字来自同范围、同计算结果的分析发现')
-        except ValueError as exc:
-            issues.append(str(exc))
-    return issues
-
-
-def render_report(draft, facts):
-    by_id = {row['id']: row['text'] for row in facts}
-    return '\n\n'.join('**' + section.title + '**\n\n'
-        + '\n'.join(by_id[key] for key in dict.fromkeys(section.factIds))
-        + ('\n\n' + section.analysis if section.analysis else '') for section in draft.sections)
-
 
 class EvidenceReporter:
     async def _invoke(self, schema, system, payload):
-        if schema is not ReportOutline:
-            raise ValueError('报告模型只允许选择提纲和证据')
+        if schema is not ReportDraft:
+            raise ValueError('报告模型只允许生成有引用的结论')
         started = perf_counter()
         self._last_call = {'schema': schema.__name__}
         settings = get_settings()
-        generation_schema = outline_schema(payload)
+        generation_schema = answer_schema(payload)
         if settings.llm_provider == 'openai_compatible':
             system += '\n必须遵守的 JSON schema：' + json.dumps(generation_schema, ensure_ascii=False, separators=(',', ':'))
-        model = get_structured_model(schema, reasoning=False, num_predict=OUTLINE_TOKENS)
+        model = get_structured_model(schema, reasoning=False, num_predict=REPORT_TOKENS)
         if settings.llm_provider == 'ollama':
             model = model.bind(format=generation_schema)
         elif settings.llm_provider == 'openai':
-            model = model.bind(response_format=response_format('ReportOutline', generation_schema))
+            model = model.bind(response_format=response_format('LedgerConclusion', generation_schema))
         response = await asyncio.wait_for(model.ainvoke([
             ('system', system),
             ('human', json.dumps(payload, ensure_ascii=False, separators=(',', ':')))]),
@@ -447,18 +445,19 @@ class EvidenceReporter:
         async def invoke(schema, system, scoped):
             try:
                 result = await self._invoke(schema, system, scoped)
+                result = schema.model_validate(result)
                 self._last_composition_plan = result.model_dump()
                 return result
             finally:
                 self._last_composition_calls.append({**getattr(self, '_last_call', {}), 'schema': schema.__name__})
 
-        return await compose_report(payload, invoke, num_ctx=get_settings().ollama_num_ctx)
+        return await compose_report(payload, invoke)
 
     async def answer(self, question, context, results, *, history='', instruction='', artifacts=None, understanding=None, analysis_scope=None):
         needs = set((understanding or {}).get('evidenceNeeds', []))
         forecast_metrics = {row['evidence'].get('metric') for row in results if row['tool'] == 'forecast'}
         focused = [row for row in results if not (
-            row['tool'] == 'sources' and (forecast_metrics or (understanding and not needs & {'sources', 'members', 'remarks'})))]
+            row['tool'] == 'sources' and row.get('supplemental') and (forecast_metrics or (understanding and not needs & {'sources', 'members', 'remarks'})))]
         if len(forecast_metrics) == 1 and forecast_metrics <= {'income', 'expense'}:
             metric = next(iter(forecast_metrics))
             forecast_modes = {row.get('mode') for row in results if row['tool'] == 'forecast'}
@@ -492,52 +491,39 @@ class EvidenceReporter:
                     'values': [q('原期限', previous, '个月'), q('新期限', projection['months'], '个月'),
                                q('新增结余增量', extra), q('月度结余', projection['monthlyNet'])]})
         attention = build_attention_points(question, focused, facts, findings)
-        attention_ids = {key for point in attention for key in point['factIds']}
-        facts = [{**row, 'required': row['required'] or row['id'] in attention_ids} for row in facts]
-        all_facts, attempts, budget_stats = facts, [], {}
-        status = 'planned'
+        payload.update(facts=facts, analysisFindings=findings, reviewPriorities=attention)
+        report_context = audit_report_context(payload)
+        attempts, calls, status, report = [], [], 'planned', None
         try:
-            settings = get_settings()
-            payload, facts, budget_stats = build_report_context(
-                payload, facts, OUTLINE_PROMPT, ReportOutline, include_values=False,
-                num_ctx=settings.ollama_num_ctx, num_predict=OUTLINE_TOKENS)
-            draft = await self._draft({**payload, 'analysisFindings': findings})
-            issues = validate_draft(draft, facts, findings)
-            if issues:
-                raise ValueError('；'.join(issues))
-            reply = render_report(draft, facts)
-            report = draft.model_dump()
+            report_context = prepare_report_context(payload, REPORT_PROMPT, ReportDraft,
+                num_ctx=get_settings().ollama_num_ctx, num_predict=REPORT_TOKENS)
+            for turn in range(2):
+                try:
+                    draft = await self._draft(report_context)
+                finally:
+                    calls.extend(getattr(self, '_last_composition_calls', []))
+                issues = validate_draft(draft, report_context)
+                if not issues:
+                    reply = render_report(draft, report_context)
+                    report = draft.model_dump()
+                    break
+                attempts.append({'issues': issues, 'stage': 'reference_validation'})
+                if turn:
+                    raise ValueError('；'.join(issues))
+                report_context.payload = {**report_context.payload, 'corrections': issues}
+            else:
+                raise ValueError('结论生成未完成')
         except Exception as exc:
-            # A failed outline never removes known answers or the requested artifacts.
             detail = '; '.join(f"{err['loc']}: {err['msg']}" for err in exc.errors()) if isinstance(exc, ValidationError) else (str(exc) if isinstance(exc, ValueError) else '')
-            attempts.append({'issues': ['报告提纲失败：' + type(exc).__name__ + ' ' + detail[:500]],
-                             'calls': list(getattr(self, '_last_composition_calls', [])),
-                             'contextBudget': budget_stats})
-            facts = all_facts
-            selected = [row for row in facts if row['required']]
-            selected += [row for row in facts if not row['required']][:12]
-            paragraphs, seen = [], set()
-            for row in selected:
-                paragraphs.append(row['text'])
-                explanation = grounded_analysis([row['id']], facts, findings, seen)
-                if explanation:
-                    paragraphs.append(explanation)
-            reply = '以下是本次账本核算与分析：\n\n' + '\n\n'.join(paragraphs)
-            report, status = None, 'fallback'
-        count = requested_attention_count(question)
-        if count:
-            by_id = {row['id']: row for row in all_facts}
-            lines = ['**综合关注点**', '按已核算的资金约束、已记变化、来源结构和待核查线索依次整理：']
-            for index, point in enumerate(attention, 1):
-                scope = by_id[point['factIds'][0]]['binding']['scope']
-                lines.append(f"{index}. **【{scope}】{point['title']}**：{point['reason']}")
-            if len(attention) < count:
-                lines.append(f'现有证据仅支持 {len(attention)} 项关注点，不能据此凑出 {count} 项财务问题。')
-            reply = '\n\n'.join(lines) + '\n\n' + reply
-        table_text = render_artifacts_markdown(artifacts)
-        return reply + ('\n\n' + table_text if table_text else ''), {
-            'status': 'grounded', 'mechanism': 'computed_findings', 'compositionStatus': status,
-            'facts': facts, 'findings': findings, 'report': report, 'attempts': attempts,
+            attempts.append({'issues': ['结论生成失败：' + type(exc).__name__ + ' ' + detail[:500]],
+                             'contextBudget': report_context.budget})
+            reply, status = fallback_report(report_context), 'fallback'
+        return reply, {
+            'status': 'grounded', 'mechanism': 'cited_conclusions', 'compositionStatus': status,
+            'facts': facts, 'composerFactIds': [f['id'] for f in report_context.selected],
+            'valueReferences': report_context.values, 'judgments': report_context.judgments,
+            'findings': findings, 'report': report, 'attempts': attempts,
             'attentionPoints': attention,
             'compositionPlan': getattr(self, '_last_composition_plan', None),
-            'calls': list(getattr(self, '_last_composition_calls', [])), 'contextBudget': budget_stats}
+            'calls': calls or list(getattr(self, '_last_composition_calls', [])),
+            'contextBudget': report_context.budget}

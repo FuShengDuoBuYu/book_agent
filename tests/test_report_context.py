@@ -3,7 +3,7 @@ from copy import deepcopy
 
 from app.agent.report_context import build_report_context, _fit_evidence, _prompt_budget
 from app.agent.report_values import value_catalog
-from app.agent.report_composition import ReportOutline
+from app.schemas.report import ReportDraft
 
 
 SYSTEM = '只使用本轮账本证据作答。'
@@ -30,7 +30,7 @@ class ReportContextTests(unittest.TestCase):
     def test_model_projection_uses_a_single_compact_display_per_value(self):
         original = [fact(1, required=True, text='进账 1,234 元。', label='进账')]
         original[0]['binding'] = {'scope': '个人版', 'resultGroup': 'g1', 'metric': 'income'}
-        payload, selected, stats = build_report_context(base_payload(), original, SYSTEM, ReportOutline)
+        payload, selected, stats = build_report_context(base_payload(), original, SYSTEM, ReportDraft)
         self.assertEqual(payload['facts'], [{'id': 'f1', 'text': '进账 1,234 元。', 'required': True,
                                             'binding': original[0]['binding']}])
         self.assertEqual(payload['values'], {'v1': 'f1 进账 = 1,234 元'})
@@ -50,7 +50,7 @@ class ReportContextTests(unittest.TestCase):
             for number in range(1, 9)
         ]
         original = [required, *sources]
-        payload, selected, stats = build_report_context(base, original, SYSTEM, ReportOutline)
+        payload, selected, stats = build_report_context(base, original, SYSTEM, ReportDraft)
 
         self.assertEqual(payload['question'], base['question'])
         self.assertEqual(payload['understanding'], base['understanding'])
