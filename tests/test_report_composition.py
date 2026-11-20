@@ -240,6 +240,7 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
         reserve = context(facts=[fact('f1', values=[{'label': 'cashAfterPurchase', 'value': 4000, 'unit': '元'},
             {'label': 'reserveMargin', 'value': -1000, 'unit': '元'}])])
         self.assertEqual(validate_draft(draft('购买后剩余{{v1}}，比应急储备底线少{{v3}}。'), reserve), [])
+        self.assertEqual(validate_draft(draft('若还要留足储备，资金共缺{{v3}}。'), reserve), [])
 
     def test_financial_assurance_paraphrases_cannot_reverse_immutable_judgment(self):
         data = context(facts=[fact('f1', tool='purchase')], findings={
@@ -249,6 +250,7 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(text=text):
                 report = draft('{{j1}}', reasons=[{'text': text, 'factIds': ['f1']}])
                 self.assertTrue(validate_draft(report, data))
+        self.assertEqual(validate_draft(draft('{{j1}}', reasons=[{'text': '若还要留足储备，需要调整购买时间。', 'factIds': ['f1']}]), data), [])
 
     def test_quantity_bearing_original_remark_has_an_inert_label_reference(self):
         original = fact('f1', text='同期医疗支出发生变化，备注为一次就诊。')
