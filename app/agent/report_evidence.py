@@ -38,6 +38,8 @@ def response_limit(question):
 
 def judgment_leads(payload):
     question = payload.get('question', '')
+    if re.search(r'哪几个月|参考.*哪些月份|参照.*哪些月份', question):
+        return False
     if re.search(r'多少|多久|要几个月|能否|能不能|是否足够|够不够|合适吗|能实现', question):
         return True
     return not bool(re.search(r'为什么|为啥|依据|方法|怎么算|怎么.*(?:算|判断)|如何.*(?:算|判断)|怎样.*(?:算|判断)|靠谱|可信|限制', question))
@@ -244,15 +246,18 @@ def prepare_report_context(payload, system, schema, *, num_ctx=8192, num_predict
                                'states': value.get('states', {}),
                                **{field: value.get(field, [])[:2] for field in ('observations', 'limitations', 'actions')}}
                           for key, value in findings.items() if key in bound_groups}
+        preview = {f['id']: (f.get('modelText') or f['text']) if len(f.get('modelText') or f['text']) <= 650
+                   else '原文过长，当前仅提供已核算的数值及范围；不能补全未展示的含义。' for f in selected}
         supplied = []
         cap = 18 if detail_requested(payload.get('question', '')) else 8
         for fact in selected:
             owned = [v for v in values if v['factId'] == fact['id']]
             scalar = sorted((v for v in owned if v['unit'] != 'label'), key=lambda v: v['unit'] in {'date', 'month'})
-            supplied.extend([*scalar[:cap], *(v for v in owned if v['unit'] == 'label')])
+            names = [fact.get('binding', {}).get(k) for k in ('source', 'member', 'category')]
+            supplied.extend([*scalar[:cap], *(v for v in owned if v['unit'] == 'label'
+                and (v['value'] in preview[fact['id']] or v['value'] in names))])
         return {**common,
-                'facts': [{'id': f['id'], 'text': (f.get('modelText') or f['text']) if len(f.get('modelText') or f['text']) <= 650
-                           else '原文过长，当前仅提供已核算的数值及范围；不能补全未展示的含义。',
+                'facts': [{'id': f['id'], 'text': preview[f['id']],
                            'binding': {k: v for k, v in f.get('binding', {}).items() if v is not None and v != []
                                        if k in {'tool', 'scope', 'historyWindow', 'month', 'partial', 'metric',
                                                 'aggregation', 'evidenceRole', 'excluded', 'category', 'source', 'member', 'filters', 'primary'}}}

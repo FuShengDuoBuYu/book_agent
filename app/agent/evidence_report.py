@@ -308,7 +308,7 @@ def build_facts(results):
                 exclusion = '此项为已剔除的入账，不计入持续收入。' if row.get('excluded') else ''
                 add(summary + '；'.join(row.get('remarks', [])) + '。' + exclusion,
                     binding={'metric': 'income', 'evidenceRole': 'forecast_source', 'excluded': bool(row.get('excluded')), **{key: row[key] for key in ('member', 'memberKey', 'source', 'sourceKey') if key in row}},
-                    model_text=summary + '；'.join(str(remark)[:80] for remark in row.get('remarks', [])[:4]) + ('。仅展示部分备注，不能据此判断其他备注不存在。' if len(row.get('remarks', [])) > 4 else '。') + exclusion,
+                    model_text=summary.removesuffix('备注依据：') + exclusion,
                     values=[q('该来源预测贡献', row.get('estimate')), q('该来源历史样本入账', row.get('amount'))])
             if e.get('excludedIncomeTotal'):
                 add(f"历史样本中按备注识别并剔除非持续性入账 {money(e['excludedIncomeTotal'])} 元；归类仍需核查。", binding={'evidenceRole': 'forecast_exclusions'}, values=[q('excludedIncomeTotal', e['excludedIncomeTotal'])])

@@ -57,6 +57,17 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(render_report(report, data).startswith('这是按近期'))
         self.assertNotIn('6600', render_report(report, data))
 
+    def test_bare_counter_is_not_a_complete_evidence_explanation(self):
+        data = context(facts=[fact('f1', values=[{'label': 'missingPaymentMethodCount', 'value': 31, 'unit': '笔'}])])
+        self.assertTrue(validate_draft(draft('{{v1}}，会影响按账户或支付方式分析。'), data))
+        self.assertEqual(validate_draft(draft('缺少支付方式{{v1}}，会影响相关归集但不证明金额错误。'), data), [])
+        self.assertEqual(validate_draft(draft('{{v1}}账单缺少支付方式，会影响归集。'), data), [])
+
+    def test_short_reference_month_question_answers_the_method_first(self):
+        from app.agent.report_evidence import judgment_leads
+        self.assertFalse(judgment_leads({'question': '这个预测参考哪几个月？'}))
+        self.assertTrue(judgment_leads({'question': '几个月能存到目标？'}))
+
     def test_schema_references_only_facts_present_in_the_bounded_context(self):
         data = context()
         schema = answer_schema(data.payload)
@@ -71,7 +82,7 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('{{v1}}', render_report(report, data))
 
     def test_arabic_and_chinese_fabricated_amounts_are_rejected(self):
-        for text in ['预计能赚999999元。', '预计能赚两万元。', '明年收入翻三倍并保证到账。', '预计收入提高一半。', '这笔款半个月内到账。']:
+        for text in ['预计能赚999999元。', '预计能赚两万元。', '明年收入翻三倍并保证到账。', '预计收入提高一半。', '这笔款半个月内到账。', '疑似重复增加一组。', '缺字段十条。']:
             with self.subTest(text=text):
                 self.assertTrue(validate_draft(draft(text), context()))
 
@@ -213,6 +224,30 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
             question='刚才那个月拿哪几个月参照，具体怎么从项目算到总数，一次性款项怎么处理？')
         self.assertFalse(data.payload['answerRequirements']['leadWithJudgment'])
         self.assertTrue({'method','source','excluded'} <= {f['id'] for f in data.selected})
+
+    def test_source_method_budget_does_not_duplicate_all_original_remarks(self):
+        from app.agent.evidence_report import build_facts
+        from app.agent.analysis_findings import build_analysis_findings
+        evidence = {'metric': 'income', 'targetMonth': '2026-12', 'sufficientData': True,
+            'estimate': 6000, 'lower': 4800, 'upper': 7200,
+            'baselineMonths': ['2026-08','2026-09','2026-10'],
+            'observedMonths': ['2026-05','2026-06','2026-07','2026-08','2026-09','2026-10'],
+            'method': '各来源按最近有记录的完整月份取月金额中位数，再加总来源贡献。',
+            'excludedIncomeTotal': 0, 'sourceForecasts': []}
+        for i in range(8):
+            notes = [(f'项目{i}第{j}期设计交付已确认并按约结算。' + '已完成设计交付并核对客户的结算安排。'*12)[:40] for j in range(4)]
+            evidence['sourceForecasts'].append({'source': f'项目{i}', 'member': '成员甲', 'amount': 2250,
+                'estimate': 750, 'lower': 600, 'upper': 900, 'remarks': notes, 'excluded': False})
+        results = [{'tool': 'forecast', 'mode': '个人版',
+            'historyWindow': {'startDate': '2026-05-01', 'endDate': '2026-11-20'}, 'evidence': evidence}]
+        facts = build_facts(results)
+        data = prepare_report_context({'question': '具体怎么从项目算到总数？', 'facts': facts,
+            'analysisFindings': build_analysis_findings(results)}, REPORT_PROMPT, ReportDraft, num_ctx=8192)
+        self.assertLessEqual(data.budget['estimatedPromptTokens'], data.budget['promptBudgetTokens'])
+        original = evidence['sourceForecasts'][0]['remarks'][0]
+        self.assertIn(original, repr(data.facts))
+        self.assertNotIn(original, repr(data.payload))
+        self.assertTrue(any(f['binding'].get('evidenceRole')=='forecast_source' for f in data.selected))
 
     def test_monthly_improvement_gap_is_not_solved_by_postponing_a_goal(self):
         data = context(facts=[fact('f1', tool='optimization')], findings={
