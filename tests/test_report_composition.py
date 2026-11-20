@@ -234,6 +234,13 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(text=text): self.assertTrue(validate_draft(draft(text), family))
         self.assertEqual(validate_draft(draft('家庭版，已记收入为{{v1}}。'), family), [])
 
+    def test_calculated_cash_deficit_and_positive_gap_magnitude_keep_their_roles(self):
+        flow = context(facts=[fact('f1', values=[{'label': 'monthlyDeficit', 'value': 2600, 'unit': '元'}])])
+        self.assertEqual(validate_draft(draft('收入全部停止时，估算每月现金缺口为{{v1}}。'), flow), [])
+        reserve = context(facts=[fact('f1', values=[{'label': 'cashAfterPurchase', 'value': 4000, 'unit': '元'},
+            {'label': 'reserveMargin', 'value': -1000, 'unit': '元'}])])
+        self.assertEqual(validate_draft(draft('购买后剩余{{v1}}，比应急储备底线少{{v3}}。'), reserve), [])
+
     def test_financial_assurance_paraphrases_cannot_reverse_immutable_judgment(self):
         data = context(facts=[fact('f1', tool='purchase')], findings={
             'g1': {'tool': 'purchase', 'scope': '个人版', 'states': {

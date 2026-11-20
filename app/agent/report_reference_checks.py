@@ -42,7 +42,7 @@ def reference_issues(value, template, start, context):
         if name and scope and name != scope and not re.search(r'不能(?:将|把)|不等于|不能代表', fragment):
             issues.append('数量所属账本不能重新命名')
     role = value['role']
-    if value['unit'] == '元' and re.search(r'余额|存款|可动用资金|现金(?!流)', fragment):
+    if value['unit'] == '元' and re.search(r'余额|存款|可动用资金|现金(?!流|缺口)', fragment):
         # A calendar average/net is a flow, not an available cash stock.
         if not re.search(r'不能(?:将|把)|不等于|不能代表', fragment):
             stock = role in {'当前可动用余额', '用户提供的可动用余额', 'startingBalance', '用户给定起始余额'}
@@ -54,7 +54,7 @@ def reference_issues(value, template, start, context):
     if value['unit'] == '元' and isinstance(value['value'], (int, float)):
         if value['value'] < 0 and re.search(r'缺口(?:为|是)?\s*$|还差\s*$|短缺\s*$|相差\s*$', fragment):
             issues.append('负余量不能写成负缺口；请用提供的绝对值引用或保留余量措辞')
-        if '绝对值' in role and not re.search(r'幅度|绝对值|缺口|还差|差额|短缺|亏损|减少|增加', fragment):
+        if '绝对值' in role and not re.search(r'幅度|绝对值|缺口|还差|差额|短缺|亏损|减少|增加|底线少|底线多', fragment):
             issues.append('绝对值幅度不能改写成带符号的原始金额')
     if value['unit'] == '元' and re.search(r'预计|预测|下个月.{0,5}(?:收入|支出)', fragment):
         if value.get('binding', {}).get('tool') not in {'forecast', 'projection', 'scenario', 'savings', 'budget', 'runway'}:
