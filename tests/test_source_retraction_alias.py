@@ -130,6 +130,8 @@ class SourceRetractionAliasTests(unittest.IsolatedAsyncioTestCase):
             '我没有撤回“星港海报少一半”这个假设，继续推演。',
             '我之前提到过撤回“星港海报少一半”这个假设，这次只是回顾那句话。',
             '如果取消“星港海报少一半”这个假设会怎样？',
+            '我不是要撤回星港海报少一半这个假设，继续推演。',
+            '上一轮曾按正常星港海报算，这次只是核对说法。',
         ):
             with self.subTest(question=question):
                 prior = saved_context([OLD_CHANGE])
