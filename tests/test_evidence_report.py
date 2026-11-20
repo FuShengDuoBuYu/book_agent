@@ -27,6 +27,15 @@ class EvidenceFactTests(unittest.TestCase):
         self.assertEqual(monthly['binding']['scope'], '个人版')
         self.assertIn('month', monthly['binding'])
 
+    def test_recorded_change_driver_has_a_typed_context_role(self):
+        from datetime import date
+        from scripts.conclusion_cases import conclusion_cases
+        result = next(r for r in conclusion_cases(date(2026, 11, 20))[0]['results'] if r['tool'] == 'changes')
+        facts = build_facts([result])
+        driver = next(f for f in facts if '变化来自' in f['text'])
+        self.assertEqual(driver['binding'].get('evidenceRole'), 'change_driver')
+        self.assertEqual(driver['binding'].get('category'), '医疗')
+
     def test_missing_liquidity_is_a_mandatory_fact(self):
         facts = build_facts([{'tool': 'purchase', 'mode': '个人版', 'evidence': {
             'sufficientData': False, 'missingInputs': ['startingBalance'], 'purchaseAmount': 6000}}])

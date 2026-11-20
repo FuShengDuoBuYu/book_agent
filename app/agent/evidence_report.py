@@ -1,4 +1,4 @@
-"""Compose a scoped outline and render only computed financial findings."""
+"""Compose scoped conclusions while retaining full computed audit evidence."""
 
 import asyncio
 import json
@@ -274,7 +274,7 @@ def build_facts(results):
                     values=[q('前期总支出', e['before']['expenseTotal']), q('后期总支出', e['after']['expenseTotal'])])
             for direction, label in (('expense', '支出'), ('income', '收入')):
                 for row in [r for r in e[direction + 'Drivers'] if r['change']][:3]:
-                    add(f"同期{label}变化来自“{row['name']}”：{money(row['before'])} → {money(row['after'])} 元，变化 {money(row['change'])} 元。记录备注：{'、'.join(row.get('afterRemarks', []))}。备注只能说明记录内容，不能确认现实原因或是否再次发生。", True, values=[q('前期金额', row['before']), q('后期金额', row['after']), q('金额变化', row['change'])])
+                    add(f"同期{label}变化来自“{row['name']}”：{money(row['before'])} → {money(row['after'])} 元，变化 {money(row['change'])} 元。记录备注：{'、'.join(row.get('afterRemarks', []))}。备注只能说明记录内容，不能确认现实原因或是否再次发生。", True, binding={'evidenceRole': 'change_driver', 'category': row['name'], 'metric': direction}, values=[q('前期金额', row['before']), q('后期金额', row['after']), q('金额变化', row['change'])])
                     if row.get('countContribution') is not None:
                         add(f"“{row['name']}”的账单笔数由 {row['beforeCount']} 笔变为 {row['afterCount']} 笔，每笔均额由 {money(row['meanAmountBefore'])} 元变为 {money(row['meanAmountAfter'])} 元；对称分解中笔数变化贡献 {money(row['countContribution'])} 元、每笔均额变化贡献 {money(row['meanContribution'])} 元。两项相加为上面的金额变化；这是记账层面的分解，不能推断商品单价或实际购买数量变化。",
                             values=[q('前期笔数', row['beforeCount'], '笔'), q('后期笔数', row['afterCount'], '笔')] +

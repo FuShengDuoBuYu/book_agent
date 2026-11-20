@@ -176,6 +176,21 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
         data = context(facts=facts, findings={'g1': {'tool': 'aggregate', 'scope': '个人版', 'states': {}}})
         self.assertIn('cause', {f['id'] for f in data.selected})
 
+    def test_typed_change_driver_survives_many_optional_totals(self):
+        facts = [fact(f't{i}', tool='changes', values=[{'label': '支出', 'value': 100, 'unit': '元'}]) for i in range(44)]
+        facts.append(fact('cause', tool='changes', evidenceRole='change_driver', category='医疗', metric='expense',
+            text='医疗是该期支出变化的账面贡献。', values=[{'label': '金额变化', 'value': 900, 'unit': '元'}]))
+        data = context(facts=facts)
+        self.assertIn('cause', {f['id'] for f in data.selected})
+
+    def test_monthly_improvement_gap_is_not_solved_by_postponing_a_goal(self):
+        data = context(facts=[fact('f1', tool='optimization')], findings={
+            'g1': {'tool': 'optimization', 'scope': '个人版', 'states': {},
+                   'observations': ['候选开销不足以覆盖每月改善目标。']}})
+        report = draft('{{j1}}', nextStep={'text': '如果目标期限可以调整，也可考虑延后达成。', 'factIds': ['f1']})
+        self.assertTrue(validate_draft(report, data))
+        self.assertEqual(validate_draft(draft('{{j1}}', nextStep={'text': '继续核查保护项以外的开销及可实现增收。', 'factIds': ['f1']}), data), [])
+
     def test_one_sentence_request_does_not_accept_extra_reason_paragraphs(self):
         report = draft(reasons=[{'text': '还有额外分析。', 'factIds': ['f1']}])
         self.assertTrue(validate_draft(report, context(question='一句话给结论，别堆数据')))

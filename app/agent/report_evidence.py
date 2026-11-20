@@ -160,8 +160,10 @@ def _ordered(facts, judgments, priorities):
     pinned.update(f['id'] for f in facts if f.get('binding', {}).get('aggregation') == 'recorded_month_total')
     causes = {}
     for fact in facts:
-        if fact.get('binding', {}).get('tool') == 'aggregate' and re.search(r'(?:category|source)=', fact['text']):
-            causes.setdefault(fact.get('binding', {}).get('resultGroup'), []).append(fact)
+        binding = fact.get('binding', {})
+        typed_driver = binding.get('evidenceRole') == 'change_driver'
+        if typed_driver or (binding.get('tool') == 'aggregate' and re.search(r'(?:category|source)=', fact['text'])):
+            causes.setdefault((binding.get('resultGroup'), binding.get('metric') if typed_driver else None), []).append(fact)
     pinned.update(f['id'] for rows in causes.values() for f in rows[:2])
     mandatory = [f for f in facts if f['id'] in pinned]
     groups, warnings = {}, []
@@ -242,7 +244,7 @@ def prepare_report_context(payload, system, schema, *, num_ctx=8192, num_predict
                            else '原文过长，当前仅提供已核算的数值及范围；不能补全未展示的含义。',
                            'binding': {k: v for k, v in f.get('binding', {}).items() if v is not None and v != []
                                        if k in {'tool', 'scope', 'historyWindow', 'month', 'partial', 'metric',
-                                                'aggregation', 'source', 'member', 'filters', 'primary'}}}
+                                                'aggregation', 'evidenceRole', 'category', 'source', 'member', 'filters', 'primary'}}}
                           for f in selected],
                 'values': {v['id']: v['factId'] + ' ' + v['label'] + ' = ' + v['display'] for v in supplied},
                 'computedFindings': brief_findings,
