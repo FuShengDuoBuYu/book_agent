@@ -221,6 +221,7 @@ def _changes(orders: list[dict], *, as_of: date, **kwargs) -> dict:
                             "meanAmountBefore": money(mean_a) if first else None,
                             "meanAmountAfter": money(mean_b) if second else None,
                             "countContribution": count_effect, "meanContribution": mean_effect,
+                            "beforeRemarks": list(dict.fromkeys(str(row.get("orderRemark") or "") for row in first))[:5],
                             "afterRemarks": list(dict.fromkeys(str(row.get("orderRemark") or "") for row in second))[:5]})
         result[direction + "Drivers"] = sorted(drivers, key=lambda row: abs(row["change"]), reverse=True)[:20]
     result["driverMethod"] = "两期均有记录时，笔数贡献为笔数差乘两期每笔均额的均值；每笔均额贡献为剩余变化。仅分解已记录交易金额，不代表商品单价、购买次数或现实原因。"

@@ -29,6 +29,18 @@ def money(value):
     return f'{value:,.2f}'.rstrip('0').rstrip('.') if isinstance(value, (int, float)) else '未知'
 
 
+
+def _major_changes(rows, limit):
+    selected = rows[:limit]
+    for sign in (-1, 1):
+        candidates = [r for r in rows if isinstance(r.get('change'), (int, float)) and r['change'] * sign > 0]
+        if candidates:
+            extreme = max(candidates, key=lambda r: abs(r['change']))
+            if extreme not in selected:
+                selected.append(extreme)
+    return selected
+
+
 def _ledger_literals(value):
     labels = set()
     def visit(item, field=''):
@@ -36,7 +48,7 @@ def _ledger_literals(value):
             for key, child in item.items():visit(child, key)
         elif isinstance(item, list):
             for child in item:visit(child, field)
-        elif isinstance(item, str) and field in {'source', 'member', 'name', 'category', 'remark', 'remarks', 'afterRemarks'}:
+        elif isinstance(item, str) and field in {'source', 'member', 'name', 'category', 'remark', 'remarks', 'beforeRemarks', 'afterRemarks'}:
             if item and len(item) <= 160:labels.add(item)
     visit(value)
     return labels
@@ -202,12 +214,15 @@ def build_facts(results):
                 if row.get('month'):
                     values.append(q('月份', row['month'], 'month'))
                 add(f"{dimensions}：{amounts}，{row['count']} 笔{detail}。", values=values)
-            for row in e['comparisons'][:4]:
+            for row in _major_changes(e['comparisons'], 4):
                 dimensions = '、'.join(f"{name}={literal(row[name])}" for name in e.get('comparisonDimensions', e['dimensions']) if name != 'period' and name in row) or '全部选中记录'
                 if row['change'] is None:
                     add(f"{dimensions}，{literal(row['beforePeriod'])} 对比 {literal(row['afterPeriod'])}：至少一个区间未查全或没有已记账单，变化未知。", True)
                 else:
                     add(f"{dimensions}，{literal(row['beforePeriod'])} 至 {literal(row['afterPeriod'])}的已记{labels[row['metric']]}从 {money(row['before'])} 元变为 {money(row['after'])} 元，变化 {money(row['change'])} 元。", True,
+                        binding={'metric': row['metric'],
+                                 **{key: row[key] for key in ('category', 'source', 'member') if key in row},
+                                 **({'evidenceRole': 'change_driver'} if any(key in row for key in ('category', 'source', 'member', 'bank', 'weekday')) else {})},
                         values=[q(name, row[name]) for name in ('before', 'after', 'change')] + [q('变化率', row.get('changePercent'), '%')])
             if e['omittedGroupCount'] or e['omittedComparisonCount']:
                 add(f"详细表省略 {e['omittedGroupCount']} 个分组、{e['omittedComparisonCount']} 项比较；总计仍覆盖完整筛选范围，不能把展示行当作全部数据。", True,
@@ -271,12 +286,16 @@ def build_facts(results):
                 add(f"来源摘要另有 {e['omittedSourceCount']} 项未展开，不能据摘要断言不存在其他来源。", True, values=[q('省略来源', e['omittedSourceCount'], '项')])
         elif tool == 'changes':
             add(f"从 {e['from']} 到 {e['to']}，收入变化 {money(e['incomeChange'])} 元，支出变化 {money(e['expenseChange'])} 元，结余变化 {money(e['netChange'])} 元。", True, values=[q('from', e['from'], 'month'), q('to', e['to'], 'month'), q('incomeChange', e['incomeChange']), q('expenseChange', e['expenseChange']), q('netChange', e['netChange'])])
-            if e.get('before') and e.get('after'):
-                add(f"上述期间已记总支出从 {money(e['before']['expenseTotal'])} 元变为 {money(e['after']['expenseTotal'])} 元。",
-                    values=[q('前期总支出', e['before']['expenseTotal']), q('后期总支出', e['after']['expenseTotal'])])
             for direction, label in (('expense', '支出'), ('income', '收入')):
-                for row in [r for r in e[direction + 'Drivers'] if r['change']][:3]:
-                    add(f"同期{label}变化来自“{row['name']}”：{money(row['before'])} → {money(row['after'])} 元，变化 {money(row['change'])} 元。记录备注：{'、'.join(row.get('afterRemarks', []))}。备注只能说明记录内容，不能确认现实原因或是否再次发生。", True, binding={'evidenceRole': 'change_driver', 'category': row['name'], 'metric': direction}, values=[q('前期金额', row['before']), q('后期金额', row['after']), q('金额变化', row['change'])])
+                requested_metric = result.get('requestedMetric', result.get('metric'))
+                if requested_metric in {'income', 'expense'} and requested_metric != direction:
+                    continue
+                if e.get('before') and e.get('after'):
+                    add(f"上述期间已记总{label}从 {money(e['before'][direction + 'Total'])} 元变为 {money(e['after'][direction + 'Total'])} 元。",
+                        binding={'evidenceRole': 'period_total', 'metric': direction, 'fromMonth': e['from'], 'toMonth': e['to']},
+                        values=[q('前期总' + label, e['before'][direction + 'Total']), q('后期总' + label, e['after'][direction + 'Total'])])
+                for row in _major_changes([r for r in e[direction + 'Drivers'] if r['change']], 3):
+                    add(f"同期{label}变化来自“{row['name']}”：{money(row['before'])} → {money(row['after'])} 元，变化 {money(row['change'])} 元。前期备注：{'、'.join(row.get('beforeRemarks', [])) or '该结果未返回前期备注'}；后期备注：{'、'.join(row.get('afterRemarks', [])) or '无备注文本'}。备注只能说明记录内容，不能确认现实原因或是否再次发生。", True, binding={'evidenceRole': 'change_driver', 'category': row['name'], 'metric': direction}, values=[q('前期金额', row['before']), q('后期金额', row['after']), q('金额变化', row['change'])])
                     if row.get('countContribution') is not None:
                         add(f"“{row['name']}”的账单笔数由 {row['beforeCount']} 笔变为 {row['afterCount']} 笔，每笔均额由 {money(row['meanAmountBefore'])} 元变为 {money(row['meanAmountAfter'])} 元；对称分解中笔数变化贡献 {money(row['countContribution'])} 元、每笔均额变化贡献 {money(row['meanContribution'])} 元。两项相加为上面的金额变化；这是记账层面的分解，不能推断商品单价或实际购买数量变化。",
                             values=[q('前期笔数', row['beforeCount'], '笔'), q('后期笔数', row['afterCount'], '笔')] +
