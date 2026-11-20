@@ -40,4 +40,7 @@ Files: synthetic conclusion evaluation script/fixtures, relevant architecture/ev
 - [x] Run full backend suite, frontend tests/build and independent code review.
 - [x] Run history-like synthetic model questions and private saved-evidence replays of both actual failures; read full replies and record failures/costs separately from structural checks.
 - [x] Fix observed failures with regression tests and rerun affected cases; do not claim a final full matrix from mixed revisions.
-- [ ] Push PR, wait CI, merge, stage/release through canonical infra paths with private rollback and real authorized public/history acceptance. Update deployed revision and source checkout; retain only purposeful module artifacts.
+- [x] Push PR, wait CI, merge, stage/release through canonical infra paths with private rollback and real authorized public/history acceptance. Update deployed revision and source checkout; retain only purposeful module artifacts.
+
+
+Release receipt: implementation PR7/8/9 merged; final application1b28ef0 (same app files as tested342d25d),588 backend checks and CI pass. Public real-ledger acceptance46/46 in110.19 seconds, both normal compositions with no repair, replies298/42 characters; full semantic reading completed. Original bill snapshot unchanged, temporary grants removed, histories/artifacts restored, private metadata excluded. Same canonical paths/root isolation/model/boot units retained; only Agent restarted and21 other app PIDs unchanged. Detailed provenance and failed intermediate acceptance are retained in deployment/quality records rather than merged into one score.
