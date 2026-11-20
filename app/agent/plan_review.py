@@ -149,7 +149,7 @@ def _deadline_retractions(clause):
     deadline = r"(?:截止(?:日期|时间|期限)?|期限|时限)"
     action = (r"(?:取消|撤销|撤回|去掉|移除|不按|不再(?:沿用|保留|按)|"
               r"不(?:再)?(?:设定|设置|设|限定|限制|要求))")
-    negation = r"(?:不是|并非|不(?:想|要|用|必|会|能)?|无需|别|勿|(?:并|尚)?未|没有|没)(?:再)?\s*$"
+    negation = r"(?:不是|并非|不|无需|别|勿|(?:并|尚)?未|没有|没)(?:再)?(?:打算|准备|考虑|想|要|用|必|会|能){0,2}(?:再)?\s*$"
     patterns = (rf"{action}.{{0,24}}?{deadline}|(?:没有|无)(?:固定|明确)?{deadline}|"
                 rf"{deadline}\s*(?:(?:这次|现在|也|一并|都|就)\s*)*{action}|不(?:再)?限期")
     return [match for match in re.finditer(patterns, clause) if not re.search(negation, clause[:match.start()])]

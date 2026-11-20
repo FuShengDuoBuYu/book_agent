@@ -377,7 +377,9 @@ class DeadlineRetractionTests(unittest.IsolatedAsyncioTestCase):
         for question in ('我不取消截止日期，起点和总目标也不变，继续按原期限算。',
                          '不要改变原来的期限，起点和目标照旧。',
                          '别取消期限，起点和目标照旧。',
-                         '并未取消截止期限，按原条件重新计算。'):
+                         '并未取消截止期限，按原条件重新计算。',
+                         '我不是要取消期限，起点和目标照旧，继续算。',
+                         '我不打算取消期限，起点和目标照旧，继续算。'):
             with self.subTest(question=question):
                 plan = await self.planned(question)
                 self.assertEqual(next(task for task in plan.analyses if task.tool == 'savings').months, 4)
