@@ -17,7 +17,7 @@ from app.agent.planner import HISTORY_BASED_TOOLS, QueryPlanner
 from app.agent.analysis_context import latest_context, logical_queries
 from app.agent.evidence_report import EvidenceReporter, money
 from app.agent.report_values import literal
-from app.agent.artifacts import build_artifacts
+from app.agent.artifacts import build_artifacts, render_artifacts_markdown
 from app.agent.investigation import EvidenceInvestigator, merged_source_groups
 from app.agent.source_grouping import grounded_source_groups
 from app.agent.progress import with_progress
@@ -77,6 +77,7 @@ class BookAgent:
         new_session: bool = False,
     ) -> tuple[str, str | None]:
         chunks: list[str] = []
+        requested_artifacts = []
         resolved_session_id: str | None = None
         async for event in self.stream_chat(
             phone_num=phone_num,
@@ -90,10 +91,14 @@ class BookAgent:
                 resolved_session_id = event["sessionId"]
             if event["type"] == "delta":
                 chunks.append(event["content"])
+            elif event["type"] == "artifacts":
+                requested_artifacts = [item for item in event["artifacts"] if item.get("presentation") == "requested"]
             elif event["type"] == "error":
                 raise RuntimeError(event["content"])
 
-        return "".join(chunks).strip(), resolved_session_id
+        reply = "".join(chunks).strip()
+        table_text = render_artifacts_markdown(requested_artifacts)
+        return reply + ("\n\n" + table_text if table_text else ""), resolved_session_id
 
     async def stream_chat(
         self,
@@ -258,7 +263,8 @@ class BookAgent:
                 chart_target = next((tool for tool in ('projection', 'forecast', 'aggregate', 'trends')
                                      if tool in primary_tools), None)
                 output = {**plan.output.model_dump(), 'chartTarget': chart_target,
-                          'includeLineage': 'remarks' in needs,
+                          'includeLineage': 'remarks' in needs or plan.output.lineage,
+                          'lineageRequested': plan.output.lineage,
                           'includeSources': bool(needs & {'sources', 'members', 'remarks'} or
                              ((plan.output.table or plan.output.export) and not needs & {'trends', 'changes', 'forecast'})),
                           'includeTrends': (plan.output.chart != 'none' and chart_target == 'trends') or
@@ -270,6 +276,7 @@ class BookAgent:
                     instruction=plan.finalInstruction, artifacts=artifacts,
                     understanding=plan.understanding.model_dump(), analysis_scope={
                         'historyWindow': plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None,
+                        'asOfDate': datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat(),
                         'primaryTasks': [task.model_dump(mode='json', exclude_none=True) for task in plan.analyses if not task._supplemental],
                         'sourceGroups': [group.model_dump(mode='json') for group in plan.sourceGroups]
                     }), '正在核对分析结论与问题要求')) as progress_stream:

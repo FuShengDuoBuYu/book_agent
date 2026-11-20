@@ -20,8 +20,8 @@ class ConclusionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         reporter = EvidenceReporter()
 
         async def invoke(schema, system, payload):
-            value = next((v["id"] for v in payload.get("values", [])
-                          if v["label"] == "预测基准"), "v1")
+            value = next((key for key, value in payload.get("values", {}).items()
+                          if "预测基准 =" in value), "v1")
             return answer("{{j1}}", reasons=[statement("先按{{" + value + "}}安排下个月的必要开销，临时收入到账后再增加预算。", "f1")],
                           caveat=statement("这是历史模式延续的条件估计，不能保证未来到账。", "f1"))
 
@@ -70,12 +70,22 @@ class ConclusionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("余额", reply)
         self.assertEqual(metadata["compositionStatus"], "fallback")
 
+    async def test_primary_source_analysis_is_not_discarded_by_an_empty_advisory_need_list(self):
+        reporter = EvidenceReporter()
+        reporter._invoke = AsyncMock(side_effect=TimeoutError())
+        result = {'tool': 'sources', 'mode': '个人版', 'evidence': {
+            'sources': [{'metric': 'income', 'source': '项目收入', 'amount': 900, 'remarks': ['项目结算']}],
+            'memberTotals': []}}
+        _, meta = await reporter.answer('把收入来源列成表', {}, [result],
+            understanding={'requestedAnswers': ['展示来源表格'], 'evidenceNeeds': []})
+        self.assertTrue(meta['facts'])
+
     async def test_two_scopes_cannot_share_a_typed_value_by_citing_another_fact(self):
         reporter = EvidenceReporter()
 
         async def invoke(schema, system, payload):
-            value = next((v["id"] for v in payload.get("values", [])
-                          if v.get("factId") == "foreign"), "v9999")
+            value = next((key for key, value in payload.get("values", {}).items()
+                          if value.startswith("foreign ")), "v9999")
             return answer("个人下月收入是{{" + value + "}}。")
 
         reporter._invoke = AsyncMock(side_effect=invoke)
@@ -91,13 +101,54 @@ class ConclusionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata["compositionStatus"], "fallback")
 
 
+class BudgetEvidenceTests(unittest.TestCase):
+    def test_empty_target_month_does_not_publish_assumed_full_remaining_budget(self):
+        from datetime import date
+        from app.tools.financial_analysis import run_analysis
+        from app.agent.evidence_report import build_facts
+        result = {'tool': 'budget', 'mode': '个人版', 'evidence': run_analysis(
+            'budget', [], as_of=date(2026, 11, 20), budget_amount=4000)}
+        facts = build_facts([result])
+        text = '\n'.join(f['text'] for f in facts)
+        self.assertIn('未知', text)
+        self.assertNotIn('已记支出 0', text)
+        self.assertFalse(any(v['label'] in {'spent', 'remaining', 'dailyAllowance'}
+                             for f in facts for v in f.get('values', [])))
+
+
 class SupportingArtifactTests(unittest.TestCase):
+    def test_source_table_request_does_not_expand_original_remark_mapping(self):
+        source = {'tool': 'sources', 'mode': '个人版', 'evidence': {
+            'sources': [{'metric': 'income', 'source': '项目收入', 'amount': 900, 'remarks': ['项目结算']}],
+            'memberTotals': []}}
+        artifacts = build_artifacts([source], {'table': True, 'includeLineage': True})
+        mapping = next(a for a in artifacts if '原始备注' in a['title'])
+        self.assertEqual(mapping.get('presentation'), 'supporting')
+        explicit = build_artifacts([source], {'table': True, 'includeLineage': True, 'lineageRequested': True})
+        self.assertTrue(any(a.get('presentation') == 'requested' for a in explicit if '原始备注' in a['title']))
+
     def test_unrequested_forecast_data_is_supporting_and_requested_table_expands(self):
         ordinary = build_artifacts([forecast_result()], {"table": False, "chart": "none"})
         requested = build_artifacts([forecast_result()], {"table": True})
         self.assertTrue(ordinary)
         self.assertTrue(all(item.get("presentation") == "supporting" for item in ordinary))
         self.assertTrue(any(item.get("presentation") == "requested" for item in requested))
+
+
+class LegacyChatTableTests(unittest.IsolatedAsyncioTestCase):
+    async def test_text_chat_keeps_explicit_tables_but_does_not_dump_supporting_data(self):
+        from app.agent.book_agent import BookAgent
+        agent = BookAgent.__new__(BookAgent)
+        for presentation in ['supporting', 'requested']:
+            async def events(**kwargs):
+                yield {'type': 'session', 'sessionId': 'fixture'}
+                yield {'type': 'delta', 'content': '简短结论。'}
+                yield {'type': 'artifacts', 'artifacts': [{'id': 'a1', 'kind': 'table', 'title': '请求的数据',
+                    'presentation': presentation, 'columns': [{'key': 'amount', 'label': '金额', 'unit': '元'}],
+                    'rows': [{'amount': 900}]}]}
+            agent.stream_chat = events
+            reply, _ = await agent.chat('fixture', '问题')
+            self.assertEqual('| ---' in reply, presentation == 'requested')
 
 
 if __name__ == "__main__":

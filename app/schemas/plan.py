@@ -204,6 +204,7 @@ class IntentUnderstanding(BaseModel):
 
 
 class OutputRequest(BaseModel):
+    lineage: bool = Field(default=False, description='仅当用户明确要求展示原始备注与来源对应关系时为true；分析需要读取备注不表示要展示对应表。')
     table: bool = False
     chart: Literal['none', 'line', 'bar'] = 'none'
     metric: Literal['income', 'expense', 'net', 'all'] = 'all'

@@ -6,7 +6,7 @@ import re
 
 from app.agent.analysis_context import DECISION_TOOLS
 from app.agent.report_context import _prompt_budget
-from app.agent.report_values import literal, value_catalog
+from app.agent.report_values import literal, value_catalog, QUANTITY_LITERAL
 
 
 @dataclass
@@ -21,10 +21,26 @@ class ReportContext:
     findings: dict
 
 
+def conclusion_only(question):
+    for match in re.finditer(r'一句(?:话|结论|总结)|只(?:要|说|给).{0,5}结论', question or ''):
+        if not re.search(r'不是|不要|不只', (question or '')[max(0, match.start()-4):match.start()]):
+            return True
+    return False
+
+
 def detail_requested(question):
-    if re.search(r'只.{0,5}结论|一句话|简短|不要展开|别展开', question or ''):
-        return False
-    return bool(re.search(r'详细|深入|完整报告|逐项|展开(?:分析|说明|讲)', question or ''))
+    return not conclusion_only(question) and bool(re.search(r'详细|深入|完整报告|逐项|展开(?:分析|说明|讲)', question or ''))
+
+
+def response_limit(question):
+    return 250 if conclusion_only(question) else 3200 if detail_requested(question) else 1200
+
+
+def judgment_leads(payload):
+    question = payload.get('question', '')
+    if re.search(r'多少|多久|几个月|能否|能不能|是否足够|够不够|合适吗|能实现', question):
+        return True
+    return not bool(re.search(r'为什么|为啥|依据|方法|怎么算|怎么.*(?:算|判断)|如何.*(?:算|判断)|怎样.*(?:算|判断)|靠谱|可信|限制', question))
 
 
 def _judgments(facts, findings):
@@ -40,7 +56,16 @@ def _judgments(facts, findings):
         if finding.get('scope') != binding.get('scope') or finding.get('tool') != binding.get('tool'):
             continue
         tool, states = binding['tool'], finding.get('states', {})
+        anchors = []
+        def take(label):
+            for row in rows:
+                for value in value_catalog([row]):
+                    if value['label'] == label:
+                        if row['id'] not in anchors:anchors.append(row['id'])
+                        return value
+            return None
         anchor = next((f for f in rows if f.get('binding', {}).get('headline')), rows[0])
+        anchors.append(anchor['id'])
         if states.get('sufficientData') is False:
             text = '目前还不能确定这项结果。' + anchor['text']
         elif tool == 'forecast':
@@ -56,18 +81,39 @@ def _judgments(facts, findings):
                 text = '给定现金可以支付买价；尚未给出应急储备底线，不能据此确认买后是否影响生活。'
         elif tool == 'savings':
             state = states.get('meetsDeadline')
-            text = ('按当前收支假设，期限内能达到目标。' if state is True else
-                    '按当前收支假设，给定期限内仍不能达到目标。' if state is False else
-                    next((s for s in finding.get('observations', []) if '目标' in s or '达标' in s), anchor['text']))
+            if state is not None:
+                projected = take('projectedBalance')
+                text = ('按当前收支假设，给定期限内能达到目标。' if state else '按当前收支假设，给定期限内仍不能达到目标。')
+                if projected:text += '期末预计余额为' + projected['display'] + '。'
+            else:
+                duration = take('estimatedMonthsToTarget')
+                if duration is not None:
+                    text = ('按给定余额，目标已经达到。' if duration['value'] == 0 else
+                            '若当前收支模式持续，约需' + duration['display'] + '达到目标。')
+                else:
+                    text = '当前情景没有正的月度结余，无法按这一基准推算有限的达标时间。'
         elif tool == 'budget':
-            text = anchor['text'].split('按含今天')[0]
+            if states.get('hasRecords') is False:
+                text = '目标月尚未见账单，实际支出和预算余量未知，不能当作零支出或预算全部可用。'
+            else:
+                remaining, allowance = take('remaining'), take('dailyAllowance')
+                text = ('按当前已记账单，预算余量为' + remaining['display'] + '。') if remaining else anchor['text']
+                if allowance:text += '含今天的剩余时间内，日均可用额度为' + allowance['display'] + '；未记录支出会改变额度。'
         elif tool == 'optimization':
-            text = next((s for s in finding.get('observations', []) if '缺口' in s or '目标' in s or '上界' in s), anchor['text'])
+            gap, spend = take('候选项之外的改善缺口'), take('可核查月度候选开销')
+            if gap and gap['value'] > 0 and spend:
+                text = ('现有可核查支出上界为' + spend['display'] + '，即便全部调整，距每月改善目标仍差'
+                        + gap['display'] + '；实际能调整多少还需确认。')
+            else:
+                text = next((line for line in finding.get('observations', []) if '目标' in line or '缺口' in line),
+                            next(iter(finding.get('observations', [])), anchor['text']))
         elif tool == 'runway':
-            text = next((s for s in finding.get('observations', []) if '当前情景' in s), anchor['text'])
+            duration = take('runwayMonths')
+            text = ('按你设定的收支条件，这笔可动用资金约能维持' + duration['display'] + '。' if duration else
+                    next((line for line in finding.get('observations', []) if '当前情景' in line), anchor['text']))
         else:
             text = anchor['text'].split('。')[0] + '。'
-        result.append({'id': f'j{len(result) + 1}', 'text': text, 'factIds': [anchor['id']],
+        result.append({'id': f'j{len(result) + 1}', 'text': text, 'factIds': list(dict.fromkeys(anchors)),
                        'binding': dict(binding), 'states': dict(states)})
     if len({j['binding'].get('scope') for j in result}) > 1:
         for judgment in result:
@@ -92,32 +138,63 @@ def _catalog(facts):
         # Numeric/markup-bearing names are inert ledger labels, never scalar money.
         binding = fact.get('binding', {})
         labels = [binding.get(k) for k in ('source', 'member', 'category')]
+        labels += fact.get('literals', [])
         labels += re.findall(r'`+\s+([^`\n]+?)\s+`+', fact['text'])
         for label in dict.fromkeys(x for x in labels if isinstance(x, str) and x):
-            if re.search(r'\d|[{}<>]|https?://', label) and not re.fullmatch(r'\d{4}-\d{2}(?:-\d{2})?', label):
+            if (QUANTITY_LITERAL.search(label) or re.search(r'[{}<>]|https?://', label)) and not re.fullmatch(r'\d{4}-\d{2}(?:-\d{2})?', label):
                 values.append({'id': f'n{len(values) + 1}', 'factId': fact['id'], 'value': label,
                                'unit': 'label', 'label': '账单原文标签，不是金额', 'role': 'ledger_label',
                                'display': literal(label), 'binding': dict(binding)})
+    for value in list(values):
+        if value['unit'] == '元' and isinstance(value['value'], (int, float)) and value['value'] < 0:
+            magnitude = abs(value['value'])
+            values.append({**value, 'id': f'v{len(values) + 1}', 'value': magnitude,
+                           'label': value['label'] + '（绝对值）', 'role': value['role'] + '（绝对值）',
+                           'display': f'{magnitude:,.2f}'.rstrip('0').rstrip('.') + ' 元'})
     return values
 
 
 def _ordered(facts, judgments, priorities):
     pinned = {key for j in [*judgments, *priorities] for key in j['factIds']}
-    mandatory = [f for f in facts if f['id'] in pinned]
-    groups = {}
+    # Trend synthesis needs all returned month totals, not the generic coverage warning.
+    pinned.update(f['id'] for f in facts if f.get('binding', {}).get('aggregation') == 'recorded_month_total')
+    causes = {}
     for fact in facts:
-        if fact['id'] not in pinned:
-            groups.setdefault(fact.get('binding', {}).get('resultGroup', fact['id']), []).append(fact)
-    # Preserve diversity instead of filling the entire budget with one catalogue.
+        if fact.get('binding', {}).get('tool') == 'aggregate' and re.search(r'(?:category|source)=', fact['text']):
+            causes.setdefault(fact.get('binding', {}).get('resultGroup'), []).append(fact)
+    pinned.update(f['id'] for rows in causes.values() for f in rows[:2])
+    mandatory = [f for f in facts if f['id'] in pinned]
+    groups, warnings = {}, []
+    for fact in facts:
+        if fact['id'] in pinned:
+            continue
+        binding = fact.get('binding', {})
+        has_data = any(v.get('value') is not None and v.get('unit', '元') not in {'date', 'month'} for v in fact.get('values', []))
+        generic = any(phrase in fact['text'] for phrase in ('来源摘要另有', '详细表省略', '有记录月份只能说明', '本次现金流完整月份均值使用'))
+        if not has_data or generic:
+            warnings.append(fact)
+        else:
+            groups.setdefault(binding.get('resultGroup', fact['id']), []).append(fact)
     optional = [f for batch in zip_longest(*groups.values()) for f in batch if f is not None]
-    return mandatory, optional
+    return mandatory, [*optional, *warnings]
+
+
+def _compact(value):
+    if isinstance(value, dict):
+        return {key: _compact(item) for key, item in value.items()
+                if key not in {'sourceKeys', 'sourceKey', 'sourceGroups', 'queryIds',
+                               'sourceGroupingScope', 'sourceGroupingScopes', 'sourceGroupScope'}
+                and item is not None and item != '' and item != [] and item != {}}
+    if isinstance(value, list):
+        return [_compact(item) for item in value]
+    return value
 
 
 def audit_report_context(payload):
     facts = payload.get('facts', [])
     return ReportContext(facts, [], _catalog(facts), _judgments(facts, payload.get('analysisFindings', {})),
                          {k: payload[k] for k in ('question', 'reviewPriorities') if k in payload}, {},
-                         3200 if detail_requested(payload.get('question', '')) else 1200, payload.get('analysisFindings', {}))
+                         response_limit(payload.get('question', '')), payload.get('analysisFindings', {}))
 
 
 def prepare_report_context(payload, system, schema, *, num_ctx=8192, num_predict=1536):
@@ -132,10 +209,16 @@ def prepare_report_context(payload, system, schema, *, num_ctx=8192, num_predict
             if finding.get('scope') != binding.get('scope') or finding.get('tool') != binding.get('tool'):
                 raise ValueError('关键判断与证据的范围或工具不一致')
     values, judgments = _catalog(facts), _judgments(facts, findings)
-    char_limit = 3200 if detail_requested(payload.get('question', '')) else 1200
-    common = {k: payload[k] for k in ('question', 'understanding', 'analysisScope', 'userConditions', 'reviewPriorities') if k in payload}
-    common['answerRequirements'] = {'leadWithConclusion': True, 'targetCharacters': 500 if char_limit == 1200 else 1800,
-                                    'maximumCharacters': char_limit, 'noAuditDump': True}
+    char_limit = response_limit(payload.get('question', ''))
+    common = _compact({k: payload[k] for k in ('question', 'understanding', 'analysisScope', 'userConditions', 'reviewPriorities', 'asOfDate') if k in payload})
+    if isinstance(common.get('analysisScope'), dict):
+        for task in common['analysisScope'].get('primaryTasks', []):
+            task.pop('aggregate', None)  # The report uses computed, scoped facts, not executable aggregation plans.
+    common['answerRequirements'] = {'leadWithConclusion': True,
+                                    'targetCharacters': 150 if char_limit == 250 else 500 if char_limit == 1200 else 1800,
+                                    'maximumCharacters': char_limit, 'onlyConclusion': char_limit == 250,
+                                    'leadWithJudgment': judgment_leads(payload),
+                                    'noAuditDump': True}
     common['judgments'] = [{k: j[k] for k in ('id', 'text', 'factIds', 'states')} for j in judgments]
     limit, estimate = _prompt_budget(system, schema, num_ctx, num_predict)
     limit -= 768  # Reserve a bounded correction instruction without changing reference IDs.
@@ -148,15 +231,23 @@ def prepare_report_context(payload, system, schema, *, num_ctx=8192, num_predict
                                'states': value.get('states', {}),
                                **{field: value.get(field, [])[:2] for field in ('observations', 'limitations', 'actions')}}
                           for key, value in findings.items() if key in bound_groups}
+        supplied = []
+        cap = 18 if detail_requested(payload.get('question', '')) else 8
+        for fact in selected:
+            owned = [v for v in values if v['factId'] == fact['id']]
+            scalar = sorted((v for v in owned if v['unit'] != 'label'), key=lambda v: v['unit'] in {'date', 'month'})
+            supplied.extend([*scalar[:cap], *(v for v in owned if v['unit'] == 'label')])
         return {**common,
                 'facts': [{'id': f['id'], 'text': (f.get('modelText') or f['text']) if len(f.get('modelText') or f['text']) <= 650
                            else '原文过长，当前仅提供已核算的数值及范围；不能补全未展示的含义。',
-                           'binding': {k: v for k, v in f.get('binding', {}).items()
+                           'binding': {k: v for k, v in f.get('binding', {}).items() if v is not None and v != []
                                        if k in {'tool', 'scope', 'historyWindow', 'month', 'partial', 'metric',
                                                 'aggregation', 'source', 'member', 'filters', 'primary'}}}
                           for f in selected],
-                'values': [{k: value[k] for k in ('id', 'factId', 'label', 'display')} for value in values if value['factId'] in ids],
-                'computedFindings': brief_findings}
+                'values': {v['id']: v['factId'] + ' ' + v['label'] + ' = ' + v['display'] for v in supplied},
+                'computedFindings': brief_findings,
+                'evidenceCoverage': {'auditFactCount': len(facts), 'contextFactCount': len(selected),
+                                     'omittedForContext': len(facts) - len(selected)}}
 
     selected = list(mandatory)
     if estimate(project(selected)) > limit:

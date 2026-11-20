@@ -2,9 +2,9 @@
   <details class="analysis-evidence" :open="items.some((item) => item.presentation === 'requested')">
     <summary>查看数据依据（{{ items.length }}项）</summary>
     <div class="analysis-artifacts">
-    <section v-for="{ artifact, chart } in cards" :key="artifact.id" class="analysis-card">
+    <details v-for="{ artifact, chart } in cards" :key="artifact.id" class="analysis-card" :open="artifact.presentation === 'requested'">
+      <summary class="analysis-card-title">{{ artifact.title }}</summary>
       <header class="analysis-heading">
-        <h3>{{ artifact.title }}</h3>
         <div class="analysis-downloads">
           <button type="button" :aria-label="artifact.title + '，下载 CSV'" @click="downloadCsv(artifact)">
             CSV
@@ -120,7 +120,7 @@
       <ul v-if="artifact.notes?.length" class="analysis-notes">
         <li v-for="(note, index) in artifact.notes" :key="index">{{ note }}</li>
       </ul>
-    </section>
+    </details>
     </div>
   </details>
 </template>
@@ -234,6 +234,9 @@ async function downloadPng(artifact, chart) {
   gap: 12px;
   margin-top: 10px;
 }
+
+.analysis-card-title { cursor: pointer; font-size: 14px; font-weight: 600; }
+.analysis-card[open] > .analysis-card-title { margin-bottom: 10px; }
 
 .analysis-card {
   min-width: 0;

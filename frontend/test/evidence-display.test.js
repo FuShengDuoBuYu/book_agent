@@ -33,3 +33,18 @@ test("requested evidence presentation survives history normalization without pri
   const [forged] = normalizeArtifacts([{ ...table, presentation: "invalid" }]);
   assert.notEqual(forged.presentation, "requested");
 });
+
+test("an opened requested table does not also open unrelated supporting tables", async () => {
+  const server = await createServer({ root: fileURLToPath(new URL("../", import.meta.url)), server: { middlewareMode: true, hmr: false }, logLevel: "silent" });
+  try {
+    const { default: Component } = await server.ssrLoadModule("/src/AnalysisArtifacts.vue");
+    const html = await renderToString(createSSRApp(Component, { items: [
+      { ...table, presentation: "requested" },
+      { ...table, id: "mapping", title: "原始备注映射", presentation: "supporting" },
+    ] }));
+    const cards = [...html.matchAll(/<details[^>]*class="analysis-card"[^>]*>/g)].map(match => match[0]);
+    assert.equal(cards.length, 2);
+    assert.match(cards[0], /\bopen(?:[ =>])/);
+    assert.doesNotMatch(cards[1], /\bopen(?:[ =>])/);
+  } finally { await server.close(); }
+});

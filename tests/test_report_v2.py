@@ -50,7 +50,7 @@ class ReportFlowTests(unittest.IsolatedAsyncioTestCase):
         reporter = EvidenceReporter()
         seen = []
         async def invoke(schema, system, payload):
-            seen.append([v['id'] for v in payload['values']])
+            seen.append(list(payload['values']))
             return answer('下月一定到账999999元。') if len(seen) == 1 else answer('{{j1}}')
         reporter._invoke = AsyncMock(side_effect=invoke)
         reply, meta = await reporter.answer('下个月收入多少？', {}, [forecast_result()])

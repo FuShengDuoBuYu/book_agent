@@ -9,7 +9,7 @@
 
 ## Global constraints
 
-Reuse canonical home apps/runtime/secrets/infra layout and current models/privacy. No real ledger data in Git. Preserve authorization, evidence, history and download behavior. Default prose bounded1200 characters, aim under700; detailed requests bounded separately. One normal composition call replaces outline; a bounded repair may precede concise safe fallback.
+Reuse canonical home apps/runtime/secrets/infra layout and current models/privacy. No real ledger data in Git. Preserve authorization, evidence, history and download behavior. Default prose bounded1200 characters, aim under500; detailed requests bounded separately. One normal composition call replaces outline; a bounded repair may precede concise safe fallback.
 
 ## Review focus
 
@@ -22,16 +22,16 @@ Reuse canonical home apps/runtime/secrets/infra layout and current models/privac
 ### Task1: Evidence-bound conclusion composition
 
 Files: app/schemas/report.py, app/agent/report_composition.py, app/agent/evidence_report.py, app/agent/report_context.py as needed; tests/test_report_composition.py, tests/test_report_v2.py and focused new conclusion regressions.
-- [ ] Write failing regressions for a direct synthesized conclusion, typed reference ownership, fabricated quantities, missing decision inputs and concise fallback.
-- [ ] Run regressions to observe the intended failures before implementation.
-- [ ] Replace outline-only schema/composition, retire unused outline code, retain reusable scoped findings and value helpers. Record raw structured draft, reference validation and bounded failure/repair metadata privately.
-- [ ] Verify focused tests and migrate old tests whose required data-dump contract is intentionally replaced, preserving safety assertions.
+- [x] Write failing regressions for a direct synthesized conclusion, typed reference ownership, fabricated quantities, missing decision inputs and concise fallback.
+- [x] Run regressions to observe the intended failures before implementation.
+- [x] Replace outline-only schema/composition, retire unused outline code, retain reusable scoped findings and value helpers. Record raw structured draft, reference validation and bounded failure/repair metadata privately.
+- [x] Verify focused tests and migrate old tests whose required data-dump contract is intentionally replaced, preserving safety assertions.
 
 ### Task2: Supporting data display
 
 Files: app/agent/book_agent.py, app/agent/artifacts.py, app/schemas/artifacts.py, frontend/src/artifacts.js, frontend/src/AnalysisArtifacts.vue; existing Python/Node artifact/history tests.
-- [ ] Add failing no-Markdown-append and collapsed-supporting-versus-requested artifact regressions.
-- [ ] Keep data separate, preserve public artifact validation and fold supporting evidence by default while honoring explicit display requests.
+- [x] Add failing no-Markdown-append and collapsed-supporting-versus-requested artifact regressions.
+- [x] Keep data separate, preserve public artifact validation and fold supporting evidence by default while honoring explicit display requests.
 - [ ] Verify history/export, literal content and mobile UI behavior.
 
 ### Task3: Actual answer quality and release

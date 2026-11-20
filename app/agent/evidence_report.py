@@ -29,6 +29,19 @@ def money(value):
     return f'{value:,.2f}'.rstrip('0').rstrip('.') if isinstance(value, (int, float)) else '未知'
 
 
+def _ledger_literals(value):
+    labels = set()
+    def visit(item, field=''):
+        if isinstance(item, dict):
+            for key, child in item.items():visit(child, key)
+        elif isinstance(item, list):
+            for child in item:visit(child, field)
+        elif isinstance(item, str) and field in {'source', 'member', 'name', 'category', 'remark', 'remarks', 'afterRemarks'}:
+            if item and len(item) <= 160:labels.add(item)
+    visit(value)
+    return labels
+
+
 def build_facts(results):
     from app.agent.evidence_pipeline import computed_metric
 
@@ -80,6 +93,7 @@ def build_facts(results):
         fact = {'id': f'f{len(facts) + 1}', 'text': sanitize_fact(prefix + text, result),
                 'required': required and not result.get('supplemental', False), 'values': values,
                 'binding': {**base_binding, **(binding or {})}}
+        fact['literals'] = sorted(label for label in result_literals if label in text)
         if tool in {'forecast', 'projection', 'scenario', 'savings', 'purchase', 'budget', 'runway', 'optimization'}:
             fact['binding']['headline'] = len(facts) - result_start < 2
         if tool == 'cashflow' and text == e.get('computedConclusion'):
@@ -100,6 +114,7 @@ def build_facts(results):
     for result_number, result in enumerate(results, 1):
         result_start = len(facts)
         tool, e = result['tool'], result['evidence']
+        result_literals = _ledger_literals(e)
         scope = result.get('mode', '当前账本')
         base_binding = {key: value for key, value in {
             'resultGroup': f'g{result_number}', 'primary': not result.get('supplemental', False),
@@ -311,6 +326,10 @@ def build_facts(results):
             if e.get('requiredMonthlySaving') is not None:
                 add(f"按 {e['months']} 个月期限，目标所需月结余 {money(e['requiredMonthlySaving'])} 元。", True, values=[q('months', e['months'], '个月'), q('requiredMonthlySaving', e['requiredMonthlySaving'])])
         elif tool == 'budget':
+            if e.get('hasRecords') is False:
+                add(f"{e['month']} 尚未见账单，实际支出和预算余量未知，不能把未记录当作零支出或预算全部可用。", True,
+                    values=[q('月份', e['month'], 'month'), q('budgetAmount', e['budgetAmount'])])
+                continue
             add(f"{e['month']} 用户预算 {money(e['budgetAmount'])} 元，已记支出 {money(e['spent'])} 元，剩余 {money(e['remaining'])} 元。按含今天的剩余 {e['remainingDaysIncludingToday']} 天，日均可用额度 {money(e['dailyAllowance'])} 元。未记录支出会改变结果。", True, values=[q('月份', e['month'], 'month'), q('budgetAmount', e['budgetAmount']), q('spent', e['spent']), q('remaining', e['remaining']), q('remainingDaysIncludingToday', e['remainingDaysIncludingToday'], '天'), q('dailyAllowance', e['dailyAllowance'])])
         elif tool == 'projection':
             add(f"假设收支模式及所列变化延续，{e['startMonth']} 至 {e['endMonth']} 共 {e['months']} 个月：月收入 {money(e['monthlyIncome'])} 元，月支出 {money(e['monthlyExpense'])} 元，月结余 {money(e['monthlyNet'])} 元；累计新增结余 {money(e['totalNet'])} 元。", True, values=[q('startMonth', e['startMonth'], 'month'), q('endMonth', e['endMonth'], 'month'), q('months', e['months'], '个月'), q('monthlyIncome', e['monthlyIncome']), q('monthlyExpense', e['monthlyExpense']), q('monthlyNet', e['monthlyNet']), q('totalNet', e['totalNet'])])
@@ -426,7 +445,7 @@ class EvidenceReporter:
         needs = set((understanding or {}).get('evidenceNeeds', []))
         forecast_metrics = {row['evidence'].get('metric') for row in results if row['tool'] == 'forecast'}
         focused = [row for row in results if not (
-            row['tool'] == 'sources' and (forecast_metrics or (understanding and not needs & {'sources', 'members', 'remarks'})))]
+            row['tool'] == 'sources' and row.get('supplemental') and (forecast_metrics or (understanding and not needs & {'sources', 'members', 'remarks'})))]
         if len(forecast_metrics) == 1 and forecast_metrics <= {'income', 'expense'}:
             metric = next(iter(forecast_metrics))
             forecast_modes = {row.get('mode') for row in results if row['tool'] == 'forecast'}

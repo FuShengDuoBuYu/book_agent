@@ -4,6 +4,12 @@ import math
 import re
 
 
+QUANTITY_LITERAL = re.compile(
+    r'\d|百分之[零〇一二两三四五六七八九十百千万亿]+|[零〇一二两三四五六七八九十百千万亿]+分之[零〇一二两三四五六七八九十百千万亿]+'
+    r'|[零〇一二两三四五六七八九十百千万亿]+(?:点[零〇一二两三四五六七八九]+)?\s*'
+    r'(?:元|块|％|%|个月|万元|笔|次(?!性)|成|倍|天|日|周|年|月|小时|分钟|秒)|翻倍|翻番|加倍')
+
+
 def literal(value):
     text = str(value).replace('\n', ' ').replace('\r', ' ')
     fence = '`' * (max((len(match[0]) for match in re.finditer(r'`+', text)), default=0) + 1)

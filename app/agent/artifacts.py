@@ -203,10 +203,10 @@ def build_artifacts(results, output=None, window=None):
     forecast_scopes = {row.get('mode', '当前账本') for row in results if row['tool'] == 'forecast'}
     catalog_scopes = {row.get('mode', '当前账本') for row in results if row['tool'] == 'sources'}
 
-    def add(title, columns, rows, *, kind='table', x_key=None, series=None, notes=None):
+    def add(title, columns, rows, *, kind='table', x_key=None, series=None, notes=None, presentation=None):
         if rows:
             artifacts.append({'id': f'a{len(artifacts) + 1}', 'kind': kind, 'title': title,
-                              'presentation': 'requested' if (output.get('table') or output.get('export') or kind != 'table') and not result.get('supplemental') else 'supporting',
+                              'presentation': presentation or ('requested' if (output.get('table') or output.get('export') or kind != 'table') and not result.get('supplemental') else 'supporting'),
                               'columns': [{'key': key, 'label': label, **({'unit': unit} if unit else {})}
                                           for key, label, unit in columns],
                               'rows': rows, 'notes': notes or [],
@@ -255,7 +255,7 @@ def build_artifacts(results, output=None, window=None):
                                  '全月缺少账单时金额未知。未来工作安排需由用户确认。'])
             if include_lineage and scope not in catalog_scopes and e.get('sourceForecasts') and metric in {'all', 'income', 'net'}:
                 columns, mapped, notes = _remark_mapping(e['sourceForecasts'], [REMARK_COVERAGE], default_metric='income')
-                add(f"{scope} {e['targetMonth']} 预测样本原始备注与来源对应表", columns, mapped, notes=notes)
+                add(f"{scope} {e['targetMonth']} 预测样本原始备注与来源对应表", columns, mapped, notes=notes, presentation='requested' if output.get('lineageRequested') else 'supporting')
         elif tool == 'sources' and (
                 include_lineage or not result.get('supplemental') or (output.get('includeSources', True) and scope not in forecast_scopes)):
             sources = [row for row in e.get('sources', []) if metric in {'all', 'net'} or row['metric'] == metric]
@@ -276,7 +276,7 @@ def build_artifacts(results, output=None, window=None):
                 add(f'{scope} 来源汇总', columns, rows, notes=notes)
             if show_mapping:
                 columns, mapped, mapping_notes = _remark_mapping(sources, notes)
-                add(f'{scope} 原始备注与来源对应表', columns, mapped, notes=mapping_notes)
+                add(f'{scope} 原始备注与来源对应表', columns, mapped, notes=mapping_notes, presentation='requested' if output.get('lineageRequested') else 'supporting')
         elif tool == 'trends' and (kind != 'table' or include_trends):
             fields = [('income', 'incomeTotal', '收入'), ('expense', 'expenseTotal', '支出'),
                       ('net', 'netIncomeMinusExpense', '结余')]

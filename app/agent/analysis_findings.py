@@ -319,6 +319,7 @@ def build_analysis_findings(results, context=None):
                 limits.append('金额排名不能证明收入会持续，也不能据此判断支出负担或可削减性。')
             limits.append('历史现金流不能说明目前可动用的余额和到期债务，单凭结余无法判断抗风险能力。')
         elif tool == 'budget':
+            out['states']['hasRecords'] = e.get('hasRecords')
             if e.get('hasRecords') is True and e.get('remaining') is not None:
                 remaining = e['remaining']
                 out['states']['overBudget'] = remaining < 0

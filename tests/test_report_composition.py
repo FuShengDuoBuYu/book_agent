@@ -3,7 +3,7 @@ from copy import deepcopy
 from unittest.mock import AsyncMock
 
 from app.agent.report_composition import (REPORT_PROMPT, REPORT_TOKENS, answer_schema,
-    compose_report, grounded_analysis, render_report, validate_draft)
+    compose_report, grounded_analysis, render_report, validate_draft, fallback_report)
 from app.agent.report_evidence import prepare_report_context
 from app.schemas.report import ReportDraft
 
@@ -46,6 +46,16 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('history', invoke.await_args.args[2])
         self.assertNotIn('artifacts', invoke.await_args.args[2])
         self.assertIn('computedFindings', invoke.await_args.args[2])
+
+    def test_forecast_basis_question_leads_with_explanation_instead_of_repeating_point(self):
+        data = context(facts=[fact('f1', '下月收入条件估计为 6600 元。', tool='forecast', headline=True)],
+            findings={'g1': {'tool': 'forecast', 'scope': '个人版', 'states': {'sufficientData': True}}},
+            question='你为什么这样预测，依据是什么？')
+        report = draft('这是按近期同来源的历史入账构成估计，不代表未来到账保证。')
+        self.assertFalse(data.payload['answerRequirements']['leadWithJudgment'])
+        self.assertEqual(validate_draft(report, data), [])
+        self.assertTrue(render_report(report, data).startswith('这是按近期'))
+        self.assertNotIn('6600', render_report(report, data))
 
     def test_schema_references_only_facts_present_in_the_bounded_context(self):
         data = context()
@@ -136,6 +146,111 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
         index = lambda data: {(v['factId'], v['role']): v['id'] for v in data.values}
         self.assertEqual(index(wide), index(narrow))
         self.assertLess(len(narrow.selected), len(wide.selected))
+
+    def test_internal_planning_bulk_cannot_crowd_out_months_and_change_sources(self):
+        facts = [fact('warning', text='通用统计口径说明。' * 20, tool='trends')]
+        facts += [fact(f'm{i}', text=f'月份账单已经核算，主要金额如下。', tool='trends',
+                       month=f'2026-{i:02}', aggregation='recorded_month_total',
+                       values=[{'label': '月份', 'value': f'2026-{i:02}', 'unit': 'month'},
+                               {'label': '已记支出', 'value': i * 900, 'unit': '元'}]) for i in range(6, 12)]
+        facts += [fact('driver', text='学费是已记大额支出，需要核查是否重复。', group='g2', tool='aggregate',
+                       values=[{'label': 'expense', 'value': 12000, 'unit': '元'}])]
+        payload = {'question': '分析近半年收支变化和主要原因', 'facts': facts,
+                   'analysisFindings': {'g1': {'scope': '个人版', 'tool': 'trends', 'states': {}},
+                                        'g2': {'scope': '个人版', 'tool': 'aggregate', 'states': {}}},
+                   'analysisScope': {'historyWindow': None,
+                       'primaryTasks': [{'tool': 'aggregate', 'queryIds': ['opaque-query-id' * 8],
+                                         'unusedOptional': None} for _ in range(12)],
+                       'sourceGroups': [{'label': '业务来源', 'sourceKeys': ['opaque-source-key' * 8] * 40}]},
+                   'userConditions': {'sourceGroups': [{'label': '已确认来源', 'sourceKeys': ['opaque-key' * 8] * 40}]}}
+        data = prepare_report_context(payload, REPORT_PROMPT, ReportDraft)
+        self.assertTrue({f'm{i}' for i in range(6, 12)} | {'driver'} <= {f['id'] for f in data.selected})
+        self.assertNotIn('opaque-key', repr(data.payload))
+        self.assertNotIn('opaque-source-key', repr(data.payload))
+
+    def test_causal_detail_is_not_dropped_behind_repeated_aggregate_totals(self):
+        facts = [fact(f't{i}', text='按查询范围汇总得到总计。', tool='aggregate',
+                      values=[{'label': 'expense', 'value': 100, 'unit': '元'}]) for i in range(1, 44)]
+        facts.append(fact('cause', text='month=九月、source=学费：支出12000元。', tool='aggregate',
+                          values=[{'label': 'expense', 'value': 12000, 'unit': '元'}]))
+        data = context(facts=facts, findings={'g1': {'tool': 'aggregate', 'scope': '个人版', 'states': {}}})
+        self.assertIn('cause', {f['id'] for f in data.selected})
+
+    def test_one_sentence_request_does_not_accept_extra_reason_paragraphs(self):
+        report = draft(reasons=[{'text': '还有额外分析。', 'factIds': ['f1']}])
+        self.assertTrue(validate_draft(report, context(question='一句话给结论，别堆数据')))
+        self.assertEqual(context(question='不要只给结论，详细解释').char_limit, 3200)
+
+    def test_decision_cannot_be_reversed_by_citing_a_non_anchor_fact_or_synonym(self):
+        data = context(facts=[fact('f1', tool='purchase'), fact('f2', tool='purchase')], findings={
+            'g1': {'tool': 'purchase', 'scope': '个人版', 'states': {
+                'sufficientData': True, 'coversPrice': True, 'coversPriceAndReserve': False}}})
+        for text in ['放心买，完全不会影响生活。', '资金绰绰有余，可以直接下单，不必担心储备。']:
+            report = draft('{{j1}}', reasons=[{'text': text, 'factIds': ['f2']}])
+            self.assertTrue(validate_draft(report, data), text)
+
+    def test_historical_net_is_not_current_cash_even_when_value_is_owned(self):
+        data = context(facts=[fact('f1', tool='cashflow', values=[
+            {'label': '完整月份月均结余', 'value': 2300, 'unit': '元'}])],
+            findings={'g1': {'tool': 'cashflow', 'scope': '个人版', 'states': {}}})
+        self.assertTrue(validate_draft(draft('目前可动用余额为{{v1}}，可以据此安排付款。'), data))
+
+    def test_single_book_and_month_cannot_be_relabelled(self):
+        data = context(facts=[fact('f1', tool='trends', scope='家庭版', month='2026-10',
+                                  values=[{'label': '已记收入', 'value': 8400, 'unit': '元'}])],
+            findings={'g1': {'tool': 'trends', 'scope': '家庭版', 'states': {}}})
+        data.payload['asOfDate'] = '2026-11-20'
+        self.assertTrue(validate_draft(draft('个人版本月收入为{{v1}}。'), data))
+        self.assertTrue(validate_draft(draft('家庭版本月收入为{{v1}}。'), data))
+
+    def test_chinese_multipliers_percentages_and_time_need_references_independently(self):
+        for text in ['收入翻三倍。', '未来收入增加百分之六十。', '这笔收入三天内到账。']:
+            self.assertTrue(validate_draft(draft(text), context()), text)
+
+    def test_priority_fallback_keeps_the_missing_purchase_balance(self):
+        data = context(facts=[fact('f1', text='家庭可动用余额未知。', tool='purchase', scope='家庭版')],
+            findings={'g1': {'tool': 'purchase', 'scope': '家庭版', 'states': {'sufficientData': False}}})
+        data.payload['reviewPriorities'] = [{'title': '已记收支', 'reason': '历史收支存在需要核对的波动。', 'factIds': ['f1']}]
+        self.assertIn('余额未知', fallback_report(data))
+
+    def test_one_sentence_runway_and_savings_leads_contain_the_calculated_time(self):
+        cases = [('runway', 'runwayMonths', 3.85,
+                  {'sufficientData': True, 'hasDeficit': True}, '当前情景有月度资金缺口，覆盖时长按余额除以缺口计算。'),
+                 ('savings', 'estimatedMonthsToTarget', 3,
+                  {'sufficientData': True, 'meetsDeadline': None}, '未指定截止期限，若当前情景持续，可以估计达标所需时间。')]
+        for tool, label, value, states, observation in cases:
+            data = context(facts=[fact('f1', tool=tool, values=[{'label': label, 'value': value, 'unit': '个月'}])],
+                findings={'g1': {'tool': tool, 'scope': '个人版', 'states': states, 'observations': [observation]}},
+                question='一句话告诉我多久')
+            self.assertIn(str(value), render_report(draft('{{j1}}'), data))
+
+    def test_postposed_labels_and_comma_separated_book_labels_cannot_retype_values(self):
+        net = context(facts=[fact('f1', values=[{'label': '月均结余', 'value': 2300, 'unit': '元'}])])
+        self.assertTrue(validate_draft(draft('{{v1}}就是你现在的可动用余额。'), net))
+        family = context(facts=[fact('f1', scope='家庭版', month='2026-10',
+            values=[{'label': '已记收入', 'value': 900, 'unit': '元'}])],
+            findings={'g1': {'tool': 'changes', 'scope': '家庭版', 'states': {}}})
+        for text in ['个人版，收入合计为{{v1}}。', '{{v1}}是个人版的本月收入。']:
+            with self.subTest(text=text): self.assertTrue(validate_draft(draft(text), family))
+        self.assertEqual(validate_draft(draft('家庭版，已记收入为{{v1}}。'), family), [])
+
+    def test_financial_assurance_paraphrases_cannot_reverse_immutable_judgment(self):
+        data = context(facts=[fact('f1', tool='purchase')], findings={
+            'g1': {'tool': 'purchase', 'scope': '个人版', 'states': {
+                'sufficientData': True, 'coversPrice': True, 'coversPriceAndReserve': False}}})
+        for text in ['当前储备底线已经满足。', '购买后生活开销不受影响。', '这笔购买完全负担得起。', '不能确定会不会影响生活，所以可以直接下单。', '不能保证但可以直接下单。']:
+            with self.subTest(text=text):
+                report = draft('{{j1}}', reasons=[{'text': text, 'factIds': ['f1']}])
+                self.assertTrue(validate_draft(report, data))
+
+    def test_quantity_bearing_original_remark_has_an_inert_label_reference(self):
+        original = fact('f1', text='同期医疗支出发生变化，备注为一次就诊。')
+        original['literals'] = ['一次就诊']
+        data = context(facts=[original])
+        label = next((v for v in data.values if v['unit'] == 'label' and v['value'] == '一次就诊'), None)
+        self.assertIsNotNone(label)
+        report = draft('备注为{{' + label['id'] + '}}，不能据此认定今后还会发生。')
+        self.assertEqual(validate_draft(report, data), [])
 
     def test_numeric_ledger_label_is_inert_and_not_recursively_substituted(self):
         data = context(facts=[fact('f1', source='画稿{{v1}}',
