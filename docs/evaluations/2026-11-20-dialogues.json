@@ -1,0 +1,78 @@
+{
+  "suite": "dialogues-v1",
+  "applicationCommit": "199e1e9ddf83b8b397af9c928cf5edce1e259f5c",
+  "fixtureDate": "2026-11-20",
+  "turnsPerModel": 30,
+  "identicalQuestionsAndFixtures": true,
+  "contextBudget": 8192,
+  "plannerOutputBudget": 2048,
+  "review": "Independent anonymized review of complete replies, artifacts and actual evidence; equivalent units accepted uniformly.",
+  "models": [
+    {
+      "model": "qwen3.5:9b",
+      "provider": "ollama",
+      "automatedPass": 26,
+      "manualPass": 21,
+      "medianResponseSeconds": 33.505,
+      "knownEstimatedCostUsd": 0,
+      "unknownCostTurns": 0,
+      "rawSha256": "c76a4a621bea9826a5ba45871d725939b67ab580ff824293962ad87c94fc67f0"
+    },
+    {
+      "model": "gpt-6-luna",
+      "provider": "openai",
+      "automatedPass": 25,
+      "manualPass": 22,
+      "medianResponseSeconds": 40.742,
+      "knownEstimatedCostUsd": 0.10221977,
+      "unknownCostTurns": 1,
+      "rawSha256": "347374adf2ccd0d43e339dd08025080c6f8eee735cab631a42ea66e010c49694"
+    },
+    {
+      "model": "gpt-6.1-terra",
+      "provider": "openai",
+      "automatedPass": 28,
+      "manualPass": 25,
+      "medianResponseSeconds": 45.241,
+      "knownEstimatedCostUsd": 0.8416428,
+      "unknownCostTurns": 1,
+      "rawSha256": "2f731b6201036eceb34146e0a062c74491304309da59f1bb2cb48398370f18a5"
+    }
+  ],
+  "costNote": "Known estimates exclude unknown calls and are not complete actual invoices. Local API cost excludes operating costs.",
+  "recommendedModel": "gpt-6.1-terra",
+  "limits": "One correlated trajectory per model; not a general success-rate estimate. Post-comparison targeted reruns use a later commit.",
+  "targetedRerun": {
+    "applicationCommit": "f579c31417ff25fca98c621b55dba716f9e2924d",
+    "cases": [
+      "protected_deadline",
+      "savings_inputs",
+      "attention_quality"
+    ],
+    "turnsPerModel": 9,
+    "models": [
+      {
+        "model": "qwen3.5:9b",
+        "automatedPass": 6,
+        "manualPass": 6,
+        "knownEstimatedCostUsd": 0,
+        "unknownCostTurns": 0
+      },
+      {
+        "model": "gpt-6-luna",
+        "automatedPass": 8,
+        "manualPass": 9,
+        "knownEstimatedCostUsd": 0.03409228,
+        "unknownCostTurns": 0
+      },
+      {
+        "model": "gpt-6.1-terra",
+        "automatedPass": 8,
+        "manualPass": 9,
+        "knownEstimatedCostUsd": 0.30865935,
+        "unknownCostTurns": 0
+      }
+    ],
+    "note": "Separate targeted trajectory, not merged into the complete 30-turn scores. Automatic optimization requirement in pressure clarification overconstrains an otherwise fulfilled answer."
+  }
+}

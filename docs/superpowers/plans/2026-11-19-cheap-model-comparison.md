@@ -23,13 +23,13 @@
 
 - [x] Add 24–32 synthetic turns covering historical failure shapes and held-out wording, with independent expected calculations and context checks.
 - [x] Test scoring against incorrect queries, amounts, missing conditions and budget-stop behavior.
-- [ ] Run the same committed code/fixtures with OpenAI and Qwen; collect individual outputs, task fulfillment, latency and API usage. Manually review substantive answers.
-- [ ] Fix concrete failures with regression tests; rerun affected comparisons and report remaining limitations honestly.
+- [x] Run the same committed code/fixtures with OpenAI and Qwen; collect individual outputs, task fulfillment, latency and API usage. Manually review substantive answers.
+- [x] Fix concrete failures with regression tests; rerun affected comparisons and report remaining limitations honestly.
 
 ## Task 3: Integration and release
 
-- [ ] Complete backend/frontend checks and an independent review; update evaluation docs and Android README accurately.
-- [ ] Perform authenticated private real-ledger acceptance on an isolated home service with the selected cheap model.
+- [x] Complete backend/frontend checks and an independent review; update evaluation docs and Android README accurately.
+- [x] Perform authenticated private real-ledger acceptance on an isolated home service with the selected cheap model.
 - [ ] Push and merge after checks, deploy the immutable merged revision with private environment and rollback; verify ready, assets, auth, history and enabled services.
 - [ ] Sync the durable checkout and perform phone installation/WebView validation if a device is available.
 
@@ -42,3 +42,17 @@
 - Confirmed and regression-tested: source-group fragments dropping a stage; unverified planner groups blocking confirmed follow-up grouping; omitted negative anomaly results; failed turns losing history/usage. Correct historical samples and equivalent nonoverlapping bank tables now have independent checks.
 - Two shared failures require program corrections before model selection: colloquial Chinese amount literals were rejected by the guard, and an explicitly removed deadline was reintroduced after the model review correctly set it to null. Add test-first fixes, then rerun the affected dialogues with the compared providers.
 - Production is still the original release until authenticated staged acceptance and final merge succeed. USB devices were not connected at the latest ADB check.
+
+
+## Nov20 completion evidence
+
+- Frozen `199e1e9` three-provider 30-turn runs completed with identical fixture/date/questions. Independent anonymized full-answer review: Qwen21, Luna22, Terra25. The stricter manual score differs from auto26/25/28; equivalent-unit answers and raw-catalog redundancy were adjudicated uniformly.
+- Default selected Terra. Known call estimate subtotals and unknown-cost turns are recorded separately in `docs/model-comparison-2026-11-19.md`; neither reserve allowances nor missing usage are presented as actual charges. Sol/Astra were not called.
+- `f579c31` test-first corrections bind income exclusions/denominators/windows, resolve an explicit no-deadline savings continuation, collapse only equivalent normalized goals, and preserve verified deadline comparisons without exposing internal snapshots as user conditions. 527 backend tests passed on home Python3.13 and GitHub Python3.11; CI includes frontend checks. Independent review found no remaining blockers in this bounded patch.
+- `f579c31` + Terra private real-ledger acceptance passed all35 checks: two normal turns, exact category comparisons, filtered category table, history/artifact restoration, secure auth, no raw private metadata, stable ledger snapshot and temporary-grant cleanup. Full private report remains only on the home host. An initial check started before the stage listener was ready failed connection; it created no AI answer, then the ready200 rerun completed.
+- Three later 9-turn targeted runs are separate from the frozen full matrix. They are not combined into a claimed final 30-turn score.
+- Nov20 ADB inventory is empty; current APK installation and phone WebView testing remain conditional on an attached authorized device. No native change was needed for the server-model selection.
+
+- Bounded 9-turn reruns completed: manual Qwen6/9, Luna9/9, Terra9/9; remaining Qwen planning failures and an automatic-scoring false negative are documented separately.
+
+- Required `evaluate_intent --case expense_decision` on f579c31+Terra completed three normal turns with all checks passing; raw outputs are separate from the comparison matrix.
