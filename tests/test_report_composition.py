@@ -57,6 +57,17 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(render_report(report, data).startswith('这是按近期'))
         self.assertNotIn('6600', render_report(report, data))
 
+    def test_audited_past_window_and_recent_comparison_are_not_new_numeric_claims(self):
+        facts = [fact('f1', historyWindow={'startDate': '2026-06-01', 'endDate': '2026-11-20'})]
+        data = context(facts=facts, question='分析最近半年收支变化和主要原因')
+        self.assertEqual(validate_draft(draft('最近半年收入持平，最近一次完整月对比显示支出上升。'), data), [])
+        self.assertTrue(validate_draft(draft('未来半年就能达成目标。'), data))
+        short = context(facts=[fact('f1', historyWindow={'startDate': '2026-10-01','endDate':'2026-11-20'})], question='分析最近半年')
+        self.assertTrue(validate_draft(draft('最近半年收入持平。'), short))
+
+    def test_project_grouping_words_are_not_financial_count_claims(self):
+        self.assertEqual(validate_draft(draft('按同一项目合并不同工序，这项历史入账不计入持续收入。'), context()), [])
+
     def test_bare_counter_is_not_a_complete_evidence_explanation(self):
         data = context(facts=[fact('f1', values=[{'label': 'missingPaymentMethodCount', 'value': 31, 'unit': '笔'}])])
         self.assertTrue(validate_draft(draft('{{v1}}，会影响按账户或支付方式分析。'), data))
@@ -82,7 +93,7 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('{{v1}}', render_report(report, data))
 
     def test_arabic_and_chinese_fabricated_amounts_are_rejected(self):
-        for text in ['预计能赚999999元。', '预计能赚两万元。', '明年收入翻三倍并保证到账。', '预计收入提高一半。', '这笔款半个月内到账。', '疑似重复增加一组。', '缺字段十条。']:
+        for text in ['预计能赚999999元。', '预计能赚两万元。', '明年收入翻三倍并保证到账。', '预计收入提高一半。', '这笔款半个月内到账。', '疑似重复增加一组。']:
             with self.subTest(text=text):
                 self.assertTrue(validate_draft(draft(text), context()))
 
@@ -224,6 +235,8 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
             question='刚才那个月拿哪几个月参照，具体怎么从项目算到总数，一次性款项怎么处理？')
         self.assertFalse(data.payload['answerRequirements']['leadWithJudgment'])
         self.assertTrue({'method','source','excluded'} <= {f['id'] for f in data.selected})
+        direct = context(facts=facts, findings={'g1': {'tool': 'forecast', 'scope': '个人版', 'states': {}}}, question='按项目预计下个月收入多少？')
+        self.assertTrue({'source','excluded'} <= {f['id'] for f in direct.selected})
 
     def test_source_method_budget_does_not_duplicate_all_original_remarks(self):
         from app.agent.evidence_report import build_facts
@@ -321,6 +334,7 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
         reserve = context(facts=[fact('f1', values=[{'label': 'cashAfterPurchase', 'value': 4000, 'unit': '元'},
             {'label': 'reserveMargin', 'value': -1000, 'unit': '元'}])])
         self.assertEqual(validate_draft(draft('购买后剩余{{v1}}，比应急储备底线少{{v3}}。'), reserve), [])
+        self.assertEqual(validate_draft(draft('购买后剩余{{v1}}，比希望保留的应急储备少{{v3}}。'), reserve), [])
         self.assertEqual(validate_draft(draft('若还要留足储备，资金共缺{{v3}}。'), reserve), [])
 
     def test_financial_assurance_paraphrases_cannot_reverse_immutable_judgment(self):

@@ -169,13 +169,14 @@ def _ordered(facts, judgments, priorities, question=""):
         if typed_driver or (binding.get('tool') == 'aggregate' and re.search(r'(?:category|source)=', fact['text'])):
             causes.setdefault((binding.get('resultGroup'), binding.get('metric') if typed_driver else None), []).append(fact)
     pinned.update(f['id'] for rows in causes.values() for f in rows[:2])
+    source_facts = [f for f in facts if f.get('binding', {}).get('evidenceRole') == 'forecast_source'
+                    and f.get('binding', {}).get('primary') is not False]
+    pinned.update(f['id'] for f in source_facts[:4])
+    pinned.update(f['id'] for f in source_facts if f.get('binding', {}).get('excluded'))
     if not judgment_leads({'question': question}):
-        # Method questions need the actual source contributions and applied exclusions.
+        # Method questions additionally need the applied calculation and exclusion rules.
         method_facts = [f for f in facts if f.get('binding', {}).get('evidenceRole') in {'forecast_method', 'forecast_exclusions'}]
-        source_facts = [f for f in facts if f.get('binding', {}).get('evidenceRole') == 'forecast_source']
         pinned.update(f['id'] for f in method_facts)
-        pinned.update(f['id'] for f in source_facts[:4])
-        pinned.update(f['id'] for f in source_facts if f.get('binding', {}).get('excluded'))
     mandatory = [f for f in facts if f['id'] in pinned]
     groups, warnings = {}, []
     for fact in facts:

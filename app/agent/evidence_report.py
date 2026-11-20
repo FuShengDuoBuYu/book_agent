@@ -306,9 +306,13 @@ def build_facts(results):
                 historical = f"历史样本入账 {money(row['amount'])} 元，" if row.get('amount') is not None else ''
                 summary = f"{row.get('member', '归属未知')}的“{row['source']}”{historical}条件估计 {money(row.get('estimate'))} 元。备注依据："
                 exclusion = '此项为已剔除的入账，不计入持续收入。' if row.get('excluded') else ''
+                short_notes = [str(remark) for remark in row.get('remarks', [])[:4]]
+                note_preview = '；'.join(short_notes) if sum(map(len, short_notes)) <= 80 else ''
+                if note_preview and len(row.get('remarks', [])) > 4:
+                    note_preview += '；这里只展示备注样例，完整映射见数据依据。'
                 add(summary + '；'.join(row.get('remarks', [])) + '。' + exclusion,
                     binding={'metric': 'income', 'evidenceRole': 'forecast_source', 'excluded': bool(row.get('excluded')), **{key: row[key] for key in ('member', 'memberKey', 'source', 'sourceKey') if key in row}},
-                    model_text=summary.removesuffix('备注依据：') + exclusion,
+                    model_text=(summary + note_preview + '。' if note_preview else summary.removesuffix('备注依据：')) + exclusion,
                     values=[q('该来源预测贡献', row.get('estimate')), q('该来源历史样本入账', row.get('amount'))])
             if e.get('excludedIncomeTotal'):
                 add(f"历史样本中按备注识别并剔除非持续性入账 {money(e['excludedIncomeTotal'])} 元；归类仍需核查。", binding={'evidenceRole': 'forecast_exclusions'}, values=[q('excludedIncomeTotal', e['excludedIncomeTotal'])])

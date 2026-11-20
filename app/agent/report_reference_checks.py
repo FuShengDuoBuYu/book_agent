@@ -54,7 +54,8 @@ def reference_issues(value, template, start, context):
     if value['unit'] == '元' and isinstance(value['value'], (int, float)):
         if value['value'] < 0 and re.search(r'缺口(?:为|是)?\s*$|还差\s*$|短缺\s*$|相差\s*$', fragment):
             issues.append('负余量不能写成负缺口；请用提供的绝对值引用或保留余量措辞')
-        if '绝对值' in role and not re.search(r'幅度|绝对值|缺|还差|差额|短缺|亏损|减少|增加|底线少|底线多', fragment):
+        if ('绝对值' in role and not re.search(r'幅度|绝对值|缺|还差|差额|短缺|亏损|减少|增加|底线少|底线多', fragment)
+                and not re.search(r'比[^。；]{1,40}(?:多|少|高|低)(?:出|了|于)?\s*$', prefix[boundary + 1:])):
             issues.append('绝对值幅度不能改写成带符号的原始金额')
     if value['unit'] == '元' and re.search(r'预计|预测|下个月.{0,5}(?:收入|支出)', fragment):
         if value.get('binding', {}).get('tool') not in {'forecast', 'projection', 'scenario', 'savings', 'budget', 'runway'}:
@@ -77,3 +78,20 @@ def reference_issues(value, template, start, context):
     if inline and value['unit'] == '元' and verified_month and inline[-1] != verified_month:
         issues.append('日期引用与金额所属月份不一致')
     return issues
+
+
+def quantitative_text(raw, context):
+    # A recent comparison is an ordinal reference, not a newly calculated count.
+    text = raw.replace('最近一次', '最近的')
+    if '半年' not in context.payload.get('question', ''):
+        return text
+    windows = [context.payload.get('analysisScope', {}).get('historyWindow')]
+    windows += [f.get('binding', {}).get('historyWindow') for f in context.selected]
+    for window in windows:
+        if not isinstance(window, dict):continue
+        try:
+            days = (date.fromisoformat(window['endDate']) - date.fromisoformat(window['startDate'])).days
+        except (KeyError, ValueError, TypeError):continue
+        if 150 <= days <= 190:
+            return re.sub(r'(?:最近|近|过去)半年', '所选历史区间', text)
+    return text

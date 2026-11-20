@@ -5,7 +5,7 @@ import re
 
 from app.agent.report_evidence import ReportContext, conclusion_only
 from app.agent.report_values import literal_links, QUANTITY_LITERAL
-from app.agent.report_reference_checks import reference_issues
+from app.agent.report_reference_checks import reference_issues, quantitative_text
 from app.schemas.report import ReportDraft
 
 
@@ -79,7 +79,7 @@ def validate_draft(draft, context):
             if finding.get('scope') != binding.get('scope') or finding.get('tool') != binding.get('tool'):
                 issues.append('分析发现的范围或工具与引用证据不一致')
         raw = TOKEN.sub('', statement.text)
-        quantities = [match[0] for match in RAW_QUANTITY.finditer(raw)]
+        quantities = [match[0] for match in RAW_QUANTITY.finditer(quantitative_text(raw, context))]
         if quantities:
             issues.append('本句未引用的数量或含数量原文：' + '、'.join(dict.fromkeys(quantities))[:100] + '；金额用v引用，账单原文如一次就诊用对应n引用')
         if '{{' in raw or '}}' in raw:
