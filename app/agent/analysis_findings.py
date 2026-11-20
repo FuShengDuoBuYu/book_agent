@@ -301,7 +301,7 @@ def build_analysis_findings(results, context=None):
         elif tool == 'cashflow':
             average = e.get('completeMonthAverage', {})
             if average.get('net') is not None and average.get('months'):
-                obs.append('历史完整月份的月均已记结余' + _direction(average['net'], SIGN) + '。')
+                obs.append('本次现金流筛选范围内，历史完整月份的月均已记结余' + _direction(average['net'], SIGN) + '；该判断只适用于所选账单。')
             else:
                 limits.append('缺少可计算月均结余的完整月份。')
             for field, label in [('incomeSources', 'source'), ('expenseCategories', 'name')]:
@@ -311,10 +311,10 @@ def build_analysis_findings(results, context=None):
             if out['labels']:
                 for key, desc in [('incomeSources', '收入来源'), ('expenseCategories', '支出类别')]:
                     if names := out['labels'].get(key):
-                        obs.append(f'查询期内已记金额靠前的{desc}有' + '、'.join(map(_name, names)) + '。')
+                        obs.append(f'本次现金流取数窗口内已记金额靠前的{desc}有' + '、'.join(map(_name, names)) + '。')
                 majority = next((r['source'] for r in e.get('incomeSources', []) if (r.get('sharePercent') or 0) > 50), None)
                 if majority:
-                    obs.append(f'{_name(majority)}占查询期已记收入的大部分。')
+                    obs.append(f'{_name(majority)}占本次现金流取数窗口已记收入的大部分；本句分母为该窗口收入，跨结果比较前需核对日期与筛选。')
                     out['actions'].append(f'安排近期付款前，可先核实{_name(majority)}下次到账时间与必付账单到期日。')
                 limits.append('金额排名不能证明收入会持续，也不能据此判断支出负担或可削减性。')
             limits.append('历史现金流不能说明目前可动用的余额和到期债务，单凭结余无法判断抗风险能力。')
@@ -342,12 +342,12 @@ def build_analysis_findings(results, context=None):
             if e.get('incomeMin') is not None and e.get('incomeMax') is not None:
                 same = e['incomeMin'] == e['incomeMax']
                 out['states']['constantInSample'] = same
-                obs.append('观察到的完整月份收入相同。' if same else '观察到的完整月份收入有波动。')
+                obs.append('剔除备注规则识别的非持续入账后，所统计完整月份的纳入收入相同。' if same else '剔除备注规则识别的非持续入账后，所统计完整月份的纳入收入有波动。')
             majority = [r['source'] for r in e.get('sources', []) if (r.get('sharePercent') or 0) > 50]
             if majority:
                 out['labels']['majoritySource'] = majority[0]
-                obs.append('“' + _name(majority[0]) + '”占所统计历史收入的大部分。')
-            limits.append('历史集中度和波动无法证明未来收入稳定或安全。')
+                obs.append('“' + _name(majority[0]) + '”占同一完整月样本剔除已识别非持续入账后纳入收入的大部分。')
+            limits.append('该样本剔除了备注规则识别的非持续性入账，不代表全部历史入账；未被识别不证明收入持续，历史集中度和波动也不能证明未来稳定或安全。')
         elif tool in {'data_quality', 'anomalies'}:
             if 'possibleDuplicates' in e:
                 obs.append('命中疑似重复线索，需要核对原始记录。' if e['possibleDuplicates'] else '本次规则未检出疑似重复。')

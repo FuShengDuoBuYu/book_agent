@@ -69,6 +69,8 @@ def compact_user_context(context):
     """Build a model-only view. Use the original conditions for execution and inheritance."""
     context = context or {}
     view = _copy_without_defaults(context)
+    # Execution-only tool evidence must not become a model-supplied user condition.
+    view.pop('savingsDeadlineReference', None)
     for key in ('changes', 'protectedCategories'):
         if key in context and context[key] == []:
             # A resolved scenario can explicitly have no active assumptions or protections.

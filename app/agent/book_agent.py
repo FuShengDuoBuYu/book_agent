@@ -270,7 +270,8 @@ class BookAgent:
                     instruction=plan.finalInstruction, artifacts=artifacts,
                     understanding=plan.understanding.model_dump(), analysis_scope={
                         'historyWindow': plan.analysisWindow.model_dump(mode='json') if plan.analysisWindow else None,
-                        'primaryTasks': [task.model_dump(mode='json', exclude_none=True) for task in plan.analyses if not task._supplemental]
+                        'primaryTasks': [task.model_dump(mode='json', exclude_none=True) for task in plan.analyses if not task._supplemental],
+                        'sourceGroups': [group.model_dump(mode='json') for group in plan.sourceGroups]
                     }), '正在核对分析结论与问题要求')) as progress_stream:
                     async for progress in progress_stream:
                         if progress['type'] == 'result':

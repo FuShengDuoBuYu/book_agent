@@ -13,7 +13,7 @@ from datetime import date
 from decimal import Decimal
 from statistics import median, quantiles
 
-from app.tools.aggregate_analysis import aggregate_analysis
+from app.tools.aggregate_analysis import aggregate_analysis, _query_union
 from app.tools.order_calculations import (
     calculate_category_breakdown,
     calculate_order_summary,
@@ -140,11 +140,24 @@ def _cashflow(orders: list[dict], *, as_of: date, **kwargs) -> dict:
     complete = [row for row in _series(orders, as_of, kwargs.get("window_start"), kwargs.get("window_end")) if not row["partial"]]
     averages = {name: _round_money(sum(row[field] for row in complete) / len(complete)) if complete else None
                 for name, field in (("income", "incomeTotal"), ("expense", "expenseTotal"), ("net", "netIncomeMinusExpense"))}
-    averages["netIncomeRatioPercent"] = _round_money(averages["net"] / averages["income"] * 100) if averages["income"] else None
+    complete_income = sum(row["incomeTotal"] for row in complete)
+    complete_net = sum(row["netIncomeMinusExpense"] for row in complete)
+    averages["netIncomeRatioPercent"] = _round_money(complete_net / complete_income * 100) if complete_income else None
+    query_ranges = _query_union(kwargs.get('queried_intervals'))
+    window_start, window_end = kwargs.get('window_start'), kwargs.get('window_end')
+    if query_ranges is None and window_start and window_end:
+        query_ranges = [(window_start, window_end)]
+    if query_ranges is not None:
+        query_ranges = [{'startDate': max(start, window_start or date.min).isoformat(),
+                         'endDate': min(end, window_end or as_of, as_of).isoformat()}
+                        for start, end in query_ranges
+                        if max(start, window_start or date.min) <= min(end, window_end or as_of, as_of)]
     categories = json.loads(calculate_category_breakdown(payload))
     for row in categories["expenseCategories"]:
         row["shareOfIncomePercent"] = _round_money(row["amount"] / income * 100) if income else None
-    return {**summary, **categories,
+    ratio_text = (f"完整月份结余率 {averages['netIncomeRatioPercent']}%"
+                  if averages['netIncomeRatioPercent'] is not None else "完整月份已记收入为零，结余率不适用")
+    return {**summary, **categories, "queryIntervals": query_ranges,
             **json.loads(calculate_payment_method_breakdown(payload)),
             **json.loads(calculate_remark_breakdown(payload)),
             "expenseIncomeRatioPercent": _round_money(summary["expenseTotal"] / income * 100) if income else None,
@@ -153,7 +166,7 @@ def _cashflow(orders: list[dict], *, as_of: date, **kwargs) -> dict:
                                "sharePercent": _round_money(amount / income * 100) if income else None}
                               for name, amount in sorted(sources.items(), key=lambda item: item[1], reverse=True)][:20],
             "completeMonthAverage": {**averages, "months": [row["month"] for row in complete]},
-            "computedConclusion": (f"完整月份共 {len(complete)} 个，月均收入 {averages['income']} 元，月均支出 {averages['expense']} 元，月均结余 {averages['net']} 元，完整月份结余率 {averages['netIncomeRatioPercent']}%。这组均值包含完整月份中的大额支出，不能用常态或中位数替换。" if complete else "缺少可计算月均值的完整月份。"),
+            "computedConclusion": (f"完整月份共 {len(complete)} 个，月均收入 {averages['income']} 元，月均支出 {averages['expense']} 元，月均结余 {averages['net']} 元，{ratio_text}。这组均值包含完整月份中的大额支出，不能用常态或中位数替换。" if complete else "缺少可计算月均值的完整月份。"),
             "interpretation": "支出占比说明结构，shareOfIncomePercent 才是该支出占收入的比例。资产与债务余额未知，不能据此判断抗风险能力或偿付压力。",
             "averageDefinition": "averageIncome 与 averageExpense 是每笔交易均值；completeMonthAverage 不含未完月份，外层比例为整个查询期累计比例。"}
 
@@ -365,7 +378,7 @@ def _scenario(orders: list[dict], *, as_of: date, target_month=None, changes=Non
     ratio = _round_money(net / totals["income"] * 100) if totals["income"] else None
     return {"sufficientData": True, **totals, "net": net,
             "baselineNet": baseline_net, "netChange": _round_money(net - baseline_net), "netIncomeRatioPercent": ratio,
-            "computedConclusion": f"在用户假设实现且其他收支延续历史基准的条件下，收入 {totals['income']} 元，支出 {totals['expense']} 元，结余 {net} 元，结余占收入 {ratio}%。基准结余 {baseline_net} 元，改善 {_round_money(net - baseline_net)} 元。这不证明真实资产或抗风险能力。",
+            "computedConclusion": f"在用户假设实现且其他收支延续历史基准的条件下，收入 {totals['income']} 元，支出 {totals['expense']} 元，结余 {net} 元，{('结余占收入 ' + str(ratio) + '%') if ratio is not None else '收入为零，结余率不适用'}。基准结余 {baseline_net} 元，改善 {_round_money(net - baseline_net)} 元。这不证明真实资产或抗风险能力。",
             "assumptions": assumptions, "baseline": {"income": income, "expense": expense}}
 
 

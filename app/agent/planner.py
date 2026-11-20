@@ -16,7 +16,11 @@ from app.agent.intent_resolution import IntentResolver
 from app.agent.conversation_context import compact_user_context
 from app.agent.plan_parsing import repair_descriptive_arrays
 from app.agent.report_context import build_report_context
-from app.agent.plan_review import NUMBER, PlanReviewer, _duration_evidence, calendar_context, explicit_month_delta, explicit_projection_start, named_percent_changes, sanitize_user_conditions, unrequested_future_aggregate
+from app.agent.plan_review import (
+    NUMBER, PlanReviewer, _duration_evidence, _prior_for, _retracts_deadline, calendar_context,
+    explicit_month_delta, explicit_projection_start, named_percent_changes, sanitize_user_conditions,
+    unrequested_future_aggregate,
+)
 from app.agent.prompts import PLANNER_HUMAN_PROMPT, PLANNER_SYSTEM_PROMPT
 from app.schemas.plan import (
     AgentPlan,
@@ -323,6 +327,12 @@ class QueryPlanner:
                 self._normalize_projection(plan, message, context, book_mode, now.date())
                 self._sanitize_conditions(plan, message, book_mode, context)
                 self._coalesce_forecasts(plan)
+                # Horizon normalization can make two proposed savings scenarios identical.
+                unique = []
+                for task in plan.analyses:
+                    if task.tool != 'savings' or task not in unique:
+                        unique.append(task)
+                plan.analyses = unique
                 resolve_context(plan, context, self._normalize_mode(book_mode))
                 self._sanitize_conditions(plan, message, book_mode, context, prune_prior=False)
                 if requested_window and plan.intent == 'analyze_orders' and not plan.analyses and plan.toolCalls:
@@ -850,6 +860,14 @@ class QueryPlanner:
                         or named_percent_changes(text),
         }
         explicit = {tool for tool, supported in requests.items() if supported}
+        elapsed = r'(?:多久|多长时间|几个?月|何时|什么时候)'
+        reaching = r'(?:达到|达成|达标)'
+        wants_savings_duration = re.search(rf'{elapsed}.{{0,12}}{reaching}|{reaching}.{{0,12}}{elapsed}', text)
+        if wants_savings_duration and _retracts_deadline(text):
+            prior = _prior_for(None, plan, self._normalize_mode(book_mode), previous or {})
+            active = prior.get('activeAnalyses') or prior.get('conversation', {}).get('analyses', [])
+            if prior.get('targetAmount') is not None and sum(row.get('tool') == 'savings' for row in active) == 1:
+                explicit.add('savings')
         if not (plan.followUpOfPreviousQuestion and not plan.resetAnalysisContext
                 and previous and not previous.get('ambiguous')
                 and re.search(r'刚才|上轮|上次|之前那|原来那|原计划|那个|这个数|同样|沿用|继续|再算|重新算', text)):

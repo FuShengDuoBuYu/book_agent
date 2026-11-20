@@ -19,6 +19,7 @@ from app.agent.report_composition import (compose_report, grounded_analysis, Rep
                                           outline_schema, OUTLINE_PROMPT, OUTLINE_TOKENS)
 from app.tools.financial_analysis import shift_month
 from app.agent.report_values import literal, quantity as q, sanitize_fact
+from app.agent.goal_comparison import add_savings_deadline_facts
 
 
 INPUT_NAMES = {'startingBalance': '当前可动用余额', 'targetAmount': '希望达到的存款目标',
@@ -198,10 +199,29 @@ def build_facts(results):
             add('账单笔数和每笔均额是记账统计，不能据此断定商品单价、购买数量或现实消费频率；同名来源是否同一业务仍需结合备注核查。')
         elif tool == 'cashflow':
             add(e['computedConclusion'], True)
+            months = e.get('completeMonthAverage', {}).get('months', [])
+            if months:
+                add('本次现金流完整月份均值使用：' + '、'.join(months) + '；来源累计金额与占比则使用下述现金流取数窗口，不能与其他区间的累计金额混用。', True,
+                    values=[q('完整月份', month, 'month') for month in months])
+            window = result.get('historyWindow') or {}
+            intervals = e.get('queryIntervals')
+            if intervals is None and window.get('startDate') and window.get('endDate'):
+                intervals = [window]
+            dates = [q(label, interval[key], 'date') for interval in intervals or []
+                     for key, label in [('startDate', '统计起日'), ('endDate', '统计止日')]]
+            scope_text = ('本次现金流取数窗口 ' + '；'.join(row['startDate'] + ' 至 ' + row['endDate'] for row in intervals)
+                          if intervals else '本次现金流已查账单范围（未限定起止日期）')
+            denominator = (f"该窗口已记收入合计 {money(e['incomeTotal'])} 元"
+                           if e.get('incomeTotal') is not None else '该窗口已记收入合计')
             for row in e.get('incomeSources', [])[:3]:
-                add(f"查询期收入来源“{row['source']}”累计 {money(row['amount'])} 元，占查询期收入 {row['sharePercent']}%。", values=[q('金额', row['amount']), q('sharePercent', row['sharePercent'], '%')])
+                share = (f"占{denominator}的 {row['sharePercent']}%" if row.get('sharePercent') is not None else '窗口收入为零，占比不适用')
+                add(f"{scope_text}，收入来源“{row['source']}”累计 {money(row['amount'])} 元，{share}。",
+                    values=[q('金额', row['amount']), q('sharePercent', row.get('sharePercent'), '%'), q('历史窗口收入合计', e.get('incomeTotal'))] + dates,
+                    binding={'aggregation': 'recorded_window_source_total'})
             for row in e.get('expenseCategories', [])[:3]:
-                add(f"查询期“{row['name']}”支出 {money(row['amount'])} 元，占查询期收入 {row['shareOfIncomePercent']}%。", values=[q('金额', row['amount']), q('shareOfIncomePercent', row['shareOfIncomePercent'], '%')])
+                share = (f"占{denominator}的 {row['shareOfIncomePercent']}%" if row.get('shareOfIncomePercent') is not None else '窗口收入为零，占收入比不适用')
+                add(f"{scope_text}，“{row['name']}”支出 {money(row['amount'])} 元，{share}。",
+                    values=[q('金额', row['amount']), q('shareOfIncomePercent', row.get('shareOfIncomePercent'), '%'), q('历史窗口收入合计', e.get('incomeTotal'))] + dates)
             add('分类占比反映已记录支出结构，不能单凭占比判断生活负担；资产与债务余额需要另行确认。')
         elif tool == 'trends':
             for row in e['months'][-6:]:
@@ -308,10 +328,19 @@ def build_facts(results):
                     add('最近完整月份的支出变化包括：' + '；'.join(f"{row['name']}变化 {money(row['change'])} 元" for row in drivers[:3]) + '。未来是否重复、是否还有其他大额安排，是测算前需要确认的变数；无法仅凭账本确定最大的未来风险。', True,
                         values=[q(row['name'] + '变化', row['change']) for row in drivers[:3]])
         elif tool == 'income_stability':
-            add(f"已观察的完整月份共 {len(e['observedMonths'])} 个，月收入最低 {money(e['incomeMin'])} 元、最高 {money(e['incomeMax'])} 元、中位数 {money(e['incomeMedian'])} 元。仅说明已记录历史的波动。", True, values=[q('incomeMin', e['incomeMin']), q('incomeMax', e['incomeMax']), q('incomeMedian', e['incomeMedian'])] +
-                [q('完整月份数', len(e['observedMonths']), unit) for unit in ('个', '个月')] + [q('完整月份', month, 'month') for month in e['observedMonths']])
+            months = e['observedMonths']
+            basis = {'incomeBasis': e.get('incomeBasis'), 'months': months}
+            exclusions = (f"本样本剔除备注规则识别的非持续入账 {e['excludedNonrecurringIncomeCount']} 笔、{money(e['excludedNonrecurringIncomeTotal'])} 元。"
+                          if e.get('excludedNonrecurringIncomeCount') is not None else '')
+            add('仅在已观察完整月份 ' + '、'.join(months) + f" 共 {len(months)} 个月中，剔除备注规则识别的非持续入账后，月收入最低 {money(e['incomeMin'])} 元、最高 {money(e['incomeMax'])} 元、中位数 {money(e['incomeMedian'])} 元。"
+                + exclusions + '该口径不代表全部历史入账，未被规则识别也不证明未来持续。', True,
+                binding=basis, values=[q('incomeMin', e['incomeMin']), q('incomeMax', e['incomeMax']), q('incomeMedian', e['incomeMedian']),
+                    q('剔除非持续入账笔数', e.get('excludedNonrecurringIncomeCount'), '笔'), q('剔除非持续入账金额', e.get('excludedNonrecurringIncomeTotal'))] +
+                [q('完整月份数', len(months), unit) for unit in ('个', '个月')] + [q('完整月份', month, 'month') for month in months])
+            denominator = f"纳入收入 {money(e['includedIncomeTotal'])} 元" if e.get('includedIncomeTotal') is not None else '纳入收入'
             for row in e['sources'][:3]:
-                add(f"历史收入来源“{row['source']}”累计 {money(row['amount'])} 元，占已记录收入 {row['sharePercent']}%。来源集中意味着该来源变化需要重点测算，并不证明它将减少。", True, values=[q('金额', row['amount']), q('sharePercent', row['sharePercent'], '%')])
+                add(f"同一完整月样本剔除已识别非持续入账后，收入来源“{row['source']}”累计 {money(row['amount'])} 元，占{denominator}的 {row['sharePercent']}%。来源集中意味着该来源变化需要重点测算，并不证明它将减少。", True,
+                    binding=basis, values=[q('金额', row['amount']), q('sharePercent', row['sharePercent'], '%'), q('同口径纳入收入', e.get('includedIncomeTotal'))])
         elif tool == 'optimization':
             add('在保护 ' + '、'.join(dict.fromkeys(e['protectedCategories'] + e['excludedCategories'])) + f" 等支出的前提下，本次已记录数据中可逐项核查的月度支出上界为 {money(e['reviewableMonthlySpend'])} 元；不代表都可取消，也不能证明现实中没有其他可优化支出。", True, values=[q('可核查月度候选开销', e['reviewableMonthlySpend'])])
             if not e['candidates']:
@@ -444,8 +473,9 @@ class EvidenceReporter:
         # Old assistant values are never authorities for the fresh calculation.
         report_history = re.sub(r'[-+]?\d+(?:,\d{3})*(?:\.\d+)?\s*(?:元|块|%|％)',
                                 '[历史数量以本轮证据为准]', history[-3200:])
+        add_savings_deadline_facts(facts, focused, context, analysis_scope)
         conditions = {key: value for key, value in context.items()
-                      if key not in {'conversation', 'activeAnalyses', 'activeHistoryWindow', 'scope'}}
+                      if key not in {'conversation', 'activeAnalyses', 'activeHistoryWindow', 'scope', 'savingsDeadlineReference'}}
         payload = {'question': question, 'history': report_history, 'instruction': instruction,
                    'understanding': understanding or {}, 'userConditions': conditions,
                    'artifacts': preview, 'analysisScope': analysis_scope or {}}

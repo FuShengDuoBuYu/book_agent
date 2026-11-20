@@ -21,7 +21,7 @@ class EvidenceFactTests(unittest.TestCase):
                    for tool in ('cashflow', 'trends')]
         facts = build_facts(results)
         average = next(f for f in facts if f['text'].startswith('【个人版】完整月份'))
-        monthly = next(f for f in facts if '已记收入' in f['text'])
+        monthly = next(f for f in facts if f['binding']['tool'] == 'trends' and '已记收入' in f['text'])
         self.assertEqual(average['binding']['aggregation'], 'complete_month_average')
         self.assertEqual(monthly['binding']['aggregation'], 'recorded_month_total')
         self.assertEqual(monthly['binding']['scope'], '个人版')

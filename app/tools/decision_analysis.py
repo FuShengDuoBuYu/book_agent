@@ -166,13 +166,18 @@ def income_stability(orders, *, as_of, **kwargs):
             if float(row["money"]) > 0:
                 sources[_source(row)] += float(row["money"])
     total = sum(sources.values())
+    excluded = [row for row in history if float(row["money"]) > 0 and _nonrecurring_income(row)]
     return {"sufficientData": len(totals) >= 2, "observedMonths": list(buckets),
+            "incomeBasis": "complete_months_excluding_identified_nonrecurring",
+            "includedIncomeTotal": _round_money(total),
+            "excludedNonrecurringIncomeCount": len(excluded),
+            "excludedNonrecurringIncomeTotal": _round_money(sum(float(row["money"]) for row in excluded)),
             "incomeMin": min(totals) if totals else None, "incomeMax": max(totals) if totals else None,
             "incomeMedian": median(totals) if totals else None,
             "sources": [{"source": key, "amount": _round_money(value),
                          "sharePercent": _round_money(value / total * 100) if total else None}
                         for key, value in sorted(sources.items(), key=lambda item: item[1], reverse=True)],
-            "interpretation": "历史已记录收入的波动和来源集中程度不能证明未来收入稳定，也不能推断当前存款或承受时长。"}
+            "interpretation": "只统计已观察完整月份，并剔除备注规则识别的非持续性入账；未被规则识别不等于持续收入。此口径的波动和集中度不能代表全部入账，也不能证明未来稳定、当前存款或承受时长。"}
 
 
 ESSENTIAL_WORDS = ("房租", "房贷", "餐饮", "吃饭", "饮食", "交通", "通勤", "医疗", "水电", "燃气", "社保", "学费")
