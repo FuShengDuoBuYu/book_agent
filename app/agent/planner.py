@@ -90,27 +90,9 @@ _MONTHLY_GOAL = r'(?:每月|每个月)\s*(?:还)?(?:想|希望|要)?(?:能)?\s*(
 
 
 def explicit_goal_amount(raw):
-    """Parse bounded literal goal amounts; leave colloquial omitted units unknown."""
-    if re.fullmatch(r'\d+(?:\.\d+)?万?', raw):
-        return float(raw.rstrip('万')) * (10000 if raw.endswith('万') else 1)
-    if re.search(r'[百千万亿][一二两三四五六七八九]$', raw):
-        return None
-    total = section = number = 0
-    units = {'十': 10, '百': 100, '千': 1000, '万': 10000, '亿': 100000000}
-    for char in raw:
-        if char in _CHINESE_DIGITS:
-            number = _CHINESE_DIGITS[char]
-        elif char in units:
-            unit = units[char]
-            if unit < 10000:
-                section += (number or 1) * unit
-            else:
-                total = (total + section + number) * unit
-                section = 0
-            number = 0
-        else:
-            return None
-    return total + section + number
+    """Parse one bounded monetary literal, including normal financial shorthand."""
+    from app.agent.amount_literals import parse_amount_literal
+    return parse_amount_literal(raw)
 
 
 def explicit_complete_month_window(message, today):
@@ -681,6 +663,10 @@ class QueryPlanner:
                     state.pop(field, None)
                 for task in context.get('activeAnalyses', []):
                     task.pop(field, None)
+                if field == 'months':
+                    context.pop('previousMonths', None)
+                    for task in context.get('conversation', {}).get('analyses', []):
+                        task.pop('months', None)
         plan._planning_issues.extend(issues)
 
     def _normalize_query_scopes(self, plan, modes):
@@ -1016,13 +1002,19 @@ class QueryPlanner:
                 continue
             named = (any(group['label'] in clause for group in confirmed)
                      or re.search(r'(?:刚才|原来|之前|上轮|这些|这几项|那几项).{0,20}(?:项目|来源|阶段|工序|归并|分组)', clause))
+            aggregate_grouping = re.search(
+                r'按(?:账本)?(?:分类|类别|成员|月份|日期|收支方向|支付方式).{0,8}(?:分组|归类)', clause)
             revise = re.search(r'(?:重新|更改|修改|调整|取消|撤销|重置).{0,6}(?:分组|归组|归并|合并)'
                                r'|(?:只|仅)(?:把|将).{1,40}(?:合为|合成|合并|归并|归为)', clause)
-            ungroup = named and re.search(r'(?:不再|不要|别).{0,40}(?:合为|合成|合并|归并|归为|认作|算作|视为)', clause)
-            separate = (named and re.search(r'单列|单独核算|分开核算', clause)
-                        and not re.search(r'(?:不要|不用|不再|别).{0,20}(?:单列|单独核算|分开核算)'
-                                          r'|(?:合计|总计|总额).{0,4}(?:单列|单独核算|分开核算)', clause))
-            regrouped |= bool(revise or ungroup or separate)
+            ungroup = named and re.search(
+                r'(?:不再|不要|别).{0,40}(?:合为|合成|合并|归并|归为|认作|算作|视为)'
+                r'|(?:取消|撤销|撤回|去掉).{0,24}(?:分组|归组|归并|合并)', clause)
+            separate_action = (r'(?:单列|单独核算|分开(?:核算|算)|各算各的|'
+                               r'各自(?:作为|算作|视为)独立(?:的)?(?:收入|支出)?来源)')
+            separate = (named and re.search(separate_action, clause)
+                        and not re.search(rf'(?:不要|不用|不再|别).{{0,20}}{separate_action}'
+                                          rf'|(?:合计|总计|总额).{{0,4}}{separate_action}', clause))
+            regrouped |= bool((revise and not aggregate_grouping) or ungroup or separate)
         if confirmed and not regrouped:
             from app.schemas.plan import SourceGroup
             restored = [SourceGroup.model_validate(row) for row in confirmed]

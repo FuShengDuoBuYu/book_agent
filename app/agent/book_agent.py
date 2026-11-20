@@ -43,6 +43,10 @@ from app.agent.evidence_pipeline import collect_analysis_results
 logger = logging.getLogger(__name__)
 
 
+class PlanningUnavailableError(RuntimeError):
+    """Structured planning exhausted its bounded retries without a usable plan."""
+
+
 class BookAgent:
     def __init__(self, ledger_client: BookkeepingApiClient) -> None:
         self.ledger_client = ledger_client
@@ -178,6 +182,13 @@ class BookAgent:
                         plan = progress['value']
                     else:
                         yield progress
+            if (plan.intent == 'unknown' and not plan.needsTools and not plan.analyses
+                    and any(issue.get('type') in {'TimeoutError', 'JSONDecodeError', 'ValidationError', 'ValueError'}
+                            for issue in plan._planning_issues)):
+                # A failed planner is not a completed financial turn. Route it
+                # through the same audited failure path as a provider error so
+                # the last confirmed context remains available for a retry.
+                raise PlanningUnavailableError()
             yield {
                 "type": "status",
                 "content": f"查询计划：{plan.summary}",

@@ -145,6 +145,20 @@ KEEP = re.compile(r"不(?:想|要|用|必|会)?(?:再)?(?:改变|调整|改动|�
 CORRECTION = re.compile(r"(?:不是|并非)([^，,。；！？;]+?)(?:[，,]\s*(?:而?是)|而是)")
 
 
+def _deadline_retractions(clause):
+    deadline = r"(?:截止(?:日期|时间|期限)?|期限|时限)"
+    action = (r"(?:取消|撤销|撤回|去掉|移除|不按|不再(?:沿用|保留|按)|"
+              r"不(?:再)?(?:设定|设置|设|限定|限制|要求))")
+    negation = r"(?:不是|并非|不(?:想|要|用|必|会|能)?|无需|别|勿|(?:并|尚)?未|没有|没)(?:再)?\s*$"
+    patterns = (rf"{action}.{{0,24}}?{deadline}|(?:没有|无)(?:固定|明确)?{deadline}|"
+                rf"{deadline}\s*(?:(?:这次|现在|也|一并|都|就)\s*)*{action}|不(?:再)?限期")
+    return [match for match in re.finditer(patterns, clause) if not re.search(negation, clause[:match.start()])]
+
+
+def _retracts_deadline(question):
+    return any(_deadline_retractions(clause) for clause in CLAUSES.split(question))
+
+
 def _scenario_clauses(question):
     # Isolate the replacement operand in “不是 A，是 B 减半” with or without a comma.
     text = CORRECTION.sub(lambda m: f"不是{m[1]}，", question)
@@ -155,9 +169,30 @@ def _negated_change(clause):
     return NEGATED.search(clause) or WITHDRAW.search(clause) or KEEP.search(clause)
 
 
+_SOURCE_RETRACTION_NONCOMMAND = re.compile(
+    r"(?:假如|假设|假定|如果|倘若|要是|是否|之前|先前|上[轮次]|以前|曾经|过去|当时|"
+    r"提到|提过|说过|听说|回顾|引述|讨论)"
+    r"|(?:别|请勿|无[需须]|没(?:有)?|未(?:曾)?|不(?:打算|准备|考虑|想|要|用|必|会)?)(?:再)?\s*$"
+    r"""|["'‘“「『]\s*$"""
+)
+_SOURCE_RETRACTION_TAIL = (
+    rf"$|(?:这[个项种]|该|的)?(?:假设|情景)|(?:可能|将会?|会)?"
+    rf"(?:减(?:少|半|低|(?={NUMBER}))|增(?:加|长)|多(?:花|收|赚|(?={NUMBER}))|"
+    rf"少(?:花|收|赚|半|(?={NUMBER}))|上涨|下降|停(?:发|止|了))|重新|再算|算|推演"
+)
+_SOURCE_NORMAL_TAIL = r"(?:恢复|回到)(?:原本|原先|正常|原状|原来|原有)"
+
+
+def _source_retraction_reference(subject, name_pattern, tail):
+    return re.match(
+        rf"""^["'‘“「『]?(?P<name>{name_pattern})["'’”」』]?\s*(?:的)?"""
+        rf"""(?P<role>收入|支出)?["'’”」』]?\s*(?:{tail})""", subject)
+
+
 def _withdrawn_changes(question, previous):
     """Find scoped (metric, source) keys explicitly excluded by the user."""
     keys = {(c["metric"], c["source"]) for c in previous if c.get("source")}
+    roles = {"income": "收入", "expense": "支出"}
     withdrawn = set()
     for clause in _scenario_clauses(question):
         if KEEP.search(clause):
@@ -165,19 +200,24 @@ def _withdrawn_changes(question, previous):
         cue = WITHDRAW.search(clause) or re.search(r"(?:按|用)正常(?:的)?", clause)
         if not cue and CORRECTION.search(question):
             cue = re.match(r"(?:不是|并非)", clause)
+        if cue and _SOURCE_RETRACTION_NONCOMMAND.search(clause[:cue.start()]):
+            continue
         subject = clause[cue.end():].strip() if cue else clause
+        tail = f"{_SOURCE_NORMAL_TAIL}|{_SOURCE_RETRACTION_TAIL}" if cue else _SOURCE_NORMAL_TAIL
         matches = set()
         for metric, source in keys:
-            role = "收入" if metric == "income" else "支出"
+            role = roles[metric]
             name = source.removesuffix(role) or source
-            reference = re.match(rf"^[‘'“「]?{re.escape(name)}[’'”」]?(?:的)?(收入|支出)?", subject)
-            if not reference or reference[1] not in (None, role):
-                continue
-            tail = subject[reference.end():].strip()
-            normal = re.match(r"(?:恢复|回到)(?:原本|原先|正常|原状)", tail)
-            if normal or (cue and re.match(r"^(?:$|的?假设|的?情景|可能|会|将|减|增|多|少|上涨|下降|停|重新|再算|算|推演)", tail)):
+            reference = _source_retraction_reference(subject, re.escape(name), tail)
+            if reference and reference["role"] in (None, role):
                 matches.add((metric, source))
-        # “按正常培训算” cannot disambiguate income and spending of the same name.
+        if not matches:
+            reference = _source_retraction_reference(subject, r"[\w·][\w· -]*?", tail)
+            if reference:
+                alias = reference["name"].strip()
+                # Resolve the alias against confirmed scenario inputs in this scope.
+                matches = {(metric, source) for metric, source in keys if alias in source
+                           and reference["role"] in (None, roles[metric])}
         if len(matches) == 1:
             withdrawn.update(matches)
     return withdrawn
@@ -473,12 +513,17 @@ def _check_conditions(analyses, plan, question, mode, previous, *, strip):
     # resolve_group shares horizon fields across decision tools on one logical
     # query. Check populated sibling horizons before they enter savings context.
     savings_scopes = {frozenset(_scope_for(t, plan, mode)) for t in analyses if t.tool == "savings"}
+    durations, _ = _duration_evidence(question)
+    retract_deadline = _retracts_deadline(question)
     for task in analyses or [None]:
         prior = _prior_for(task, plan, mode, previous)
+        if (strip and retract_deadline and prior.get("months") is not None
+                and prior["months"] not in durations):
+            issues.append({"type": "withdrawn_deadline", "tool": task.tool if task else "context",
+                           "field": "months", "retirePrevious": True})
         if (strip and task and task.tool in DECISION_TOOLS and (task.tool == "savings" or
                 ((task.months is not None or task.monthsDelta is not None)
-                 and frozenset(_scope_for(task, plan, mode)) in savings_scopes))):
-            durations, _ = _duration_evidence(question)
+                 and (retract_deadline or frozenset(_scope_for(task, plan, mode)) in savings_scopes)))):
             allowed = _supported_horizons(question, prior, durations)
             if task.months not in allowed:
                 corrected = next(iter(allowed)) if len(allowed) == 1 else None
@@ -549,7 +594,14 @@ _DURATION = re.compile(
 def _duration_evidence(question):
     durations, offsets = {"future": set(), "unspecified": set()}, set()
     for clause in CLAUSES.split(question):
+        retractions = _deadline_retractions(clause)
         for match in _DURATION.finditer(clause):
+            # A duration inside a cancellation names the old deadline. The
+            # duration immediately before “期限取消” serves the same purpose.
+            if any((match.start() < retract.end() and retract.start() < match.end()) or
+                   (match.end() <= retract.start() and re.fullmatch(r"\s*的?\s*", clause[match.end():retract.start()]))
+                   for retract in retractions):
+                continue
             role = _temporal_role(clause, match)
             before, after = clause[:match.start()], clause[match.end():].lstrip()
             if (role == "history" or after.startswith(("前", "以前")) or re.search(r"每(?:隔)?\s*$|(?:过往|此前|之前|前|上)\s*$", before)
@@ -571,6 +623,8 @@ def _duration_evidence(question):
 
 
 def _supported_horizons(question, prior, durations):
+    if not durations and _retracts_deadline(question):
+        return set()
     delta = explicit_month_delta(question)
     if delta:
         revised = prior["months"] + delta if prior.get("months") else None

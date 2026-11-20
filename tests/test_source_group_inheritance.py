@@ -386,12 +386,27 @@ class SourceGroupInheritanceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(stored['conversation']['sourceGroups'], [])
 
     async def test_explicit_ungrouping_does_not_restore_the_previous_project(self):
-        question = '刚才的目标月不变，但不再把星港海报的初排、调版和完稿合为同一个项目，各自作为独立收入来源重新算。'
-        plan, evidence, stored = await self.replay(followup_draft([]), question)
-        self.assertEqual(plan.sourceGroups, [])
-        self.assertEqual(stored['conversation']['sourceGroups'], [])
-        forecast, = [row['evidence'] for row in evidence['analysisResults'] if row['tool'] == 'forecast']
-        self.assertEqual(forecast['estimate'], 3200)
+        for question in (
+                '刚才的目标月不变，但不再把星港海报的初排、调版和完稿合为同一个项目，各自作为独立收入来源重新算。',
+                '这次星港海报的初排、调版和完稿各自作为独立收入来源重新算。',
+                '取消原先的星港海报归并，初排、调版和完稿各算各的。'):
+            with self.subTest(question=question):
+                plan, evidence, stored = await self.replay(followup_draft([]), question)
+                self.assertEqual(plan.sourceGroups, [])
+                self.assertEqual(stored['conversation']['sourceGroups'], [])
+                forecast, = [row['evidence'] for row in evidence['analysisResults'] if row['tool'] == 'forecast']
+                self.assertEqual(forecast['estimate'], 3200)
+
+    async def test_regrouping_expense_categories_keeps_confirmed_income_source_groups(self):
+        question = '支出按分类重新分组，同样预测目标月收入，星港海报保持原样。'
+        draft = followup_draft([])
+        aggregate = next(task for task in draft['analyses'] if task['tool'] == 'aggregate')
+        aggregate['metric'] = 'expense'
+        aggregate['aggregate']['groupBy'] = ['category']
+        plan, _, stored = await self.replay(draft, question)
+        expected = SAVED_CONTEXT['conversation']['sourceGroups']
+        self.assertEqual([group.model_dump() for group in plan.sourceGroups], expected)
+        self.assertEqual(stored['conversation']['sourceGroups'], expected)
 
     async def test_explicit_partial_regrouping_keeps_the_new_verified_structure(self):
         group = SAVED_CONTEXT['conversation']['sourceGroups'][0]
