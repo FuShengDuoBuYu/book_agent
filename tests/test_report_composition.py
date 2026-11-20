@@ -71,7 +71,7 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('{{v1}}', render_report(report, data))
 
     def test_arabic_and_chinese_fabricated_amounts_are_rejected(self):
-        for text in ['预计能赚999999元。', '预计能赚两万元。', '明年收入翻三倍并保证到账。']:
+        for text in ['预计能赚999999元。', '预计能赚两万元。', '明年收入翻三倍并保证到账。', '预计收入提高一半。', '这笔款半个月内到账。']:
             with self.subTest(text=text):
                 self.assertTrue(validate_draft(draft(text), context()))
 
