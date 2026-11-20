@@ -47,7 +47,7 @@ def build_facts(results):
 
     facts = []
 
-    def add(text, required=False, values=(), model_text=None, binding=None):
+    def add(text, required=False, values=(), model_text=None, binding=None, method_text=None):
         values = list(values)
         inputs = {
             'savings': ('startingBalance', 'targetAmount', 'months'),
@@ -109,6 +109,8 @@ def build_facts(results):
             fact['calendars'] = [e[key] for key in ('from', 'to') if e.get(key)]
         if model_text:
             fact['modelText'] = sanitize_fact(prefix + model_text, result)
+        if method_text:
+            fact['methodText'] = sanitize_fact(prefix + method_text, result)
         facts.append(fact)
 
     for result_number, result in enumerate(results, 1):
@@ -310,10 +312,16 @@ def build_facts(results):
                 note_preview = '；'.join(short_notes) if sum(map(len, short_notes)) <= 80 else ''
                 if note_preview and len(row.get('remarks', [])) > 4:
                     note_preview += '；这里只展示备注样例，完整映射见数据依据。'
-                add(summary + '；'.join(row.get('remarks', [])) + '。' + exclusion,
+                samples = {month: row['monthlyAmounts'].get(month, 0) for month in e.get('baselineMonths', [])
+                           if isinstance(row.get('monthlyAmounts'), dict)}
+                sample_text = ('基准月份已记入账：' + '、'.join(month + '=' + money(amount) + '元' for month, amount in samples.items())
+                               + '。未出现来源的有账单月份记为零贡献；剔除项的历史入账仍保留，但预测贡献为零。') if samples else ''
+                model_summary = (summary + note_preview + '。' if note_preview else summary.removesuffix('备注依据：')) + exclusion
+                add(summary + '；'.join(row.get('remarks', [])) + '。' + exclusion + sample_text,
                     binding={'metric': 'income', 'evidenceRole': 'forecast_source', 'excluded': bool(row.get('excluded')), **{key: row[key] for key in ('member', 'memberKey', 'source', 'sourceKey') if key in row}},
-                    model_text=(summary + note_preview + '。' if note_preview else summary.removesuffix('备注依据：')) + exclusion,
-                    values=[q('该来源预测贡献', row.get('estimate')), q('该来源历史样本入账', row.get('amount'))])
+                    model_text=model_summary, method_text=model_summary + sample_text,
+                    values=[q('该来源预测贡献', row.get('estimate')), q('该来源历史样本入账', row.get('amount'))]
+                        + [q('该来源历史月入账（' + month + '）', amount) for month, amount in samples.items()])
             if e.get('excludedIncomeTotal'):
                 add(f"历史样本中按备注识别并剔除非持续性入账 {money(e['excludedIncomeTotal'])} 元；归类仍需核查。", binding={'evidenceRole': 'forecast_exclusions'}, values=[q('excludedIncomeTotal', e['excludedIncomeTotal'])])
         elif tool == 'scenario':

@@ -217,11 +217,11 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
                   fact('september', tool='trends', aggregation='recorded_month_total', month='2026-09')]
         rows = [fact(f'early{i}', text='month=2026-06、category=日常：支出100元。', group='g2', tool='aggregate',
             values=[{'label':'expense','value':100,'unit':'元'}]) for i in range(3)]
-        later = fact('large', text='month=2026-09、category=学习：支出21500元。', group='g2', tool='aggregate',
-            values=[{'label':'expense','value':21500,'unit':'元'}])
-        detail = fact('tuition', text='month=2026-09、category=学习、source=学费：支出20000元。',
+        later = fact('large', text='month=2026-09、category=学习：支出2300元。', group='g2', tool='aggregate',
+            values=[{'label':'expense','value':2300,'unit':'元'}])
+        detail = fact('tuition', text='month=2026-09、category=学习、source=学费：支出2100元。',
             group='g3', tool='aggregate', month='2026-09',
-            values=[{'label':'expense','value':20000,'unit':'元'}])
+            values=[{'label':'expense','value':2100,'unit':'元'}])
         detail['binding']['primary'] = False
         outside = deepcopy(detail);outside['id']='outside';outside['binding']['month']='2026-01'
         outside['text']='month=2026-01、source=窗外支出：支出99999元。'
@@ -276,7 +276,7 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
         for i in range(8):
             notes = [(f'项目{i}第{j}期设计交付已确认并按约结算。' + '已完成设计交付并核对客户的结算安排。'*12)[:40] for j in range(4)]
             evidence['sourceForecasts'].append({'source': f'项目{i}', 'member': '成员甲', 'amount': 2250,
-                'estimate': 750, 'lower': 600, 'upper': 900, 'remarks': notes, 'excluded': False})
+                'estimate': 750, 'lower': 600, 'upper': 900, 'remarks': notes, 'excluded': False, 'monthlyAmounts': {'2026-08':750,'2026-09':750,'2026-10':750}})
         results = [{'tool': 'forecast', 'mode': '个人版',
             'historyWindow': {'startDate': '2026-05-01', 'endDate': '2026-11-20'}, 'evidence': evidence}]
         facts = build_facts(results)
@@ -287,6 +287,26 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(original, repr(data.facts))
         self.assertNotIn(original, repr(data.payload))
         self.assertTrue(any(f['binding'].get('evidenceRole')=='forecast_source' for f in data.selected))
+
+    def test_method_source_fact_contains_audited_month_samples_without_repeating_catalogs(self):
+        from app.agent.evidence_report import build_facts
+        from app.agent.analysis_findings import build_analysis_findings
+        from tests.test_analysis_artifacts import forecast_result
+        result = forecast_result()
+        result['evidence']['sourceForecasts'][0]['monthlyAmounts'] = {'2026-08':1000,'2026-09':1200,'2026-10':1600}
+        facts = build_facts([result])
+        payload = {'question':'具体怎么从各来源算到总数？','facts':facts,'analysisFindings':build_analysis_findings([result])}
+        data = prepare_report_context(payload, REPORT_PROMPT, ReportDraft)
+        source = next(f for f in data.selected if f['binding'].get('source')=='带球')
+        visible = next(f for f in data.payload['facts'] if f['id']==source['id'])
+        self.assertIn('2026-08',visible['text'])
+        sample = next(v for v in data.values if v['factId']==source['id'] and v['role']=='该来源历史月入账（2026-08）')
+        self.assertEqual(sample['value'],1000)
+        self.assertEqual(sample['binding']['month'],'2026-08')
+        self.assertIn(sample['id'],data.payload['values'])
+        direct = prepare_report_context({**payload,'question':'预计下个月收入多少？'}, REPORT_PROMPT, ReportDraft)
+        self.assertNotIn(sample['id'],direct.payload['values'])
+        self.assertIn('monthlyAmounts',str(result))
 
     def test_monthly_improvement_gap_is_not_solved_by_postponing_a_goal(self):
         data = context(facts=[fact('f1', tool='optimization')], findings={

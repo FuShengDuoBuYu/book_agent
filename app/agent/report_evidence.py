@@ -129,6 +129,9 @@ def _catalog(facts):
     for value in values:
         value['binding'] = dict(by_id[value['factId']].get('binding', {}))
         value['role'] = value['label']
+        sample_month = re.fullmatch(r'该来源历史月入账（(\d{4}-\d{2})）', value['label'])
+        if sample_month and value['binding'].get('tool') == 'forecast':
+            value['binding'].update(month=sample_month[1], aggregation='recorded_source_month')
     for fact in facts:
         known = {(v['value'], v['unit']) for v in values if v['factId'] == fact['id']}
         for calendar in fact.get('calendars', []):
@@ -263,6 +266,8 @@ def prepare_report_context(payload, system, schema, *, num_ctx=8192, num_predict
     limit -= 768  # Reserve a bounded correction instruction without changing reference IDs.
     mandatory, optional = _ordered(facts, judgments, payload.get('reviewPriorities', []), payload.get('question', ''))
 
+    method_requested = not judgment_leads(payload)
+
     def project(selected):
         ids = {f['id'] for f in selected}
         bound_groups = {f.get('binding', {}).get('resultGroup') for f in selected}
@@ -270,12 +275,17 @@ def prepare_report_context(payload, system, schema, *, num_ctx=8192, num_predict
                                'states': value.get('states', {}),
                                **{field: value.get(field, [])[:2 if value.get('tool') in DECISION_TOOLS else 1] for field in ('observations', 'limitations', 'actions')}}
                           for key, value in findings.items() if key in bound_groups}
-        preview = {f['id']: (f.get('modelText') or f['text']) if len(f.get('modelText') or f['text']) <= 650
-                   else '原文过长，当前仅提供已核算的数值及范围；不能补全未展示的含义。' for f in selected}
+        def preview_text(fact):
+            text = (fact.get('methodText') if method_requested else None) or fact.get('modelText') or fact['text']
+            return text if len(text) <= 650 else '原文过长，当前仅提供已核算的数值及范围；不能补全未展示的含义。'
+        preview = {f['id']: preview_text(f) for f in selected}
         supplied = []
         cap = 18 if detail_requested(payload.get('question', '')) else 8
         for fact in selected:
             owned = [v for v in values if v['factId'] == fact['id']]
+            if fact.get('binding', {}).get('evidenceRole') == 'forecast_source':
+                owned = [v for v in owned if v['role'] != '预测跨度' and v['unit'] not in {'date','month'}
+                         and (method_requested or not v['role'].startswith('该来源历史月入账（'))]
             scalar = sorted((v for v in owned if v['unit'] != 'label'), key=lambda v: v['unit'] in {'date', 'month'})
             names = [fact.get('binding', {}).get(k) for k in ('source', 'member', 'category')]
             supplied.extend([*scalar[:cap], *(v for v in owned if v['unit'] == 'label'
