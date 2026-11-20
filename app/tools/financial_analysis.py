@@ -186,7 +186,10 @@ def _changes(orders: list[dict], *, as_of: date, **kwargs) -> dict:
             for order in buckets[month]:
                 amount = float(order["money"])
                 if amount and (amount > 0) == positive:
-                    groups[_source(order)].append(order)
+                    # Expense drivers are category contributions; remarks remain
+                    # supporting observations rather than replacing the category.
+                    name = _source(order) if positive else (str(order.get("costType") or "").strip() or "未分类")
+                    groups[name].append(order)
             periods.append(groups)
         drivers = []
         for name in sorted(periods[0].keys() | periods[1].keys()):
