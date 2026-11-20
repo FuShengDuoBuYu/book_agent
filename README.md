@@ -111,6 +111,7 @@ python -m scripts.evaluate_dialogues --output dialogue-results.jsonl --max-cost-
 
 复杂分析的结构化理解、规划和报告提纲使用零温度、关闭推理；普通聊天仍使用聊天配置。原生 Ollama 默认请求 8K 上下文，`OLLAMA_KEEP_ALIVE=60s` 表示请求完成后空闲一分钟释放模型。共享显卡时可设置 `OLLAMA_NUM_GPU` 限制 GPU 执行的层数，其他层由 CPU 执行；应实测显存余量和延迟，不把该值当作显存容量。对话元数据同时记录上下文、GPU 层数及驻留配置。
 
+- [本次验证与发布记录](docs/deployments/2026-11-20.md)
 - [架构与部署](docs/ai-bill-architecture.md)
 - [家庭部署信息清单](docs/home-agent-checklist.md)
 - [开发规范](CONTRIBUTING.md)

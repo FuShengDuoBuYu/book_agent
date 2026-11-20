@@ -30,8 +30,8 @@
 
 - [x] Complete backend/frontend checks and an independent review; update evaluation docs and Android README accurately.
 - [x] Perform authenticated private real-ledger acceptance on an isolated home service with the selected cheap model.
-- [ ] Push and merge after checks, deploy the immutable merged revision with private environment and rollback; verify ready, assets, auth, history and enabled services.
-- [ ] Sync the durable checkout and perform phone installation/WebView validation if a device is available.
+- [x] Push and merge after checks, deploy the immutable merged revision with private environment and rollback; verify ready, assets, auth, history and enabled services.
+- [x] Sync the durable checkout and perform phone installation/WebView validation if a device is available.
 
 **Ruling:** Preserve program-bound financial explanations while testing model changes. Better models do not make lost context, unauthorized records or unsupported money claims acceptable. Any later relaxation needs typed claims and evidence validation rather than a return to unrestricted financial prose.
 
@@ -41,7 +41,7 @@
 - Frozen initial application `f8db882` completed Qwen and Luna thirty-turn runs; Terra uses that same application and fixture for its comparison. Scorer-only revisions are applied uniformly to saved raw outputs, with no feedback to model generation.
 - Confirmed and regression-tested: source-group fragments dropping a stage; unverified planner groups blocking confirmed follow-up grouping; omitted negative anomaly results; failed turns losing history/usage. Correct historical samples and equivalent nonoverlapping bank tables now have independent checks.
 - Two shared failures require program corrections before model selection: colloquial Chinese amount literals were rejected by the guard, and an explicitly removed deadline was reintroduced after the model review correctly set it to null. Add test-first fixes, then rerun the affected dialogues with the compared providers.
-- Production is still the original release until authenticated staged acceptance and final merge succeed. USB devices were not connected at the latest ADB check.
+- Historical checkpoint before release: production remained unchanged until staged acceptance and final merge. See the completion evidence below for the current deployment. USB devices were not connected at the latest ADB check.
 
 
 ## Nov20 completion evidence
@@ -56,3 +56,5 @@
 - Bounded 9-turn reruns completed: manual Qwen6/9, Luna9/9, Terra9/9; remaining Qwen planning failures and an automatic-scoring false negative are documented separately.
 
 - Required `evaluate_intent --case expense_decision` on f579c31+Terra completed three normal turns with all checks passing; raw outputs are separate from the comparison matrix.
+
+- Final merged application `6ed60df` deployed with Terra; cold API readiness and initial namespace access fixed and tested. The subsequent user-requested layout restoration returned services to the original root-run apps/runtime/secrets/infra design, rebuilt exact environments and passed another public real-ledger35/35;20 unrelated service PIDs were unchanged. Public HTTPS real-ledger acceptance passed all35 checks in125.12s. Agent/ledger/original Ollama enabled+active; comparison services disabled+inactive. Release/rollback record: `docs/deployments/2026-11-20.md`. The conditional device step was checked: no attached device, so no claim of installation or phone validation.
