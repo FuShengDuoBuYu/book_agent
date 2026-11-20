@@ -301,7 +301,7 @@ def prepare_report_context(payload, system, schema, *, num_ctx=8192, num_predict
                 'facts': [{'id': f['id'], 'text': preview[f['id']],
                            'binding': {k: v for k, v in f.get('binding', {}).items() if v is not None and v != []
                                        if k in {'tool', 'scope', 'historyWindow', 'month', 'partial', 'metric',
-                                                'aggregation', 'evidenceRole', 'excluded', 'category', 'source', 'member', 'filters', 'primary'}}}
+                                                'aggregation', 'aggregateFilters', 'evidenceRole', 'excluded', 'category', 'source', 'member', 'filters', 'primary'}}}
                           for f in selected],
                 'values': {v['id']: v['factId'] + ' ' + v['label'] + ' = ' + v['display'] for v in supplied},
                 'computedFindings': brief_findings,

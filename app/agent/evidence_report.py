@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 from datetime import date
+from calendar import monthrange
 
 from app.core.config import get_settings
 from app.core.llm import get_structured_model
@@ -135,6 +136,7 @@ def build_facts(results):
         base_binding = {key: value for key, value in {
             'resultGroup': f'g{result_number}', 'primary': not result.get('supplemental', False),
             'filters': result.get('filters', []), 'queryIds': result.get('queryIds', []),
+            'aggregateFilters': e.get('appliedFilters') if tool == 'aggregate' else None,
             'tool': tool, 'scope': scope, 'metric': computed_metric(tool, e),
             'historyWindow': result.get('historyWindow') if tool != 'budget' else None,
             'month': e.get('month') if tool == 'budget' else None,
@@ -191,7 +193,8 @@ def build_facts(results):
                 amounts = '、'.join(f"{labels[name]} {money(row[name])} 元" for name in measures)
                 coverage = next((item for item in e['coverage'] if item['period'] == row['period']), {})
                 start, end = coverage.get('startDate', ''), coverage.get('endDate', '')
-                period_month = start[:7] if start and start[:7] == end[:7] else None
+                period_month = start[:7] if (start.endswith('-01') and start[:7] == end[:7]
+                    and int(end[-2:]) == monthrange(int(start[:4]), int(start[5:7]))[1]) else None
                 add(f"区间 {literal(row['period'])} 按当前筛选的完整已记小计：{amounts}，共 {row['count']} 笔。"
                     '重叠日期在各区间内分别统计，不能再将各期小计相加当作并集总额。', True,
                     binding={'period': row['period'], 'aggregation': 'filtered_period_total', **({'month': period_month} if period_month else {})},

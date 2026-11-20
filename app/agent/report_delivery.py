@@ -5,7 +5,7 @@ import re
 
 
 def _scope(binding, metric):
-    return json.dumps([binding.get('scope'), metric, binding.get('historyWindow'), binding.get('filters') or []], sort_keys=True, ensure_ascii=False)
+    return json.dumps([binding.get('scope'), metric, binding.get('historyWindow'), binding.get('filters') or [], binding.get('aggregateFilters') or {}], sort_keys=True, ensure_ascii=False)
 
 
 def _in_requested_table(value, artifacts, scopes):

@@ -160,3 +160,35 @@ class RequestedComparisonDeliveryTests(unittest.TestCase):
         data=prepare_report_context({'question':'支出主要增加和减少在哪里？','facts':build_facts(evidence),
             'analysisFindings':build_analysis_findings(evidence)},REPORT_PROMPT,ReportDraft)
         self.assertEqual({g['direction'] for g in data.payload['answerRequirements']['changeDirections']},{'增加','减少'})
+
+    def test_partial_month_periods_are_not_deduplicated_as_complete_months(self):
+        from datetime import date
+        from app.tools.financial_analysis import run_analysis
+        rows=[{'year':2026,'month':m,'day':d,'money':amount,'costType':'餐饮'}
+              for m,d,amount in [(9,5,-100),(9,20,-900),(10,5,-200),(10,20,-800)]]
+        spec={'periods':[{'label':'九月上半月','startDate':'2026-09-01','endDate':'2026-09-15'},
+                         {'label':'十月上半月','startDate':'2026-10-01','endDate':'2026-10-15'}]}
+        evidence=[{'tool':t,'mode':'个人版','requestedMetric':'expense','metric':'all' if t=='changes' else 'expense',
+            'historyWindow':{'startDate':'2026-09-01','endDate':'2026-10-31'},
+            'evidence':run_analysis(t,rows,as_of=date(2026,11,20),metric='expense',aggregate=spec)} for t in ['changes','aggregate']]
+        data=prepare_report_context({'question':'给出完整九月和十月各自总支出，以及两个上半月各期支出总额。',
+            'facts':build_facts(evidence),'analysisFindings':build_analysis_findings(evidence)},REPORT_PROMPT,ReportDraft)
+        required=data.payload['answerRequirements']['requiredValues']
+        self.assertEqual(len(required),4)
+        partial=[f for f in data.facts if f['binding'].get('aggregation')=='filtered_period_total']
+        self.assertTrue(all('month' not in f['binding'] for f in partial))
+
+    def test_filtered_and_unfiltered_month_totals_keep_separate_identities(self):
+        from datetime import date
+        from app.tools.financial_analysis import run_analysis
+        rows=[{'year':2026,'month':m,'day':1,'money':amount,'costType':category}
+              for m in (9,10) for amount,category in [(-100,'餐饮'),(-50,'交通')]]
+        spec={'periods':[{'label':'九月','startDate':'2026-09-01','endDate':'2026-09-30'},
+                         {'label':'十月','startDate':'2026-10-01','endDate':'2026-10-31'}],
+              'filters':{'excludeCategories':['交通']}}
+        evidence=[{'tool':t,'mode':'个人版','requestedMetric':'expense','metric':'all' if t=='changes' else 'expense',
+            'historyWindow':{'startDate':'2026-09-01','endDate':'2026-10-31'},
+            'evidence':run_analysis(t,rows,as_of=date(2026,11,20),metric='expense',aggregate=spec)} for t in ['changes','aggregate']]
+        data=prepare_report_context({'question':'给出各月支出总额，分别说明未筛选及排除交通后的总额。',
+            'facts':build_facts(evidence),'analysisFindings':build_analysis_findings(evidence)},REPORT_PROMPT,ReportDraft)
+        self.assertEqual(len(data.payload['answerRequirements']['requiredValues']),4)
