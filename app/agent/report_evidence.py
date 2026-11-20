@@ -160,15 +160,38 @@ def _ordered(facts, judgments, priorities, question=""):
     pinned = {key for j in [*judgments, *priorities] for key in j['factIds']}
     # Trend synthesis needs all returned month totals, not the generic coverage warning.
     pinned.update(f['id'] for f in facts if f.get('binding', {}).get('aggregation') == 'recorded_month_total')
+    monthly = {(f['binding'].get('scope'), f['binding'].get('month')): f for f in facts
+               if f.get('binding', {}).get('aggregation') == 'recorded_month_total'
+               and f.get('binding', {}).get('primary') is not False}
+    def amounts(fact):
+        return {v['label']: v['value'] for v in fact.get('values', [])
+                if v.get('unit', '元') == '元' and isinstance(v.get('value'), (int, float))}
+    def month_of(fact):
+        binding = fact.get('binding', {})
+        if binding.get('month'):return binding['month']
+        match = re.search(r'month=\s*(?:`+\s*)?(\d{4}-\d{2})', fact['text'])
+        return match[1] if match else None
     causes = {}
     for fact in facts:
         binding = fact.get('binding', {})
-        if binding.get('primary') is False:
-            continue
         typed_driver = binding.get('evidenceRole') == 'change_driver'
-        if typed_driver or (binding.get('tool') == 'aggregate' and re.search(r'(?:category|source)=', fact['text'])):
-            causes.setdefault((binding.get('resultGroup'), binding.get('metric') if typed_driver else None), []).append(fact)
-    pinned.update(f['id'] for rows in causes.values() for f in rows[:2])
+        aggregate_driver = binding.get('tool') == 'aggregate' and re.search(r'(?:category|source)=', fact['text'])
+        if not (typed_driver or aggregate_driver):continue
+        anchor = monthly.get((binding.get('scope'), month_of(fact)))
+        # In-window supplementary source detail can explain a primary trend; unrelated followup aggregates cannot displace it.
+        if binding.get('primary') is False and not (aggregate_driver and anchor):continue
+        stats = amounts(fact)
+        direction = binding.get('metric') if typed_driver else (
+            'income' if stats.get('income', 0) > 0 and not stats.get('expense', 0) else
+            'expense' if stats.get('expense', 0) > 0 and not stats.get('income', 0) else 'mixed')
+        monthly_stats = amounts(anchor) if anchor else {}
+        negative_month = monthly_stats.get('已记结余', monthly_stats.get('net', 0)) < 0
+        magnitude = abs(stats.get('金额变化', 0)) if typed_driver else max((abs(v) for v in stats.values()), default=0)
+        score = (bool(negative_month and direction == 'expense'), magnitude)
+        causes.setdefault((binding.get('resultGroup'), direction, typed_driver), []).append((score, fact))
+    for (_, _, typed_driver), rows in causes.items():
+        ordered = sorted(rows, key=lambda pair: pair[0], reverse=True)
+        pinned.update(f['id'] for _, f in ordered[:2 if typed_driver else 1])
     source_facts = [f for f in facts if f.get('binding', {}).get('evidenceRole') == 'forecast_source'
                     and f.get('binding', {}).get('primary') is not False]
     pinned.update(f['id'] for f in source_facts[:4])
@@ -245,7 +268,7 @@ def prepare_report_context(payload, system, schema, *, num_ctx=8192, num_predict
         bound_groups = {f.get('binding', {}).get('resultGroup') for f in selected}
         brief_findings = {key: {'scope': value.get('scope'), 'tool': value.get('tool'),
                                'states': value.get('states', {}),
-                               **{field: value.get(field, [])[:2] for field in ('observations', 'limitations', 'actions')}}
+                               **{field: value.get(field, [])[:2 if value.get('tool') in DECISION_TOOLS else 1] for field in ('observations', 'limitations', 'actions')}}
                           for key, value in findings.items() if key in bound_groups}
         preview = {f['id']: (f.get('modelText') or f['text']) if len(f.get('modelText') or f['text']) <= 650
                    else '原文过长，当前仅提供已核算的数值及范围；不能补全未展示的含义。' for f in selected}

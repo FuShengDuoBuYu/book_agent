@@ -94,4 +94,18 @@ def quantitative_text(raw, context):
         except (KeyError, ValueError, TypeError):continue
         if 150 <= days <= 190:
             return re.sub(r'(?:最近|近|过去)半年', '所选历史区间', text)
+    # Earlier saved evidence may expose six calendar buckets instead of a date window.
+    months = set()
+    for fact in context.selected:
+        binding = fact.get('binding', {})
+        if binding.get('aggregation') != 'recorded_month_total' or binding.get('primary') is False:continue
+        try:
+            month = date.fromisoformat(binding['month'] + '-01')
+            months.add(month.year * 12 + month.month)
+        except (KeyError, ValueError, TypeError):continue
+    ordered = sorted(months)
+    today = _as_of(context)
+    current = today.year * 12 + today.month
+    if len(ordered) == 6 and ordered == list(range(ordered[0], ordered[0] + 6)) and ordered[-1] in {current, current - 1}:
+        return re.sub(r'(?:最近|近|过去)半年', '所选历史区间', text)
     return text

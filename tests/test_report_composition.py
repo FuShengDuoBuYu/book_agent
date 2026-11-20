@@ -64,6 +64,10 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(validate_draft(draft('未来半年就能达成目标。'), data))
         short = context(facts=[fact('f1', historyWindow={'startDate': '2026-10-01','endDate':'2026-11-20'})], question='分析最近半年')
         self.assertTrue(validate_draft(draft('最近半年收入持平。'), short))
+        months = [fact(f'm{i}', tool='trends', month=f'2026-{i:02}', aggregation='recorded_month_total') for i in range(6,12)]
+        calendar = context(facts=months, findings={'g1': {'scope':'个人版','tool':'trends','states':{}}}, question='分析最近半年的收支')
+        calendar.payload['asOfDate'] = '2026-11-20'
+        self.assertEqual(validate_draft(draft('最近半年的收支存在波动。', ids=('m6',)), calendar), [])
 
     def test_project_grouping_words_are_not_financial_count_claims(self):
         self.assertEqual(validate_draft(draft('按同一项目合并不同工序，这项历史入账不计入持续收入。'), context()), [])
@@ -206,6 +210,26 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
             text='医疗是该期支出变化的账面贡献。', values=[{'label': '金额变化', 'value': 900, 'unit': '元'}]))
         data = context(facts=facts)
         self.assertIn('cause', {f['id'] for f in data.selected})
+
+    def test_later_large_monthly_driver_is_not_hidden_by_early_chronological_rows(self):
+        from app.agent.report_evidence import _ordered
+        months = [fact('june', tool='trends', aggregation='recorded_month_total', month='2026-06'),
+                  fact('september', tool='trends', aggregation='recorded_month_total', month='2026-09')]
+        rows = [fact(f'early{i}', text='month=2026-06、category=日常：支出100元。', group='g2', tool='aggregate',
+            values=[{'label':'expense','value':100,'unit':'元'}]) for i in range(3)]
+        later = fact('large', text='month=2026-09、category=学习：支出21500元。', group='g2', tool='aggregate',
+            values=[{'label':'expense','value':21500,'unit':'元'}])
+        detail = fact('tuition', text='month=2026-09、category=学习、source=学费：支出20000元。',
+            group='g3', tool='aggregate', month='2026-09',
+            values=[{'label':'expense','value':20000,'unit':'元'}])
+        detail['binding']['primary'] = False
+        outside = deepcopy(detail);outside['id']='outside';outside['binding']['month']='2026-01'
+        outside['text']='month=2026-01、source=窗外支出：支出99999元。'
+        outside['values'][0]['value']=99999
+        mandatory, _ = _ordered([*months,*rows,later,detail,outside],[],[],'分析最近半年收支变化和主要原因')
+        ids = {f['id'] for f in mandatory}
+        self.assertTrue({'large','tuition'} <= ids)
+        self.assertNotIn('outside',ids)
 
     def test_priority_context_does_not_repeat_private_computed_analysis(self):
         from datetime import date
