@@ -110,7 +110,7 @@ def validate_draft(draft, context):
                 if set(judgments[key]['factIds']) - ids:
                     issues.append('程序判断没有绑定本句的证据')
             else:
-                issues.append('引用了未提供的数量或判断')
+                issues.append('不存在的引用标记{{' + key + '}}；只能使用当前values或judgments实际提供的编号。没有数量的来源或原始备注可按facts原文直接写，不要编造n编号')
         plain = _plain(statement.text)
         for clause in re.split(r'[。；，\n]', plain):
             if any(name in clause for name in protected) and re.search(r'削减|减少|压缩|取消|砍掉', clause):

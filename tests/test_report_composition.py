@@ -102,6 +102,8 @@ class ConclusionCompositionTests(unittest.IsolatedAsyncioTestCase):
                                 values=[{'label': '金额', 'value': 900, 'unit': '元'}])]
         data = context(facts=facts)
         self.assertTrue(validate_draft(draft('收入为{{v9999}}。'), data))
+        issues = validate_draft(draft('原始备注是{{n9999}}。'), data)
+        self.assertIn('{{n9999}}', ' '.join(issues))
         self.assertTrue(validate_draft(draft('收入为{{v1}}。'), data))
         self.assertTrue(validate_draft(draft(ids=('unknown',)), data))
 
