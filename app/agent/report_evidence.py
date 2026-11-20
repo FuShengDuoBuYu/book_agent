@@ -5,6 +5,7 @@ from itertools import zip_longest
 import re
 
 from app.agent.analysis_context import DECISION_TOOLS
+from app.agent.report_delivery import delivery_requirements
 from app.agent.report_context import _prompt_budget
 from app.agent.report_values import literal, value_catalog, QUANTITY_LITERAL
 
@@ -129,6 +130,9 @@ def _catalog(facts):
     for value in values:
         value['binding'] = dict(by_id[value['factId']].get('binding', {}))
         value['role'] = value['label']
+        if value['binding'].get('evidenceRole') == 'period_total':
+            month_key = 'fromMonth' if value['label'].startswith('前期') else 'toMonth'
+            value['binding']['month'] = value['binding'].get(month_key)
         sample_month = re.fullmatch(r'该来源历史月入账（(\d{4}-\d{2})）', value['label'])
         if sample_month and value['binding'].get('tool') == 'forecast':
             value['binding'].update(month=sample_month[1], aggregation='recorded_source_month')
@@ -159,8 +163,10 @@ def _catalog(facts):
     return values
 
 
-def _ordered(facts, judgments, priorities, question=""):
+def _ordered(facts, judgments, priorities, question="", requirements=None):
     pinned = {key for j in [*judgments, *priorities] for key in j['factIds']}
+    requirements = requirements or {}
+    pinned.update(v['factId'] for field in ('requiredValues', 'changeDirections') for v in requirements.get(field, []))
     # Trend synthesis needs all returned month totals, not the generic coverage warning.
     pinned.update(f['id'] for f in facts if f.get('binding', {}).get('aggregation') == 'recorded_month_total')
     monthly = {(f['binding'].get('scope'), f['binding'].get('month')): f for f in facts
@@ -189,7 +195,7 @@ def _ordered(facts, judgments, priorities, question=""):
             'expense' if stats.get('expense', 0) > 0 and not stats.get('income', 0) else 'mixed')
         monthly_stats = amounts(anchor) if anchor else {}
         negative_month = monthly_stats.get('已记结余', monthly_stats.get('net', 0)) < 0
-        magnitude = abs(stats.get('金额变化', 0)) if typed_driver else max((abs(v) for v in stats.values()), default=0)
+        magnitude = abs(stats.get('金额变化', stats.get('change', 0))) if typed_driver else max((abs(v) for v in stats.values()), default=0)
         score = (bool(negative_month and direction == 'expense'), magnitude)
         causes.setdefault((binding.get('resultGroup'), direction, typed_driver), []).append((score, fact))
     for (_, _, typed_driver), rows in causes.items():
@@ -260,11 +266,12 @@ def prepare_report_context(payload, system, schema, *, num_ctx=8192, num_predict
                                     'targetCharacters': 150 if char_limit == 250 else 500 if char_limit == 1200 else 1800,
                                     'maximumCharacters': char_limit, 'onlyConclusion': char_limit == 250,
                                     'leadWithJudgment': judgment_leads(payload),
-                                    'noAuditDump': True}
+                                    'noAuditDump': True,
+                                    **delivery_requirements(payload.get('question', ''), facts, values, payload.get('artifacts', []))}
     common['judgments'] = [{k: j[k] for k in ('id', 'text', 'factIds', 'states')} for j in judgments]
     limit, estimate = _prompt_budget(system, schema, num_ctx, num_predict)
     limit -= 768  # Reserve a bounded correction instruction without changing reference IDs.
-    mandatory, optional = _ordered(facts, judgments, payload.get('reviewPriorities', []), payload.get('question', ''))
+    mandatory, optional = _ordered(facts, judgments, payload.get('reviewPriorities', []), payload.get('question', ''), common['answerRequirements'])
 
     method_requested = not judgment_leads(payload)
 
@@ -294,7 +301,7 @@ def prepare_report_context(payload, system, schema, *, num_ctx=8192, num_predict
                 'facts': [{'id': f['id'], 'text': preview[f['id']],
                            'binding': {k: v for k, v in f.get('binding', {}).items() if v is not None and v != []
                                        if k in {'tool', 'scope', 'historyWindow', 'month', 'partial', 'metric',
-                                                'aggregation', 'evidenceRole', 'excluded', 'category', 'source', 'member', 'filters', 'primary'}}}
+                                                'aggregation', 'aggregateFilters', 'evidenceRole', 'excluded', 'category', 'source', 'member', 'filters', 'primary'}}}
                           for f in selected],
                 'values': {v['id']: v['factId'] + ' ' + v['label'] + ' = ' + v['display'] for v in supplied},
                 'computedFindings': brief_findings,

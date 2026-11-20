@@ -24,3 +24,11 @@ class ChangeCategoryTests(unittest.TestCase):
         result=run_analysis('changes',rows,as_of=date(2026,11,20))
         self.assertEqual([r['name'] for r in result['expenseDrivers']],['未分类'])
         self.assertEqual({r['name'] for r in result['incomeDrivers']},{'校稿','课程'})
+
+    def test_removed_expense_keeps_previous_period_remark(self):
+        rows=[{'year':2026,'month':9,'day':1,'money':-900,'costType':'学习','orderRemark':'学费'},
+              {'year':2026,'month':10,'day':1,'money':-20,'costType':'餐饮','orderRemark':'午餐'}]
+        result=run_analysis('changes',rows,as_of=date(2026,11,20))
+        driver=next(r for r in result['expenseDrivers'] if r['name']=='学习')
+        self.assertEqual(driver['beforeRemarks'],['学费'])
+        self.assertEqual(driver['afterRemarks'],[])
