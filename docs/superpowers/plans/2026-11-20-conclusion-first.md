@@ -32,12 +32,12 @@ Files: app/schemas/report.py, app/agent/report_composition.py, app/agent/evidenc
 Files: app/agent/book_agent.py, app/agent/artifacts.py, app/schemas/artifacts.py, frontend/src/artifacts.js, frontend/src/AnalysisArtifacts.vue; existing Python/Node artifact/history tests.
 - [x] Add failing no-Markdown-append and collapsed-supporting-versus-requested artifact regressions.
 - [x] Keep data separate, preserve public artifact validation and fold supporting evidence by default while honoring explicit display requests.
-- [ ] Verify history/export, literal content and mobile UI behavior.
+- [x] Verify history/export, literal content and mobile UI behavior.
 
 ### Task3: Actual answer quality and release
 
 Files: synthetic conclusion evaluation script/fixtures, relevant architecture/evaluation/release docs; private replays only on home module state.
-- [ ] Run full backend suite, frontend tests/build and independent code review.
-- [ ] Run history-like synthetic model questions and private saved-evidence replays of both actual failures; read full replies and record failures/costs separately from structural checks.
-- [ ] Fix observed failures with regression tests and rerun affected cases; do not claim a final full matrix from mixed revisions.
+- [x] Run full backend suite, frontend tests/build and independent code review.
+- [x] Run history-like synthetic model questions and private saved-evidence replays of both actual failures; read full replies and record failures/costs separately from structural checks.
+- [x] Fix observed failures with regression tests and rerun affected cases; do not claim a final full matrix from mixed revisions.
 - [ ] Push PR, wait CI, merge, stage/release through canonical infra paths with private rollback and real authorized public/history acceptance. Update deployed revision and source checkout; retain only purposeful module artifacts.
