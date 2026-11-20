@@ -534,7 +534,7 @@ class EvidenceReporter:
                     reply = render_report(draft, report_context)
                     report = draft.model_dump()
                     break
-                attempts.append({'issues': issues, 'stage': 'reference_validation'})
+                attempts.append({'issues': issues, 'stage': 'reference_validation', 'draft': draft.model_dump()})
                 if turn:
                     raise ValueError('；'.join(issues))
                 report_context.payload = {**report_context.payload, 'corrections': issues}

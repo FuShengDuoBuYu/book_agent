@@ -104,8 +104,11 @@ def validate_draft(draft, context):
                 if value['unit'] in {'笔', '组', '项', '个'}:
                     before = re.split(r'[。；，,\n]', statement.text[:match.start()])[-1].strip()
                     after = statement.text[match.end():].lstrip()
-                    if before in {'', '有', '共', '合计', '共计', '其中', '约', '为'} and re.match(r'[,，;；。]|$', after):
-                        issues.append('数量引用缺少统计对象；请写清哪些记录缺失何字段或检测到何种组，不能只报数量再接影响')
+                    sentence_prefix = re.split(r'[。；\n]', statement.text[:match.start()])[-1]
+                    named_bill_count = (value['unit'] == '笔' and value['role'] in {'纳入笔数', '账单笔数', '区间笔数'}
+                                        and re.search(r'账单|记录|收入|支出', TOKEN.sub('', sentence_prefix)))
+                    if before in {'', '有', '共', '合计', '共计', '其中', '约', '为'} and re.match(r'[,，;；。]|$', after) and not named_bill_count:
+                        issues.append('数量引用{{' + key + '}}缺少统计对象；写清' + value['label'] + '统计的对象，不能只报数量再接影响')
                 preceding = statement.text[max(0, match.start() - 16):match.start()]
                 if '历史' in value['role'] and re.search(r'(?:预计|预测|下月|下个月)[^。；]*$', preceding):
                     issues.append('不能用历史样本金额充当预测值')
