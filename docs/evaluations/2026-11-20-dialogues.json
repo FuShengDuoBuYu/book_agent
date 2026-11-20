@@ -74,5 +74,16 @@
       }
     ],
     "note": "Separate targeted trajectory, not merged into the complete 30-turn scores. Automatic optimization requirement in pressure clarification overconstrains an otherwise fulfilled answer."
+  },
+  "deployment": {
+    "applicationCommit": "6ed60df7688606633ed9749b4c12f30979f0ec5a",
+    "provider": "openai",
+    "model": "gpt-6.1-terra",
+    "backendUnitTests": 537,
+    "publicReadyStatus": 200,
+    "publicRealLedgerChecksPassed": 35,
+    "ledgerRecordsUnchanged": true,
+    "phoneAttached": false,
+    "note": "Later audit-only documentation commits may be ahead of the deployed application; financial/model comparison scores retain their original source revisions."
   }
 }

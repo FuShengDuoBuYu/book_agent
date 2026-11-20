@@ -30,8 +30,8 @@
 
 - [x] Complete backend/frontend checks and an independent review; update evaluation docs and Android README accurately.
 - [x] Perform authenticated private real-ledger acceptance on an isolated home service with the selected cheap model.
-- [ ] Push and merge after checks, deploy the immutable merged revision with private environment and rollback; verify ready, assets, auth, history and enabled services.
-- [ ] Sync the durable checkout and perform phone installation/WebView validation if a device is available.
+- [x] Push and merge after checks, deploy the immutable merged revision with private environment and rollback; verify ready, assets, auth, history and enabled services.
+- [x] Sync the durable checkout and perform phone installation/WebView validation if a device is available.
 
 **Ruling:** Preserve program-bound financial explanations while testing model changes. Better models do not make lost context, unauthorized records or unsupported money claims acceptable. Any later relaxation needs typed claims and evidence validation rather than a return to unrestricted financial prose.
 
@@ -56,3 +56,5 @@
 - Bounded 9-turn reruns completed: manual Qwen6/9, Luna9/9, Terra9/9; remaining Qwen planning failures and an automatic-scoring false negative are documented separately.
 
 - Required `evaluate_intent --case expense_decision` on f579c31+Terra completed three normal turns with all checks passing; raw outputs are separate from the comparison matrix.
+
+- Final merged application `6ed60df` deployed with Terra; formal DynamicUser permissions and cold API readiness fixed and tested. Public HTTPS real-ledger acceptance passed all35 checks in125.12s. Agent/ledger/original Ollama enabled+active; comparison services disabled+inactive. Release/rollback record: `docs/deployments/2026-11-20.md`. The conditional device step was checked: no attached device, so no claim of installation or phone validation.
