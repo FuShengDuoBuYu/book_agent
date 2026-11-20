@@ -50,8 +50,10 @@ def delivery_requirements(question, facts, values, artifacts=()):
                 selected = [v for v in owned if v['label'] == '区间'+label+'小计'];priority=1
             elif binding.get('aggregation') == 'recorded_month_total':
                 selected = [v for v in owned if v['label'] == '已记'+label];priority=2
-            if per_period and selected:
-                totals.setdefault(_scope(binding, direction), []).append((priority, selected))
+            if per_period:
+                for value in selected:
+                    period = value['binding'].get('month') or binding.get('period') or value['label']
+                    totals.setdefault((_scope(binding, direction), period), []).append((priority, [value]))
         if both_changes and binding.get('evidenceRole') == 'change_driver' and (not metric or binding.get('metric') == metric):
             delta = next((v['value'] for v in owned if v['label'] in {'金额变化', 'change'}), None)
             if not isinstance(delta, (int, float)) or not delta:

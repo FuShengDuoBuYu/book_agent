@@ -130,3 +130,33 @@ class RequestedComparisonDeliveryTests(unittest.TestCase):
         self.assertEqual({g['direction'] for g in data.payload['answerRequirements']['changeDirections']},{'增加','减少'})
         increase=next(f for f in data.selected if f['binding'].get('category')=='交通' and f['binding'].get('evidenceRole')=='change_driver')
         self.assertIn(increase['id'],{g['factId'] for g in data.payload['answerRequirements']['changeDirections']})
+
+    def test_recent_comparison_does_not_hide_earlier_requested_trend_months(self):
+        from datetime import date
+        from app.tools.financial_analysis import run_analysis
+        rows=[{'year':2026,'month':m,'day':1,'money':-100*m,'costType':'餐饮'} for m in range(5,11)]
+        evidence=[]
+        for tool in ('changes','trends'):
+            evidence.append({'tool':tool,'mode':'个人版','metric':'all','requestedMetric':'expense',
+                'historyWindow':{'startDate':'2026-05-01','endDate':'2026-10-31'},
+                'evidence':run_analysis(tool,rows,as_of=date(2026,11,20))})
+        data=prepare_report_context({'question':'给出各月支出总额。','facts':build_facts(evidence),
+            'analysisFindings':build_analysis_findings(evidence)},REPORT_PROMPT,ReportDraft)
+        required=data.payload['answerRequirements']['requiredValues']
+        lookup={v['id']:v for v in data.values}
+        self.assertEqual(len(required),6)
+        self.assertEqual({lookup[v['id']]['binding']['month'] for v in required},{f'2026-{m:02}' for m in range(5,11)})
+
+    def test_large_income_comparisons_do_not_displace_expense_changes(self):
+        from datetime import date
+        from app.tools.financial_analysis import run_analysis
+        rows=[{'year':2026,'month':m,'day':1,'money':amount,'costType':category,'orderRemark':category}
+              for category,before,after in [('项目甲',1000,60000),('项目乙',1000,50000),('餐饮',-100,-50),('交通',-20,-40)]
+              for m,amount in [(9,before),(10,after)]]
+        spec={'periods':[{'label':'九月','startDate':'2026-09-01','endDate':'2026-09-30'},
+                         {'label':'十月','startDate':'2026-10-01','endDate':'2026-10-31'}],'groupBy':['category']}
+        evidence=[{'tool':'aggregate','mode':'个人版','metric':'all',
+            'evidence':run_analysis('aggregate',rows,as_of=date(2026,11,20),metric='all',aggregate=spec)}]
+        data=prepare_report_context({'question':'支出主要增加和减少在哪里？','facts':build_facts(evidence),
+            'analysisFindings':build_analysis_findings(evidence)},REPORT_PROMPT,ReportDraft)
+        self.assertEqual({g['direction'] for g in data.payload['answerRequirements']['changeDirections']},{'增加','减少'})

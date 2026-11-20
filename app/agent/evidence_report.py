@@ -32,12 +32,14 @@ def money(value):
 
 def _major_changes(rows, limit):
     selected = rows[:limit]
-    for sign in (-1, 1):
-        candidates = [r for r in rows if isinstance(r.get('change'), (int, float)) and r['change'] * sign > 0]
-        if candidates:
-            extreme = max(candidates, key=lambda r: abs(r['change']))
-            if extreme not in selected:
-                selected.append(extreme)
+    for metric in dict.fromkeys(r.get('metric') for r in rows):
+        for sign in (-1, 1):
+            candidates = [r for r in rows if r.get('metric') == metric
+                          and isinstance(r.get('change'), (int, float)) and r['change'] * sign > 0]
+            if candidates:
+                extreme = max(candidates, key=lambda r: abs(r['change']))
+                if extreme not in selected:
+                    selected.append(extreme)
     return selected
 
 
@@ -187,9 +189,12 @@ def build_facts(results):
                 if row.get('count') is None:
                     continue  # Coverage facts above explain why this complete total is unknown.
                 amounts = '、'.join(f"{labels[name]} {money(row[name])} 元" for name in measures)
+                coverage = next((item for item in e['coverage'] if item['period'] == row['period']), {})
+                start, end = coverage.get('startDate', ''), coverage.get('endDate', '')
+                period_month = start[:7] if start and start[:7] == end[:7] else None
                 add(f"区间 {literal(row['period'])} 按当前筛选的完整已记小计：{amounts}，共 {row['count']} 笔。"
                     '重叠日期在各区间内分别统计，不能再将各期小计相加当作并集总额。', True,
-                    binding={'period': row['period'], 'aggregation': 'filtered_period_total'},
+                    binding={'period': row['period'], 'aggregation': 'filtered_period_total', **({'month': period_month} if period_month else {})},
                     values=[q('区间' + labels[name] + '小计', row[name]) for name in measures]
                         + [q('区间笔数', row['count'], '笔')])
             for row in e.get('periodComparisons', []):
